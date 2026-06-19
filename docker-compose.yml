@@ -1,0 +1,154 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NexusLLM — local development stack (no GPU required)
+#
+# Services started:
+#   postgres     → :5432   (schema + seed applied on first boot)
+#   redis        → :6379
+#   nexus-gateway  → :8080  OpenAI-compatible inference API
+#   nexus-admin    → :8081  management API
+#   nexus-scheduler         priority queue dispatcher
+#   prometheus   → :9100
+#   grafana      → :3000   (admin / admin)
+#
+# vLLM is NOT started here — point NEXUS_VLLM_* at real GPU instances.
+# For a full GPU stack use docker-compose.single-gpu.yml instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  nexus:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+
+  # ── Infrastructure ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB:       nexusllm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./migrations/002_seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql
+      - ./migrations/003_runtime_layer.sql:/docker-entrypoint-initdb.d/03_runtime.sql
+      - ./migrations/004_single_gpu_runtime_seed.sql:/docker-entrypoint-initdb.d/04_seed_runtime.sql
+      - ./migrations/005_enterprise_platform.sql:/docker-entrypoint-initdb.d/05_enterprise.sql
+      - ./migrations/006_controller_columns.sql:/docker-entrypoint-initdb.d/06_controller.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexusllm"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [nexus]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [nexus]
+
+  # ── NexusLLM services ─────────────────────────────────────────────────────
+  nexus-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    restart: unless-stopped
+    environment:
+      NEXUS_SERVER_PORT:        "8080"
+      NEXUS_SERVER_METRICSPORT: "9090"
+      NEXUS_SERVER_MODE:        "debug"
+      NEXUS_DATABASE_DSN:       "postgres://nexus:nexus@postgres:5432/nexusllm?sslmode=disable"
+      NEXUS_REDIS_ADDR:         "redis:6379"
+      NEXUS_AUTH_JWTSECRET:     "${NEXUS_JWT_SECRET:-dev-secret-change-in-production}"
+      NEXUS_VLLM_POLLINTERVAL:  "10s"
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [nexus]
+
+  nexus-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    restart: unless-stopped
+    environment:
+      NEXUS_ADMIN_PORT:         "8081"
+      NEXUS_SERVER_METRICSPORT: "9091"
+      NEXUS_SERVER_MODE:        "debug"
+      NEXUS_DATABASE_DSN:       "postgres://nexus:nexus@postgres:5432/nexusllm?sslmode=disable"
+      NEXUS_REDIS_ADDR:         "redis:6379"
+      NEXUS_AUTH_JWTSECRET:     "${NEXUS_JWT_SECRET:-dev-secret-change-in-production}"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [nexus]
+
+  nexus-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    restart: unless-stopped
+    environment:
+      NEXUS_REDIS_ADDR:                "redis:6379"
+      NEXUS_SCHEDULER_QUEUEHIGHSTREAM: "nexus:queue:high"
+      NEXUS_SCHEDULER_QUEUEMEDSTREAM:  "nexus:queue:med"
+      NEXUS_SCHEDULER_QUEUELOWSTREAM:  "nexus:queue:low"
+    depends_on:
+      redis: { condition: service_healthy }
+    networks: [nexus]
+
+  # ── Observability ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9100:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    networks: [nexus]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on: [prometheus]
+    networks: [nexus]

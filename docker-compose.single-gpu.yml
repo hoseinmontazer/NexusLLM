@@ -1,0 +1,220 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NexusLLM — Single GPU Server Deployment
+#
+# Runs three vLLM instances on one physical machine with multiple GPUs.
+# NexusLLM routes team traffic to the correct model automatically.
+#
+# GPU mapping (adjust device_ids to match your server):
+#   gemma-3-27b    → GPU 0, 1       (2× A100 or equivalent)
+#   llama-3.3-70b  → GPU 2, 3, 4, 5 (4× A100)
+#   qwen-3-32b     → GPU 6, 7       (2× A100)
+#
+# Requirements:
+#   - NVIDIA drivers installed
+#   - nvidia-container-toolkit installed
+#   - export HF_TOKEN=hf_...
+#   - export NEXUS_JWT_SECRET=$(openssl rand -hex 32)
+#
+# Quick start:
+#   make dev-up-gpu
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  nexus:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  hf_cache:
+
+x-vllm-base: &vllm-base
+  image: vllm/vllm-openai:v0.4.3
+  restart: unless-stopped
+  environment:
+    HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+    HF_HOME: /root/.cache/huggingface
+  volumes:
+    - hf_cache:/root/.cache/huggingface
+  networks: [nexus]
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB:       nexusllm
+    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./migrations/002_seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql
+      - ./migrations/003_runtime_layer.sql:/docker-entrypoint-initdb.d/03_runtime.sql
+      - ./migrations/004_single_gpu_runtime_seed.sql:/docker-entrypoint-initdb.d/04_seed_runtime.sql
+      - ./migrations/005_enterprise_platform.sql:/docker-entrypoint-initdb.d/05_enterprise.sql
+      - ./migrations/006_controller_columns.sql:/docker-entrypoint-initdb.d/06_controller.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexusllm"]
+      interval: 5s
+      retries: 12
+    networks: [nexus]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    networks: [nexus]
+
+  # ── vLLM Runtimes ──────────────────────────────────────────────────────────
+  vllm-gemma:
+    <<: *vllm-base
+    container_name: vllm-gemma
+    command:
+      - "--model"          - "google/gemma-3-27b-it"
+      - "--served-model-name" - "gemma-3-27b"
+      - "--tensor-parallel-size" - "2"
+      - "--gpu-memory-utilization" - "0.90"
+      - "--max-model-len"  - "32768"
+      - "--dtype"          - "bfloat16"
+      - "--port"           - "8000"
+    ports: ["8000:8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      start_period: 180s
+      retries: 5
+
+  vllm-llama:
+    <<: *vllm-base
+    container_name: vllm-llama
+    command:
+      - "--model"          - "meta-llama/Llama-3.3-70B-Instruct"
+      - "--served-model-name" - "llama-3.3-70b"
+      - "--tensor-parallel-size" - "4"
+      - "--gpu-memory-utilization" - "0.90"
+      - "--max-model-len"  - "65536"
+      - "--dtype"          - "bfloat16"
+      - "--port"           - "8000"
+    ports: ["8001:8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3", "4", "5"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      start_period: 240s
+      retries: 5
+
+  vllm-qwen:
+    <<: *vllm-base
+    container_name: vllm-qwen
+    command:
+      - "--model"          - "Qwen/Qwen3-32B-Instruct"
+      - "--served-model-name" - "qwen-3-32b"
+      - "--tensor-parallel-size" - "2"
+      - "--gpu-memory-utilization" - "0.90"
+      - "--max-model-len"  - "32768"
+      - "--dtype"          - "bfloat16"
+      - "--port"           - "8000"
+    ports: ["8002:8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["6", "7"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      start_period: 180s
+      retries: 5
+
+  # ── NexusLLM ───────────────────────────────────────────────────────────────
+  nexus-gateway:
+    build: { context: ., dockerfile: Dockerfile.gateway }
+    restart: unless-stopped
+    environment:
+      NEXUS_SERVER_PORT:        "8080"
+      NEXUS_SERVER_METRICSPORT: "9090"
+      NEXUS_SERVER_MODE:        "release"
+      NEXUS_DATABASE_DSN:       "postgres://nexus:nexus@postgres:5432/nexusllm?sslmode=disable"
+      NEXUS_REDIS_ADDR:         "redis:6379"
+      NEXUS_AUTH_JWTSECRET:     "${NEXUS_JWT_SECRET:-change-me}"
+      NEXUS_VLLM_POLLINTERVAL:  "10s"
+    ports: ["8080:8080", "9090:9090"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      retries: 5
+    networks: [nexus]
+
+  nexus-admin:
+    build: { context: ., dockerfile: Dockerfile.admin }
+    restart: unless-stopped
+    environment:
+      NEXUS_ADMIN_PORT:         "8081"
+      NEXUS_SERVER_METRICSPORT: "9091"
+      NEXUS_SERVER_MODE:        "release"
+      NEXUS_DATABASE_DSN:       "postgres://nexus:nexus@postgres:5432/nexusllm?sslmode=disable"
+      NEXUS_REDIS_ADDR:         "redis:6379"
+      NEXUS_AUTH_JWTSECRET:     "${NEXUS_JWT_SECRET:-change-me}"
+    ports: ["8081:8081"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [nexus]
+
+  nexus-scheduler:
+    build: { context: ., dockerfile: Dockerfile.scheduler }
+    restart: unless-stopped
+    environment:
+      NEXUS_REDIS_ADDR: "redis:6379"
+    depends_on:
+      redis: { condition: service_healthy }
+    networks: [nexus]
+
+  # ── Observability ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.single-gpu.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9100:9090"]
+    networks: [nexus]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports: ["3000:3000"]
+    volumes:
+      - ./monitoring/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on: [prometheus]
+    networks: [nexus]

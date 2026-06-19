@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: nexus-gateway
+    static_configs:
+      - targets: ['nexus-gateway:9090']
+
+  - job_name: nexus-admin
+    static_configs:
+      - targets: ['nexus-admin:9091']
+
+  - job_name: nexus-scheduler
+    static_configs:
+      - targets: ['nexus-scheduler:9092']
+
+  # vLLM instances — each exposes Prometheus metrics at /metrics
+  - job_name: vllm-gemma
+    static_configs:
+      - targets: ['vllm-gemma:8000']
+    metrics_path: /metrics
+
+  - job_name: vllm-llama
+    static_configs:
+      - targets: ['vllm-llama:8000']
+    metrics_path: /metrics
+
+  - job_name: vllm-qwen
+    static_configs:
+      - targets: ['vllm-qwen:8000']
+    metrics_path: /metrics
