@@ -92,12 +92,15 @@ func (h *APIKeyHandler) CreateAPIKey(c *gin.Context) {
 // ListAPIKeys handles GET /admin/v1/teams/:id/api-keys
 func (h *APIKeyHandler) ListAPIKeys(c *gin.Context) {
 	teamID := c.Param("id")
-	var keys []models.APIKey
+	keys := []models.APIKey{}
 	if err := h.db.SelectContext(c.Request.Context(), &keys,
 		`SELECT id, team_id, name, key_prefix, active, last_used_at, expires_at, created_at, updated_at
 		 FROM api_keys WHERE team_id = $1 ORDER BY created_at DESC`, teamID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
+	}
+	if keys == nil {
+		keys = []models.APIKey{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": keys, "total": len(keys)})
 }

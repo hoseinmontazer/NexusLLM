@@ -41,6 +41,9 @@ type Handler struct {
 	usageTracker  *usage.Tracker
 	log           *zap.Logger
 	teamPolicies  map[string]*policy.TeamPolicy
+	// httpClient is used by multi-service handlers (rerank, STT, TTS, OCR) to
+	// forward requests directly to backend endpoints.
+	httpClient    *http.Client
 }
 
 // NewHandler constructs the proxy Handler.
@@ -65,6 +68,13 @@ func NewHandler(
 		usageTracker:  tracker,
 		log:           log,
 		teamPolicies:  teamPolicies,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Minute,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 32,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 

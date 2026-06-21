@@ -69,19 +69,37 @@ func (r *Resolver) DeleteAlias(ctx context.Context, alias, scope, scopeID string
 }
 
 // ListAliases returns all aliases visible to a team/org.
+// Empty teamID or orgID are treated as "no filter for that scope".
 func (r *Resolver) ListAliases(ctx context.Context, teamID, orgID string) ([]AliasRow, error) {
-	var rows []AliasRow
-	err := r.db.SelectContext(ctx, &rows, `
+	rows := []AliasRow{}
+
+	// Build a query that only filters on scopes where a valid ID was provided
+	query := `
 		SELECT ma.alias, m.name AS model_name, ma.scope, ma.scope_id, ma.enabled
 		FROM model_aliases ma
 		JOIN models m ON m.id = ma.model_id
 		WHERE ma.enabled = TRUE
-		  AND (
-		       (ma.scope = 'global')
-		    OR (ma.scope = 'org'   AND ma.scope_id = $1)
-		    OR (ma.scope = 'team'  AND ma.scope_id = $2)
-		      )
-		ORDER BY ma.scope, ma.alias`, orgID, teamID)
+		  AND (ma.scope = 'global'`
+
+	args := []interface{}{}
+	idx := 1
+
+	if orgID != "" {
+		query += fmt.Sprintf(" OR (ma.scope = 'org' AND ma.scope_id = $%d)", idx)
+		args = append(args, orgID)
+		idx++
+	}
+	if teamID != "" {
+		query += fmt.Sprintf(" OR (ma.scope = 'team' AND ma.scope_id = $%d)", idx)
+		args = append(args, teamID)
+		idx++
+	}
+	query += ") ORDER BY ma.scope, ma.alias"
+
+	err := r.db.SelectContext(ctx, &rows, query, args...)
+	if rows == nil {
+		rows = []AliasRow{}
+	}
 	return rows, err
 }
 

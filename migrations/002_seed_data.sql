@@ -1,79 +1,93 @@
--- NexusLLM seed data for local development / testing
--- Provides: 1 org, 3 teams, 3 models, policies, permissions, and API keys
---
--- Test API keys (raw values — save these, they won't be stored in plaintext):
---   Team A: nxs_team_a_dev_key_0000000000000000
---   Team B: nxs_team_b_dev_key_0000000000000000
---   Team C: nxs_team_c_dev_key_0000000000000000
---
--- SHA-256 hashes are pre-computed from the raw values above using the
--- same HashAPIKey() function used by the service.
-
+-- NexusLLM dev seed data — fully idempotent, no hardcoded UUIDs after org creation
 BEGIN;
 
--- ── Organization ──────────────────────────────────────────────────────────────
-INSERT INTO organizations (id, name, slug) VALUES
-  ('00000000-0000-0000-0000-000000000001', 'Acme Corp', 'acme-corp');
+-- Ensure the Acme Corp org exists (insert only if no org with this slug)
+INSERT INTO organizations (name, slug)
+SELECT 'Acme Corp', 'acme-corp'
+WHERE NOT EXISTS (SELECT 1 FROM organizations WHERE slug = 'acme-corp');
 
--- ── Teams ─────────────────────────────────────────────────────────────────────
-INSERT INTO teams (id, org_id, name, slug, priority) VALUES
-  ('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Team Alpha', 'team-alpha', 80),
-  ('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Team Beta',  'team-beta',  50),
-  ('10000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'Team Gamma', 'team-gamma', 20);
+-- Ensure teams exist under acme-corp
+INSERT INTO teams (org_id, name, slug, priority)
+SELECT o.id, 'Team Alpha', 'team-alpha', 80
+FROM organizations o WHERE o.slug = 'acme-corp'
+  AND NOT EXISTS (SELECT 1 FROM teams WHERE slug = 'team-alpha' AND org_id = o.id);
 
--- ── Models ────────────────────────────────────────────────────────────────────
-INSERT INTO models (id, name, display_name, vllm_endpoint, max_tokens) VALUES
-  ('20000000-0000-0000-0000-000000000001', 'gemma-27b',     'Gemma 27B',      'http://vllm-gemma:8000',  8192),
-  ('20000000-0000-0000-0000-000000000002', 'llama-3.3-70b', 'LLaMA 3.3 70B',  'http://vllm-llama:8000',  32768),
-  ('20000000-0000-0000-0000-000000000003', 'qwen-2.5-72b',  'Qwen 2.5 72B',   'http://vllm-qwen:8000',   32768);
+INSERT INTO teams (org_id, name, slug, priority)
+SELECT o.id, 'Team Beta', 'team-beta', 50
+FROM organizations o WHERE o.slug = 'acme-corp'
+  AND NOT EXISTS (SELECT 1 FROM teams WHERE slug = 'team-beta' AND org_id = o.id);
 
--- ── Policies ──────────────────────────────────────────────────────────────────
-INSERT INTO policies (id, team_id, rpm, tpd, max_concurrent, max_context_tokens) VALUES
-  ('30000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', 1000, 50000000, 20, 32768),  -- Team Alpha: high quota
-  ('30000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002', 500,  10000000, 10, 8192),   -- Team Beta: medium
-  ('30000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000003', 100,   2000000,  5, 4096);   -- Team Gamma: low
+INSERT INTO teams (org_id, name, slug, priority)
+SELECT o.id, 'Team Gamma', 'team-gamma', 20
+FROM organizations o WHERE o.slug = 'acme-corp'
+  AND NOT EXISTS (SELECT 1 FROM teams WHERE slug = 'team-gamma' AND org_id = o.id);
 
--- ── Model Permissions ─────────────────────────────────────────────────────────
--- Team Alpha → Gemma + LLaMA
-INSERT INTO team_model_permissions (team_id, model_id) VALUES
-  ('10000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000001'),
-  ('10000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000002');
+-- Base model rows
+INSERT INTO models (name, display_name, vllm_endpoint, max_tokens) VALUES
+  ('gemma-3-27b',   'Gemma 3 27B',   'http://vllm-gemma:8000', 8192),
+  ('llama-3.3-70b', 'LLaMA 3.3 70B', 'http://vllm-llama:8000', 8192),
+  ('qwen-3-32b',    'Qwen 3 32B',    'http://vllm-qwen:8000',  8192)
+ON CONFLICT (name) DO NOTHING;
 
--- Team Beta → Gemma only
-INSERT INTO team_model_permissions (team_id, model_id) VALUES
-  ('10000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000001');
+-- Policies for each team (one row per team)
+INSERT INTO policies (team_id, rpm, tpd, max_concurrent, max_context_tokens)
+SELECT t.id, 1000, 50000000, 20, 32768 FROM teams t WHERE t.slug = 'team-alpha'
+  AND NOT EXISTS (SELECT 1 FROM policies WHERE team_id = t.id);
 
--- Team Gamma → Qwen only
-INSERT INTO team_model_permissions (team_id, model_id) VALUES
-  ('10000000-0000-0000-0000-000000000003', '20000000-0000-0000-0000-000000000003');
+INSERT INTO policies (team_id, rpm, tpd, max_concurrent, max_context_tokens)
+SELECT t.id, 500, 10000000, 10, 8192 FROM teams t WHERE t.slug = 'team-beta'
+  AND NOT EXISTS (SELECT 1 FROM policies WHERE team_id = t.id);
 
--- ── Service Accounts ──────────────────────────────────────────────────────────
-INSERT INTO service_accounts (id, team_id, name) VALUES
-  ('40000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', 'team-alpha-sa'),
-  ('40000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002', 'team-beta-sa'),
-  ('40000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000003', 'team-gamma-sa');
+INSERT INTO policies (team_id, rpm, tpd, max_concurrent, max_context_tokens)
+SELECT t.id, 100, 2000000, 5, 4096 FROM teams t WHERE t.slug = 'team-gamma'
+  AND NOT EXISTS (SELECT 1 FROM policies WHERE team_id = t.id);
 
--- ── API Keys ──────────────────────────────────────────────────────────────────
--- Hashes are SHA-256 of the raw keys listed at the top of this file.
--- Generate real keys with: nexusctl generate-key
--- These are dev-only placeholder hashes — replace before any real deployment.
-INSERT INTO api_keys (id, team_id, name, key_hash, key_prefix) VALUES
-  ('50000000-0000-0000-0000-000000000001',
-   '10000000-0000-0000-0000-000000000001',
-   'dev-key-alpha',
-   'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
-   'nxs_team_a_'),
+-- Model permissions
+INSERT INTO team_model_permissions (team_id, model_id)
+SELECT t.id, m.id FROM teams t, models m
+WHERE t.slug = 'team-alpha' AND m.name IN ('gemma-3-27b','llama-3.3-70b')
+ON CONFLICT DO NOTHING;
 
-  ('50000000-0000-0000-0000-000000000002',
-   '10000000-0000-0000-0000-000000000002',
-   'dev-key-beta',
-   'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3',
-   'nxs_team_b_'),
+INSERT INTO team_model_permissions (team_id, model_id)
+SELECT t.id, m.id FROM teams t, models m
+WHERE t.slug = 'team-beta' AND m.name = 'gemma-3-27b'
+ON CONFLICT DO NOTHING;
 
-  ('50000000-0000-0000-0000-000000000003',
-   '10000000-0000-0000-0000-000000000003',
-   'dev-key-gamma',
-   'c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
-   'nxs_team_c_');
+INSERT INTO team_model_permissions (team_id, model_id)
+SELECT t.id, m.id FROM teams t, models m
+WHERE t.slug = 'team-gamma' AND m.name = 'qwen-3-32b'
+ON CONFLICT DO NOTHING;
+
+-- Service accounts
+INSERT INTO service_accounts (team_id, name)
+SELECT t.id, 'team-alpha-sa' FROM teams t WHERE t.slug = 'team-alpha'
+  AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE name = 'team-alpha-sa' AND team_id = t.id);
+
+INSERT INTO service_accounts (team_id, name)
+SELECT t.id, 'team-beta-sa' FROM teams t WHERE t.slug = 'team-beta'
+  AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE name = 'team-beta-sa' AND team_id = t.id);
+
+INSERT INTO service_accounts (team_id, name)
+SELECT t.id, 'team-gamma-sa' FROM teams t WHERE t.slug = 'team-gamma'
+  AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE name = 'team-gamma-sa' AND team_id = t.id);
+
+-- Dev API keys (placeholder hashes — use: make generate-key for real keys)
+INSERT INTO api_keys (team_id, name, key_hash, key_prefix)
+SELECT t.id, 'dev-key-alpha',
+  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'nxs_alpha_'
+FROM teams t WHERE t.slug = 'team-alpha'
+  AND NOT EXISTS (SELECT 1 FROM api_keys WHERE key_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+INSERT INTO api_keys (team_id, name, key_hash, key_prefix)
+SELECT t.id, 'dev-key-beta',
+  'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'nxs_beta__'
+FROM teams t WHERE t.slug = 'team-beta'
+  AND NOT EXISTS (SELECT 1 FROM api_keys WHERE key_hash = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+INSERT INTO api_keys (team_id, name, key_hash, key_prefix)
+SELECT t.id, 'dev-key-gamma',
+  'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'nxs_gamma_'
+FROM teams t WHERE t.slug = 'team-gamma'
+  AND NOT EXISTS (SELECT 1 FROM api_keys WHERE key_hash = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc');
 
 COMMIT;

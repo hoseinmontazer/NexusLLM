@@ -73,7 +73,11 @@ func main() {
 	factory := runtime.NewFactory(httpClient)
 	registry, err := runtime.NewRegistry(db, rdb, factory, log)
 	if err != nil {
-		log.Fatal("runtime registry init failed", zap.Error(err))
+		log.Warn("runtime registry init failed — starting with empty registry (run migrations)",
+			zap.Error(err))
+		// Build an empty registry so the gateway can still start.
+		// Models will become available once migrations run and the registry reloads.
+		registry, _ = runtime.NewEmptyRegistry(db, rdb, factory, log)
 	}
 
 	// ── Runtime watcher ───────────────────────────────────────────────────────
@@ -154,9 +158,15 @@ func main() {
 
 	v1 := r.Group("/v1", middleware.AuthRequired(authSvc))
 	{
-		v1.POST("/chat/completions", proxyHandler.ChatCompletions)
-		v1.POST("/embeddings", proxyHandler.Embeddings)
-		v1.GET("/models", proxyHandler.Models)
+		v1.POST("/chat/completions",       proxyHandler.ChatCompletions)
+		v1.POST("/embeddings",             proxyHandler.Embeddings)
+		v1.GET("/models",                  proxyHandler.Models)
+
+		// Multi-service APIs (AI Platform)
+		v1.POST("/rerank",                       proxyHandler.Rerank)
+		v1.POST("/audio/transcriptions",          proxyHandler.Transcriptions)
+		v1.POST("/audio/speech",                  proxyHandler.Speech)
+		v1.POST("/ocr",                           proxyHandler.OCR)
 	}
 
 	// ── Metrics server ────────────────────────────────────────────────────────

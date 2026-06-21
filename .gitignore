@@ -1,0 +1,101 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NexusLLM .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Go binaries & build output ───────────────────────────────────────────────
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/nexus-gateway
+/nexus-admin
+/nexus-scheduler
+
+# ── Go module cache ───────────────────────────────────────────────────────────
+vendor/
+
+# ── Environment & secrets ────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# ── Editor & IDE ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Keep docker-compose files but ignore override files
+docker-compose.override.yml
+
+# ── PostgreSQL local data ────────────────────────────────────────────────────
+postgres_data/
+pgdata/
+
+# ── Redis local data ─────────────────────────────────────────────────────────
+redis_data/
+dump.rdb
+
+# ── ClickHouse local data ────────────────────────────────────────────────────
+clickhouse_data/
+clickhouse_logs/
+
+# ── HuggingFace model cache (can be hundreds of GB) ─────────────────────────
+hf_cache/
+.cache/huggingface/
+models/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Test coverage & profiling ─────────────────────────────────────────────────
+coverage.out
+coverage.html
+*.prof
+*.pprof
+cpu.out
+mem.out
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# ── Web Admin UI (Next.js) ────────────────────────────────────────────────────
+web/.next/
+web/out/
+web/node_modules/
+web/.env
+web/.env.local
+web/.env.production.local
+web/.env.development.local
+web/npm-debug.log*
+web/yarn-debug.log*
+web/yarn-error.log*
+web/.pnp
+web/.pnp.js
+
+# ── Grafana provisioned data ──────────────────────────────────────────────────
+monitoring/grafana_data/
+
+# ── Generated files ───────────────────────────────────────────────────────────
+internal/admin/handlers/zz_generated*.go

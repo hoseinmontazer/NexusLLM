@@ -39,9 +39,9 @@ func (h *GPUHandler) RegisterNode(c *gin.Context) {
 	c.JSON(http.StatusCreated, node)
 }
 
-// RegisterDevice handles POST /admin/v1/gpu/nodes/:node_id/devices
+// RegisterDevice handles POST /admin/v1/gpu/nodes/:id/devices
 func (h *GPUHandler) RegisterDevice(c *gin.Context) {
-	nodeID := c.Param("node_id")
+	nodeID := c.Param("id")
 	var input struct {
 		DeviceIndex int    `json:"device_index" binding:"required"`
 		Name        string `json:"name"         binding:"required"`
@@ -66,16 +66,22 @@ func (h *GPUHandler) ListNodes(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if nodes == nil {
+		nodes = []gpu.Node{}
+	}
 	c.JSON(http.StatusOK, gin.H{"data": nodes, "total": len(nodes)})
 }
 
-// ListDevices handles GET /admin/v1/gpu/nodes/:node_id/devices
+// ListDevices handles GET /admin/v1/gpu/nodes/:id/devices
 func (h *GPUHandler) ListDevices(c *gin.Context) {
-	nodeID := c.Param("node_id")
+	nodeID := c.Param("id")
 	devs, err := h.inv.ListDevices(c.Request.Context(), nodeID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	if devs == nil {
+		devs = []gpu.Device{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": devs, "total": len(devs)})
 }

@@ -1,548 +1,219 @@
-# NexusLLM — Enterprise Platform Roadmap
+# NexusLLM — AI Platform Roadmap
 
-> Current state: Core platform is production-ready for a single GPU server.
-> This document defines the remaining phases to reach a complete self-hosted enterprise AI platform.
+## Current Status: v0.5 — AI Resource Orchestrator
+
+NexusLLM has been transformed from an LLM gateway into a full AI Resource
+Orchestrator. The sections below describe what is implemented and what comes next.
 
 ---
 
-## What Is Already Done ✅
+## Hardware Target
 
-| Capability | Status |
+| Resource | Specification |
 |---|---|
-| Organizations / Teams / Users | ✅ |
-| API Key + JWT authentication | ✅ |
-| Model ACLs | ✅ |
-| Rate limits + daily quotas | ✅ |
-| OpenAI-compatible inference API | ✅ |
-| Runtime Registry (vLLM / Ollama / TGI / OpenAI-compat) | ✅ |
-| Runtime Watcher + health checks + circuit breaker | ✅ |
-| Model Controller (start / stop / restart / upgrade / rollback via Docker) | ✅ |
-| GPU Inventory + allocation + bin-packing | ✅ |
-| Dynamic model lifecycle (state machine + idle eviction) | ✅ |
-| Prompt Policy Engine (injection, PII, deny lists, output filters) | ✅ |
-| AI Gateway Policy Engine (temp cap, tools, model restrictions) | ✅ |
-| Usage tracking (async Redis Stream → PostgreSQL) | ✅ |
-| Model Aliases / Virtual Models | ✅ |
-| Priority queue scheduler (Redis Streams) | ✅ |
-| Prometheus + Grafana observability | ✅ |
-| Docker Compose single-GPU deployment | ✅ |
-| Admin REST API (full CRUD for all entities) | ✅ |
+| Server | Single AI Server (expandable to cluster) |
+| GPUs | 2× NVIDIA H200 NVL (144 GB VRAM each = 288 GB total) |
+| vCPUs | 384 logical cores |
+| RAM | 1 TB |
+| SSD | 10 TB NVMe |
+| HDD | 54 TB |
+| NUMA | 2 nodes (GPU 0 → NUMA 0, GPU 1 → NUMA 1) |
 
 ---
 
-## Phase 4 — Enterprise Identity & Access Control
+## ✅ Implemented (v0.5)
 
-**Goal:** Replace the simple role field with a proper RBAC system and add SSO so employees log in with their company account.
+### Core Platform (pre-existing)
+- Runtime Registry — per-model endpoint pool with health tracking
+- Runtime Controller — async container lifecycle (start / stop / restart / upgrade / rollback)
+- Runtime Watcher — background health checks with circuit breaker
+- GPU Inventory — device registration, allocation, telemetry
+- GPU Packing — FFD bin-packing for multi-model placement
+- Dynamic Model Loading — on-demand container deployment via Docker
+- Usage Tracking — per-team/org token usage via Redis Streams → PostgreSQL
+- Prompt Policies — system prompt injection, PII detection, content moderation
+- Team Policies — RPM, TPD, concurrency, context window limits (Redis hot path)
+- Model Aliases — virtual model names scoped to org/team/global
+- OpenAI Compatible API — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
+- Multi-tenant Auth — API keys (SHA-256 hash), JWT, Redis cache
+- Admin API — full CRUD for orgs, teams, models, policies, aliases
 
-### 4.1 RBAC System
+### Resource-Aware Runtime Placement (v0.5 — new)
+- **Placement Engine** (`internal/placement/`) — scores nodes by VRAM headroom,
+  GPU temperature, GPU utilisation, NUMA locality, and RAM availability.
+  Separate scoring paths for `GPU_RUNTIME` and `CPU_RUNTIME` workloads.
+- **Auto-placement** — `POST /admin/v1/models/deploy` with `auto_place: true`
+  automatically selects GPU(s) from inventory. Manual assignment still works.
+- **Placement Simulation** — `POST /admin/v1/placement/simulate` for dry-runs
+  without committing resources. Useful for capacity planning.
+- **Placement Audit Log** — every decision is written to `placement_decisions`.
 
-**Roles:**
-- `platform_admin` — full platform access
-- `org_admin` — full access within one organization
-- `team_admin` — manage their own team
-- `developer` — create API keys, read usage
-- `viewer` — read-only
+### CPU Runtime Support (v0.5 — new)
+- **CPU_RUNTIME type** — all services declare `runtime_type: GPU_RUNTIME | CPU_RUNTIME`.
+- **cpu_native backend** — wraps OpenAI-compatible HTTP for CPU services.
+- **Docker cpu affinity** — `--cpuset-cpus` and `--cpuset-mems` passed when
+  `CPUSetCPUs` / `NUMANode` are set on the RuntimeSpec.
+- **CPU Allocations** — `cpu_allocations` table tracks core and RAM reservations.
 
-**Permissions:**
-```
-users.manage        teams.manage       models.manage
-policies.manage     apikeys.manage     usage.read
-audit.read          gpu.manage         budget.manage
-```
+### AI Service Registry (v0.5 — new)
+Extends the model registry to cover all AI service types:
 
-**What needs to be built:**
-- DB schema: `roles`, `permissions`, `role_permissions`, `user_roles` tables
-- Permission middleware (Go) — replaces current simple role check
-- `GET/POST/DELETE /admin/v1/roles` API
-- Role assignment API: `POST /admin/v1/users/:id/roles`
-- Permission check helper used by all admin handlers
-
-**Estimated effort:** 3–5 days
-
----
-
-### 4.2 SSO / OIDC Integration
-
-**Supported providers:**
-- Keycloak (self-hosted)
-- Azure AD
-- Google Workspace
-- Any OIDC-compliant provider
-
-**What needs to be built:**
-- DB schema: `sso_providers`, `user_identities` tables
-- OIDC callback handler (Go — use `coreos/go-oidc`)
-- Automatic user provisioning on first login
-- Group/team mapping from OIDC claims to NexusLLM teams
-- Role mapping from OIDC claims to RBAC roles
-- Session management (JWT issued after OIDC callback)
-- Admin config page for SSO providers
-
-**Flow:**
-```
-Browser → /auth/sso/:provider → OIDC Provider → /auth/callback
-→ provision user if new → map groups → issue NexusLLM JWT → redirect to UI
-```
-
-**DB changes needed:**
-```sql
-CREATE TABLE sso_providers (
-    id, name, provider_type, issuer_url, client_id,
-    client_secret_enc, team_claim, role_claim, enabled
-);
-CREATE TABLE user_identities (
-    id, user_id, provider_id, external_id, email, last_login_at
-);
-```
-
-**Estimated effort:** 5–7 days
-
----
-
-## Phase 5 — Audit Logging
-
-**Goal:** Immutable, searchable audit trail for all admin and system actions.
-
-**What needs to be built:**
-
-**DB schema (already partially defined in migration 001 — needs extension):**
-```sql
--- Enhance existing audit_logs table:
-ALTER TABLE audit_logs ADD COLUMN actor_type VARCHAR(20); -- user | system | api_key
-ALTER TABLE audit_logs ADD COLUMN old_value  JSONB;
-ALTER TABLE audit_logs ADD COLUMN new_value  JSONB;
-ALTER TABLE audit_logs ADD COLUMN ip_address INET;
-ALTER TABLE audit_logs ADD COLUMN user_agent TEXT;
-ALTER TABLE audit_logs ADD COLUMN session_id VARCHAR(255);
-```
-
-**Events to track:**
-| Action | Trigger |
-|---|---|
-| `user.login` | SSO callback or API key use |
-| `user.created / updated / deleted` | Admin API |
-| `team.created / updated / deleted` | Admin API |
-| `apikey.created / revoked` | Admin API |
-| `model.enabled / disabled / upgraded` | Runtime controller |
-| `policy.created / updated` | Admin API |
-| `budget.exceeded.soft / hard` | Budget enforcer |
-| `endpoint.start / stop / fail` | Model controller |
-| `gpu.allocated / released` | GPU inventory |
-
-**Go service needed:**
-- `internal/audit/service.go` — `Record(ctx, event AuditEvent)` method
-- Async write via Redis buffered channel (non-blocking on hot path)
-- Injected into all admin handlers
-
-**API endpoints:**
-```
-GET /admin/v1/audit-logs
-  ?actor=<user_id>
-  ?action=apikey.revoked
-  ?resource_type=team
-  ?from=2026-01-01&to=2026-01-31
-  ?page=1&per_page=50
-```
-
-**Estimated effort:** 3–4 days
-
----
-
-## Phase 6 — Web Admin UI
-
-**Goal:** Visual management panel so admins don't need curl.
-
-**Tech stack:** Next.js 14 · TypeScript · TailwindCSS · shadcn/ui · React Query
-
-**Folder structure:**
-```
-web/
-├── app/
-│   ├── (auth)/
-│   │   └── login/page.tsx          ← SSO login + API key login
-│   ├── (dashboard)/
-│   │   ├── layout.tsx              ← sidebar navigation
-│   │   ├── page.tsx                ← Dashboard overview
-│   │   ├── organizations/
-│   │   │   ├── page.tsx            ← list orgs
-│   │   │   └── [id]/page.tsx       ← org detail + teams
-│   │   ├── teams/
-│   │   │   ├── page.tsx
-│   │   │   └── [id]/
-│   │   │       ├── page.tsx        ← team detail, members, policy
-│   │   │       └── api-keys/page.tsx
-│   │   ├── models/
-│   │   │   ├── page.tsx            ← model list + health badges
-│   │   │   └── [id]/page.tsx       ← endpoint pool, lifecycle, logs
-│   │   ├── gpu/page.tsx            ← GPU nodes, devices, utilization
-│   │   ├── usage/page.tsx          ← charts: tokens, cost, requests/day
-│   │   ├── budgets/page.tsx
-│   │   ├── audit-logs/page.tsx
-│   │   ├── policies/
-│   │   │   ├── prompt/page.tsx
-│   │   │   └── gateway/page.tsx
-│   │   ├── aliases/page.tsx
-│   │   └── settings/
-│   │       ├── sso/page.tsx
-│   │       └── rbac/page.tsx
-│   └── api/                        ← Next.js API routes (thin proxy to Go admin)
-├── components/
-│   ├── ui/                         ← shadcn/ui primitives
-│   ├── layout/
-│   │   ├── Sidebar.tsx
-│   │   └── Header.tsx
-│   ├── models/
-│   │   ├── ModelCard.tsx
-│   │   ├── EndpointHealthBadge.tsx
-│   │   └── LifecycleStateBadge.tsx
-│   ├── gpu/
-│   │   ├── GPUUtilizationBar.tsx
-│   │   └── GPUPackingVisualizer.tsx
-│   ├── usage/
-│   │   ├── TokenUsageChart.tsx
-│   │   ├── CostChart.tsx
-│   │   └── RequestsPerDayChart.tsx
-│   ├── teams/
-│   │   ├── TeamPolicyForm.tsx
-│   │   └── APIKeyTable.tsx
-│   └── audit/
-│       └── AuditLogTable.tsx
-├── lib/
-│   ├── api/                        ← typed API client (fetch wrappers)
-│   │   ├── client.ts               ← base client with auth header
-│   │   ├── models.ts
-│   │   ├── teams.ts
-│   │   ├── gpu.ts
-│   │   ├── usage.ts
-│   │   └── audit.ts
-│   ├── hooks/                      ← React Query hooks
-│   │   ├── useModels.ts
-│   │   ├── useGPU.ts
-│   │   └── useUsage.ts
-│   └── types/                      ← TypeScript types matching Go structs
-├── public/
-├── next.config.ts
-├── tailwind.config.ts
-└── package.json
-```
-
-**Key pages:**
-
-| Page | Key Components | Data Source |
+| service_type | Example Runtimes | Backend |
 |---|---|---|
-| Dashboard | request rate chart, GPU util, active models, top teams | `/admin/v1/usage/...` + Prometheus |
-| Models | health badge per endpoint, start/stop buttons, lifecycle state | `/admin/v1/models` |
-| GPU Inventory | device list, VRAM bars, allocation table, packing simulator | `/admin/v1/gpu/nodes` |
-| Teams | policy form, member list, API key table | `/admin/v1/orgs/:id/teams` |
-| Usage Analytics | token charts per team/model, cost per day/month | `/admin/v1/usage/teams/:id` |
-| Audit Logs | filterable table, actor + action + before/after | `/admin/v1/audit-logs` |
-| Settings → SSO | provider config form, test connection | `/admin/v1/sso/providers` |
+| `CHAT` | vLLM, Ollama, TGI | `vllm` / `ollama` / `tgi` |
+| `EMBEDDING` | Infinity, TEI, FastEmbed | `cpu_native` / `openai_compat` |
+| `RERANK` | TEI rerank, Cohere-compat | `cpu_native` |
+| `STT` | faster-whisper-server, whisper.cpp | `cpu_native` |
+| `TTS` | Kokoro TTS, Coqui TTS | `cpu_native` |
+| `OCR` | EasyOCR REST, Tesseract API | `cpu_native` |
+| `AGENT` | LangChain serve, custom agents | `openai_compat` |
+| `MCP` | MCP HTTP bridges | `openai_compat` |
 
-**Estimated effort:** 10–14 days
+Admin API:
+- `POST /admin/v1/services` — register existing service
+- `POST /admin/v1/services/deploy` — register + auto-place + deploy
+- `GET  /admin/v1/services[?type=EMBEDDING]` — list services
+- `GET/PUT /admin/v1/services/:id/reservation` — resource reservations
+
+### OpenAI Compatible Multi-Service Gateway (v0.5 — new)
+- `POST /v1/chat/completions` — LLM chat (existing)
+- `POST /v1/embeddings` — embedding models (existing)
+- `POST /v1/rerank` — reranker models (new)
+- `POST /v1/audio/transcriptions` — STT/Whisper (new)
+- `POST /v1/audio/speech` — TTS engines (new)
+- `POST /v1/ocr` — OCR services (new)
+
+All endpoints follow the same auth → policy → alias → failover pipeline.
+
+### Resource Reservation Engine (v0.5 — new)
+Services declare resource envelopes in `resource_reservations`:
+
+```json
+{
+  "model_id": "...",
+  "min_vram_mb": 81920,
+  "max_vram_mb": 122880,
+  "priority": "critical",
+  "preferred_runtime": "GPU_RUNTIME"
+}
+```
+
+CPU-native services:
+```json
+{
+  "cpu_cores": 32,
+  "ram_mb": 65536,
+  "numa_node_pref": 0,
+  "priority": "normal",
+  "preferred_runtime": "CPU_RUNTIME"
+}
+```
+
+### Cluster-Ready Multi-Server Architecture (v0.5 — new)
+- **`nodes` table** — hostname, total_cpu, total_ram_mb, total_vram_mb, status, labels
+- `model_endpoints` and `cpu_allocations` reference `node_id`
+- Placement engine queries `nodes` first, then narrows to GPU/CPU devices on that node
+- Current deployment: 1 node (`nexus-h200-01`). Adding nodes = inserting rows.
+- No Kubernetes, no distributed scheduler — pure PostgreSQL coordination.
+
+### Node Agent (v0.5 — new)
+`internal/nodeagent/` runs in-process (single server) or standalone (multi-server):
+- Collects: CPU util, RAM, disk, NUMA topology via `/proc`
+- Collects: GPU metrics via `nvidia-smi` (util, VRAM, temp, power, fan, PCIe bus)
+- Reports: inventory snapshot on startup, telemetry every 30 s
+- Writes: `node_telemetry`, `gpu_telemetry`, `node_inventory_snapshots`
+- Heartbeat: `UPDATE nodes SET status='online', last_heartbeat_at=NOW()`
+
+Admin API:
+- `POST /admin/v1/nodes/:id/heartbeat` — agent liveness
+- `POST /admin/v1/nodes/:id/inventory` — push full inventory
+- `GET  /admin/v1/nodes/:id/telemetry` — last 60 telemetry snapshots
+- `GET  /admin/v1/nodes/:id/inventory` — latest inventory snapshot
 
 ---
 
-## Phase 7 — Budget & Cost Management
+## Recommended H200 Service Layout
 
-**Goal:** Hard and soft spending limits per team and org, with automatic throttling.
+```
+GPU 0 (144 GB VRAM, NUMA 0)
+├── Qwen3-32B          — 65 GB  (vLLM, tensor_parallel=1)
+└── DeepSeek-Coder-7B  — 16 GB  (vLLM, tensor_parallel=1)
+    Reserve: 63 GB for on-demand loading
 
-**DB schema:**
-```sql
-CREATE TABLE budgets (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    scope           VARCHAR(20) NOT NULL CHECK (scope IN ('org','team')),
-    scope_id        UUID NOT NULL,
-    period          VARCHAR(10) NOT NULL DEFAULT 'monthly', -- monthly | daily
-    limit_usd       NUMERIC(12,4) NOT NULL,
-    soft_limit_pct  INTEGER NOT NULL DEFAULT 80,  -- alert at 80%
-    hard_limit_pct  INTEGER NOT NULL DEFAULT 100, -- throttle at 100%
-    action_on_hard  VARCHAR(20) NOT NULL DEFAULT 'throttle', -- throttle | block
-    notify_emails   JSONB NOT NULL DEFAULT '[]',
-    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(scope, scope_id, period)
-);
+GPU 1 (144 GB VRAM, NUMA 1)
+├── Llama-3.3-70B      — 140 GB (vLLM, tensor_parallel=1, fp8)
+    Reserve: 4 GB headroom
+
+CPU Pool (384 vCPUs, 1 TB RAM)
+├── NUMA 0 (cores 0-191, ~512 GB RAM)
+│   ├── Embedding Service (Infinity/TEI) — 32 cores, 64 GB
+│   ├── Reranker Service (TEI rerank)    — 16 cores, 32 GB
+│   └── MCP Bridge Services             — 8 cores,  8 GB
+└── NUMA 1 (cores 192-383, ~512 GB RAM)
+    ├── Whisper STT (faster-whisper)     — 32 cores, 16 GB
+    ├── Kokoro TTS                       — 16 cores, 8 GB
+    ├── OCR Service (EasyOCR)            — 16 cores, 16 GB
+    └── Agent Runtimes                   — 64 cores, 128 GB
 ```
 
-**Enforcement flow:**
-```
-Every request (in policy engine hot path):
-  1. Get current period spend → Redis counter (refreshed every 5min from DB)
-  2. If spend >= soft_limit: add X-Nexus-Budget-Warning header
-  3. If spend >= hard_limit AND action = throttle: inject 5s delay
-  4. If spend >= hard_limit AND action = block: return HTTP 429 with budget_exceeded
-  5. Background job checks budgets every hour, sends email alerts at thresholds
-```
+### GPU Allocation Examples
 
-**Go service needed:**
-- `internal/budget/enforcer.go`
-- `internal/budget/notifier.go` (email via SMTP)
-- Budget check integrated into `internal/policy/engine.go`
+| Model | VRAM | GPU | tensor_parallel | Placement |
+|---|---|---|---|---|
+| Qwen3-32B | ~65 GB | GPU 0 | 1 | `auto_place: true, min_vram_mb: 65536` |
+| DeepSeek-Coder-7B | ~16 GB | GPU 0 | 1 | fits on GPU 0 with Qwen3-32B |
+| Llama-3.3-70B | ~140 GB | GPU 1 | 1 | fp8 quantization |
+| DeepSeek-V3 | 288 GB | GPU 0+1 | 2 | `gpu_count: 2, min_vram_mb: 144000` |
 
-**API endpoints:**
-```
-POST   /admin/v1/budgets
-GET    /admin/v1/budgets/:scope/:scope_id
-PUT    /admin/v1/budgets/:id
-DELETE /admin/v1/budgets/:id
-GET    /admin/v1/budgets/:id/status   ← current spend vs limit
-```
+### CPU Workload Placement
 
-**Estimated effort:** 3–4 days
+| Service | Cores | RAM | NUMA | Priority |
+|---|---|---|---|---|
+| Embedding (Infinity) | 32 | 64 GB | 0 | normal |
+| Reranker (TEI) | 16 | 32 GB | 0 | normal |
+| Whisper STT | 32 | 16 GB | 1 | normal |
+| Kokoro TTS | 16 | 8 GB | 1 | low |
+| OCR (EasyOCR) | 16 | 16 GB | 1 | low |
+| Agent Runtimes | 64 | 128 GB | 1 | high |
+| MCP Bridges | 8 | 8 GB | 0 | best_effort |
 
 ---
 
-## Phase 8 — ClickHouse Analytics Layer
+## Roadmap
 
-**Goal:** High-performance analytics for token usage, cost, latency, TTFT — much faster than PostgreSQL for time-series queries.
+### v0.6 — Observability & Web UI
+- [ ] Prometheus metrics for all new service types (rerank, STT, TTS, OCR)
+- [ ] GPU telemetry Prometheus gauges (temperature, power, fan from node agent)
+- [ ] Node agent dashboard in web UI
+- [ ] AI Service Registry UI (list, deploy, manage all service types)
+- [ ] Placement decisions history page
+- [ ] Real-time resource utilisation gauges (VRAM, CPU, RAM per node)
 
-**Architecture:**
-```
-nexus-gateway
-    │  usage event (async)
-    ▼
-Redis Stream (nexus:usage:events)
-    │
-    ▼
-Usage Consumer (Go goroutine)
-    ├── PostgreSQL  ← operational data (quotas, billing)
-    └── ClickHouse  ← analytics (charts, dashboards, reports)
-```
+### v0.7 — Dynamic Load & Eviction
+- [ ] Idle eviction for CPU_RUNTIME services (lifecycle manager extension)
+- [ ] On-demand model loading triggered by first request (cold start)
+- [ ] VRAM pressure eviction — evict LRU model when GPU is full
+- [ ] Swap-to-RAM support for idle models (vLLM `--cpu-offload-gb`)
+- [ ] Priority-aware eviction: `best_effort` evicted before `critical`
 
-**ClickHouse schema:**
-```sql
-CREATE TABLE usage_events (
-    event_id          UUID,
-    org_id            UUID,
-    team_id           UUID,
-    model_name        LowCardinality(String),
-    endpoint_id       UUID,
-    request_id        String,
-    prompt_tokens     UInt32,
-    completion_tokens UInt32,
-    total_tokens      UInt32,
-    latency_ms        UInt32,
-    ttft_ms           UInt32,
-    queue_wait_ms     UInt32,
-    status            Enum8('success'=1,'error'=2,'timeout'=3,'rejected'=4),
-    error_code        Nullable(String),
-    cost_usd          Float64,
-    gpu_cache_util    Float32,
-    created_at        DateTime64(3)
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(created_at)
-ORDER BY (org_id, team_id, created_at)
-TTL created_at + INTERVAL 365 DAY;
+### v0.8 — Multi-Server Expansion
+- [ ] Node Agent standalone binary (`cmd/nodeagent`)
+- [ ] Node Agent → Admin API push protocol (gRPC or HTTP)
+- [ ] Cross-node placement scoring (network bandwidth between nodes)
+- [ ] Distributed GPU allocation with lease-based concurrency control
+- [ ] Node health monitoring with automatic failover
 
--- Pre-aggregated hourly view
-CREATE MATERIALIZED VIEW usage_hourly
-ENGINE = SummingMergeTree()
-ORDER BY (team_id, model_name, hour)
-AS SELECT
-    team_id, model_name,
-    toStartOfHour(created_at) AS hour,
-    sum(total_tokens) AS total_tokens,
-    sum(cost_usd) AS cost_usd,
-    count() AS requests,
-    avg(latency_ms) AS avg_latency_ms,
-    avg(ttft_ms) AS avg_ttft_ms
-FROM usage_events GROUP BY team_id, model_name, hour;
-```
+### v0.9 — Production Hardening
+- [ ] TLS termination on gateway and admin
+- [ ] Admin API authentication (API key or mTLS)
+- [ ] Rolling deployments (blue-green endpoint swap)
+- [ ] Backup / restore for model registry state
+- [ ] Rate limiting on admin API
+- [ ] Audit log retention policy
 
-**Go changes needed:**
-- Add ClickHouse client to `internal/usage/tracker.go`
-- Dual-write: PostgreSQL for quotas, ClickHouse for analytics
-- Grafana datasource: ClickHouse plugin
-
-**Docker Compose addition:**
-```yaml
-clickhouse:
-  image: clickhouse/clickhouse-server:24.3
-  ports: ["8123:8123", "9000:9000"]
-  volumes:
-    - clickhouse_data:/var/lib/clickhouse
-    - ./migrations/clickhouse/:/docker-entrypoint-initdb.d/
-```
-
-**Estimated effort:** 4–5 days
-
----
-
-## Phase 9 — MCP / Tool Gateway
-
-**Goal:** Controlled access to external tools (GitHub, Jira, etc.) through NexusLLM's policy engine — teams get tool access based on their permissions, with full audit trail.
-
-**Architecture:**
-```
-Team App ──► POST /v1/tools/call
-              │
-              ▼
-       Tool Gateway Middleware
-              │
-         ┌────▼──────┐
-         │  Policy   │  check team tool permissions
-         │  Check    │
-         └────┬──────┘
-              │ allowed
-              ▼
-       Tool Registry → route to correct MCP server / API adapter
-              │
-              ▼
-    GitHub API / Jira API / Internal API / MCP Server
-              │
-              ▼
-       Audit Log (tool call recorded)
-              │
-              ▼
-         Response
-```
-
-**DB schema:**
-```sql
-CREATE TABLE tool_definitions (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name         VARCHAR(255) NOT NULL UNIQUE,  -- "github.read_repo"
-    display_name VARCHAR(255),
-    tool_type    VARCHAR(50),   -- github | jira | confluence | mcp | internal_api
-    endpoint_url VARCHAR(512),
-    auth_type    VARCHAR(50),   -- none | bearer | basic | oauth2
-    auth_secret  TEXT,          -- encrypted
-    schema_json  JSONB,         -- JSON Schema for call parameters
-    enabled      BOOLEAN DEFAULT TRUE,
-    created_at   TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE tool_permissions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    scope       VARCHAR(20) CHECK (scope IN ('org','team','api_key')),
-    scope_id    UUID NOT NULL,
-    tool_id     UUID REFERENCES tool_definitions(id) ON DELETE CASCADE,
-    allow       BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(scope, scope_id, tool_id)
-);
-```
-
-**API endpoints:**
-```
-GET    /v1/tools                              ← list tools allowed for calling key
-POST   /v1/tools/call                         ← execute a tool call
-
-POST   /admin/v1/tools                        ← register tool
-GET    /admin/v1/tools
-POST   /admin/v1/tools/:id/permissions        ← grant to team/org
-DELETE /admin/v1/tools/:id/permissions/:perm_id
-```
-
-**Estimated effort:** 6–8 days
-
----
-
-## Implementation Order & Timeline
-
-```
-PHASE 4 — Identity & Access (Week 1–2)
-  ├── 4.1 RBAC schema + middleware          3–5 days
-  └── 4.2 SSO / OIDC integration            5–7 days
-
-PHASE 5 — Audit Logging (Week 2–3)
-  └── Audit service + API + migration       3–4 days
-
-PHASE 6 — Web Admin UI (Week 3–5)
-  └── Next.js app, all pages, API client    10–14 days
-
-PHASE 7 — Budget & Cost (Week 5–6)
-  └── Budget enforcer + notifier            3–4 days
-
-PHASE 8 — ClickHouse Analytics (Week 6–7)
-  └── Dual-write pipeline + schema          4–5 days
-
-PHASE 9 — MCP Tool Gateway (Week 7–9)
-  └── Tool registry + policy + adapters     6–8 days
-
-─────────────────────────────────────────
-TOTAL: ~9 weeks for full enterprise platform
-```
-
----
-
-## Production Readiness Gaps (Fix Before Any Phase)
-
-These are existing risks that should be addressed in parallel with new features:
-
-| Risk | Severity | Fix |
-|---|---|---|
-| JWT secret `dev-secret` in default config | 🔴 Critical | Enforce non-default via startup check |
-| No TLS on Admin API | 🔴 Critical | Add TLS termination (nginx reverse proxy) |
-| No rate limit on Admin API | 🔴 Critical | Add IP-based rate limit middleware |
-| PostgreSQL no SSL in compose | 🟠 High | Add `sslmode=require` in prod config |
-| Redis no password in dev compose | 🟠 High | Add `requirepass` in prod config |
-| API key hashes exposed in logs | 🟠 High | Audit log output for key_hash leaks |
-| No request body size limit on gateway | 🟡 Medium | Add `MaxBytesReader` on all handlers |
-| Usage consumer single goroutine | 🟡 Medium | Add consumer group with 2–3 workers |
-| No health check on Admin API | 🟡 Medium | Add `/healthz` with DB ping |
-| Audit log table not write-protected | 🟡 Medium | Use append-only DB role for audit writes |
-| No backup config for PostgreSQL | 🟡 Medium | Add `pg_dump` cron in docker-compose |
-| Prometheus metrics port public | 🟡 Medium | Bind metrics to `127.0.0.1` only |
-| No CORS config on gateway | 🟡 Medium | Add explicit CORS middleware |
-
----
-
-## Full Feature Checklist After All Phases
-
-```
-Core Platform (done)
-  [x] Multi-tenant (orgs/teams)
-  [x] API key + JWT auth
-  [x] OpenAI-compatible inference
-  [x] Model lifecycle management
-  [x] GPU inventory + packing
-  [x] Prompt policy engine
-  [x] Gateway policy engine
-  [x] Usage tracking
-  [x] Model aliases
-  [x] Scheduler + priority queue
-  [x] Runtime controller (start/stop/upgrade)
-  [x] Multi-backend (vLLM/Ollama/TGI)
-  [x] Prometheus + Grafana
-
-Phase 4 — Identity
-  [ ] RBAC (roles + permissions)
-  [ ] SSO / OIDC (Keycloak, Azure AD, Google)
-
-Phase 5 — Audit
-  [ ] Immutable audit log
-  [ ] Before/after state tracking
-  [ ] Searchable audit API
-
-Phase 6 — Web UI
-  [ ] Dashboard
-  [ ] Team/org management
-  [ ] API key management
-  [ ] Model health monitor
-  [ ] GPU utilization view
-  [ ] Usage analytics charts
-  [ ] Budget management
-  [ ] Audit log viewer
-  [ ] Policy management
-  [ ] SSO config
-
-Phase 7 — Budget
-  [ ] Per-team monthly budget
-  [ ] Per-org monthly budget
-  [ ] Soft limit alerts (email)
-  [ ] Hard limit enforcement (throttle/block)
-
-Phase 8 — ClickHouse
-  [ ] Dual-write pipeline
-  [ ] ClickHouse schema + materialized views
-  [ ] Grafana ClickHouse dashboards
-
-Phase 9 — Tool Gateway
-  [ ] Tool registry
-  [ ] Tool permission policies
-  [ ] GitHub / Jira / Confluence adapters
-  [ ] MCP server proxy
-  [ ] Tool audit log
-```
+### v1.0 — GA
+- [ ] Stable API (no breaking changes after this)
+- [ ] Full integration test suite
+- [ ] Load test benchmarks (requests/sec per service type on H200)
+- [ ] Production runbook and on-call guide
+- [ ] Helm chart for containerised deployment (single-node)

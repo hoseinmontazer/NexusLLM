@@ -24,39 +24,45 @@ const (
 // RuntimeSpec describes everything needed to start a model runtime.
 type RuntimeSpec struct {
 	// Logical identity
-	ModelName   string
-	Version     string
-	EndpointID  string
+	ModelName       string // HuggingFace model ID or local path (e.g. "google/gemma-3-27b-it")
+	ServedModelName string // Short name clients use (e.g. "gemma-3-27b")
+	Version         string
+	EndpointID      string
+	BackendType     string // vllm | ollama | tgi | openai_compat | cpu_native
 
 	// Container image
-	Image       string
+	Image string
 
 	// Networking
-	BindHost    string
-	BindPort    int
+	BindHost string
+	BindPort int
 
-	// GPU assignment
-	GPUDevices  []int  // device indices, e.g. [0, 1]
+	// GPU assignment (GPU_RUNTIME only)
+	GPUDevices []int // device indices, e.g. [0, 1]
 
 	// vLLM / backend flags
-	TensorParallel   int
-	GPUMemoryUtil    float64
-	MaxModelLen      int
-	Dtype            string
-	Quantization     string
-	ExtraArgs        []string
+	TensorParallel int
+	GPUMemoryUtil  float64
+	MaxModelLen    int
+	Dtype          string
+	Quantization   string
+	ExtraArgs      []string
 
 	// Environment variables
 	Env map[string]string
 
 	// Resource limits
-	CPULimit    string  // e.g. "4"
-	MemoryLimit string  // e.g. "16g"
+	CPULimit    string // e.g. "4" (number of CPUs)
+	MemoryLimit string // e.g. "16g"
 
-	// Kubernetes-specific
-	Namespace       string
-	DeploymentName  string
-	NodeSelector    map[string]string
+	// CPU_RUNTIME placement (set by placement engine)
+	// CPUSetCPUs pins the container to specific logical CPU cores (e.g. "0-31").
+	// NUMANode is the NUMA node index (-1 = no affinity).
+	// When NUMANode ≥ 0 and CPUSetCPUs is empty, the driver auto-derives
+	// the cpuset from numactl topology.
+	CPUSetCPUs  string // e.g. "0-31" or "0,2,4"
+	NUMANode    int    // -1 = no preference
+	RuntimeType string // "GPU_RUNTIME" | "CPU_RUNTIME"
 }
 
 // RuntimeStatus is a point-in-time snapshot of a running runtime.

@@ -123,8 +123,8 @@ func (w *Watcher) checkAll(ctx context.Context) {
 // checkOne health-checks a single endpoint, applies circuit-breaker logic,
 // persists the result, and updates Prometheus metrics.
 func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) {
-	// Pick the right backend for this endpoint.
-	backend, err := w.registry.backendForEndpoint(ep.ModelID)
+	// Pick the backend that matches THIS endpoint's type (ollama, vllm, tgi, etc.)
+	backend, err := w.registry.BackendForEndpoint(ep)
 	if err != nil {
 		return
 	}
@@ -178,20 +178,36 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 }
 
 func (w *Watcher) persistHealthResult(ctx context.Context, epID string, h EndpointHealth) {
+	isHealthy := h.Status == StatusHealthy
+
 	// Update the main endpoint row.
-	_, _ = w.db.ExecContext(ctx, `
+	// Use separate parameters for the CASE branches to avoid lib/pq type
+	// inference issues when the same placeholder appears in both SET and WHERE
+	// positions with different type contexts.
+	res, err := w.db.ExecContext(ctx, `
 		UPDATE model_endpoints
 		SET health_status    = $1,
 		    last_checked_at  = $2,
 		    response_time_ms = $3,
-		    consecutive_failures = CASE WHEN $1 = 'healthy' THEN 0
+		    consecutive_failures = CASE WHEN $4 THEN 0
 		                               ELSE consecutive_failures + 1 END,
-		    last_success_at  = CASE WHEN $1 = 'healthy' THEN $2
+		    last_success_at  = CASE WHEN $4 THEN $2
 		                            ELSE last_success_at END,
 		    updated_at       = NOW()
-		WHERE id = $4`,
-		string(h.Status), h.CheckedAt, h.LatencyMs, epID,
+		WHERE id = $5`,
+		string(h.Status), h.CheckedAt, h.LatencyMs, isHealthy, epID,
 	)
+	if err != nil {
+		w.log.Warn("health persist UPDATE failed",
+			zap.String("endpoint_id", epID),
+			zap.String("status", string(h.Status)),
+			zap.Error(err),
+		)
+	} else if n, _ := res.RowsAffected(); n == 0 {
+		w.log.Debug("health persist UPDATE matched 0 rows — endpoint may have been removed",
+			zap.String("endpoint_id", epID),
+		)
+	}
 
 	// Append to health log (kept for trending / alerting).
 	_, _ = w.db.ExecContext(ctx, `

@@ -140,8 +140,8 @@ func (b *vllmBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse
 		return nil, fmt.Errorf("marshal chat request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		r.EndpointURL+"/v1/chat/completions", bytes.NewReader(body))
+	chatURL := r.EndpointURL + "/v1/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func (b *vllmBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("chat completion: %w", err)
+		return nil, fmt.Errorf("chat completion to %s: %w", chatURL, err)
 	}
 
 	br := &BackendResponse{

@@ -176,3 +176,87 @@ type Model struct {
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt   time.Time `db:"updated_at" json:"updated_at"`
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-Service API types (added for AI Platform expansion)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// RerankRequest mirrors the Cohere / Jina rerank API.
+type RerankRequest struct {
+	Model     string   `json:"model"`
+	Query     string   `json:"query"     binding:"required"`
+	Documents []string `json:"documents" binding:"required"`
+	TopN      *int     `json:"top_n,omitempty"`
+	ReturnDocuments *bool `json:"return_documents,omitempty"`
+}
+
+// RerankResult is one ranked document.
+type RerankResult struct {
+	Index          int     `json:"index"`
+	RelevanceScore float64 `json:"relevance_score"`
+	Document       *string `json:"document,omitempty"` // only if return_documents=true
+}
+
+// RerankResponse is the response from a rerank endpoint.
+type RerankResponse struct {
+	Model   string         `json:"model"`
+	Results []RerankResult `json:"results"`
+	Usage   EmbeddingUsage `json:"usage"`
+}
+
+// TranscriptionRequest mirrors the OpenAI /v1/audio/transcriptions API.
+// Note: in real usage this is multipart/form-data; we model the parsed fields.
+type TranscriptionRequest struct {
+	Model       string  `json:"model"`
+	Language    string  `json:"language,omitempty"`
+	Prompt      string  `json:"prompt,omitempty"`
+	Temperature float64 `json:"temperature,omitempty"`
+	// File content is handled separately in the handler (multipart upload).
+}
+
+// TranscriptionResponse mirrors the OpenAI transcription response.
+type TranscriptionResponse struct {
+	Text string `json:"text"`
+}
+
+// SpeechRequest mirrors the OpenAI /v1/audio/speech API.
+type SpeechRequest struct {
+	Model          string  `json:"model"           binding:"required"`
+	Input          string  `json:"input"           binding:"required"`
+	Voice          string  `json:"voice,omitempty"`
+	ResponseFormat string  `json:"response_format,omitempty"` // mp3, opus, aac, flac, wav
+	Speed          float64 `json:"speed,omitempty"`
+}
+
+// OCRRequest describes a request to the /v1/ocr endpoint.
+type OCRRequest struct {
+	Model    string `json:"model"`
+	ImageURL string `json:"image_url,omitempty"` // URL or base64 data URI
+	Language string `json:"language,omitempty"`
+}
+
+// OCRResponse is the parsed text from an OCR request.
+type OCRResponse struct {
+	Text   string  `json:"text"`
+	Model  string  `json:"model"`
+	Pages  []OCRPage `json:"pages,omitempty"`
+}
+
+// OCRPage is text extracted from one page/region.
+type OCRPage struct {
+	Page int    `json:"page"`
+	Text string `json:"text"`
+}
+
+// ServiceType constants mirror those in the placement and services packages.
+// Reproduced here to keep models/ free of cross-package dependencies.
+const (
+	ServiceTypeChat      = "CHAT"
+	ServiceTypeEmbedding = "EMBEDDING"
+	ServiceTypeRerank    = "RERANK"
+	ServiceTypeSTT       = "STT"
+	ServiceTypeTTS       = "TTS"
+	ServiceTypeOCR       = "OCR"
+	ServiceTypeAgent     = "AGENT"
+	ServiceTypeMCP       = "MCP"
+)

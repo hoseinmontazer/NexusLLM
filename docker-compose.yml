@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ─────────────────────────────────────────────────────────────────────────────
 # NexusLLM — local development stack (no GPU required)
 #
@@ -38,12 +36,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
-      - ./migrations/002_seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql
-      - ./migrations/003_runtime_layer.sql:/docker-entrypoint-initdb.d/03_runtime.sql
-      - ./migrations/004_single_gpu_runtime_seed.sql:/docker-entrypoint-initdb.d/04_seed_runtime.sql
-      - ./migrations/005_enterprise_platform.sql:/docker-entrypoint-initdb.d/05_enterprise.sql
-      - ./migrations/006_controller_columns.sql:/docker-entrypoint-initdb.d/06_controller.sql
+      - ./migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nexus -d nexusllm"]
       interval: 5s

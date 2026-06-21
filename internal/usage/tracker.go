@@ -239,7 +239,7 @@ type TeamSummary struct {
 
 // GetTeamDailyUsage returns daily usage for a team in a date range.
 func (t *Tracker) GetTeamDailyUsage(ctx context.Context, teamID, from, to string) ([]TeamSummary, error) {
-	var rows []TeamSummary
+	rows := []TeamSummary{}
 	err := t.db.SelectContext(ctx, &rows, `
 		SELECT team_id, model_name, day::text, request_count, error_count,
 		       prompt_tokens, completion_tokens, total_tokens, cost_usd

@@ -22,7 +22,8 @@ const (
 type Endpoint struct {
 	ID          string
 	ModelID     string
-	URL         string          // http://host:port/v1 (base path included)
+	BackendType BackendType     // used by watcher to pick the right health-check method
+	URL         string          // http://host:port (base URL, no path)
 	Weight      int             // used by weighted strategy (0 = excluded)
 	Priority    int             // 1 = primary, 2+ = standby (active/passive)
 	Status      HealthStatus

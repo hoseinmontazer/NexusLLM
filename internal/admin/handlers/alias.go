@@ -58,10 +58,18 @@ func (h *AliasHandler) DeleteAlias(c *gin.Context) {
 func (h *AliasHandler) ListAliases(c *gin.Context) {
 	teamID := c.Query("team_id")
 	orgID := c.Query("org_id")
+	// Require at least one valid-looking ID to avoid bad UUID queries
+	if teamID == "" && orgID == "" {
+		c.JSON(http.StatusOK, gin.H{"data": []alias.AliasRow{}, "total": 0})
+		return
+	}
 	rows, err := h.resolver.ListAliases(c.Request.Context(), teamID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	if rows == nil {
+		rows = []alias.AliasRow{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
 }

@@ -67,12 +67,15 @@ func (h *OrgHandler) GetOrg(c *gin.Context) {
 
 // ListOrgs handles GET /admin/v1/orgs
 func (h *OrgHandler) ListOrgs(c *gin.Context) {
-	var orgs []models.Organization
+	orgs := []models.Organization{}
 	err := h.db.SelectContext(c.Request.Context(), &orgs,
 		`SELECT id, name, slug, active, created_at, updated_at FROM organizations ORDER BY created_at DESC`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
+	}
+	if orgs == nil {
+		orgs = []models.Organization{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": orgs, "total": len(orgs)})
 }

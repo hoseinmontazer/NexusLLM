@@ -194,18 +194,21 @@ func (inv *Inventory) UpdateTelemetry(ctx context.Context, deviceID string, util
 		utilPct, tempC, powerW, deviceID)
 }
 
-// ListNodes returns all registered GPU nodes with their devices.
+// ListNodes returns all registered GPU nodes.
 func (inv *Inventory) ListNodes(ctx context.Context) ([]Node, error) {
 	var nodes []Node
 	err := inv.db.SelectContext(ctx, &nodes,
 		`SELECT id, name, host, driver_type, total_vram_mb, is_available, created_at
 		 FROM gpu_nodes WHERE is_available = TRUE ORDER BY name`)
+	if nodes == nil {
+		nodes = []Node{}
+	}
 	return nodes, err
 }
 
 // ListDevices returns all devices, optionally filtered by node.
 func (inv *Inventory) ListDevices(ctx context.Context, nodeID string) ([]Device, error) {
-	var devices []Device
+	devices := make([]Device, 0)
 	query := `SELECT id, node_id, device_index, name, vram_mb, status,
 	           utilization_pct, temperature_c, power_draw_w, last_seen_at
 	          FROM gpu_devices`

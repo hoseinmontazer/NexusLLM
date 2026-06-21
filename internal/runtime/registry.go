@@ -33,9 +33,10 @@ type RegistryEndpoint struct {
 	ConsecutiveFailures int         `db:"consecutive_failures"`
 }
 
-// URL builds the full base URL from host, port, and base_path.
+// URL builds the base URL from host and port (no base_path).
+// Backends append their own paths (e.g. /v1/chat/completions).
 func (r *RegistryEndpoint) URL() string {
-	return fmt.Sprintf("http://%s:%d%s", r.Host, r.Port, r.BasePath)
+	return fmt.Sprintf("http://%s:%d", r.Host, r.Port)
 }
 
 // Registry is the in-process runtime catalogue.
@@ -68,6 +69,20 @@ func NewRegistry(db *sqlx.DB, rdb *redis.Client, factory *Factory, log *zap.Logg
 	return r, nil
 }
 
+// NewEmptyRegistry constructs a Registry with no endpoints loaded.
+// Used when the DB schema is not yet initialised; the registry will
+// populate itself once Reload is called successfully.
+func NewEmptyRegistry(db *sqlx.DB, rdb *redis.Client, factory *Factory, log *zap.Logger) (*Registry, error) {
+	return &Registry{
+		db:      db,
+		rdb:     rdb,
+		factory: factory,
+		log:     log,
+		pools:   make(map[string]*Pool),
+		bends:   make(map[string]Backend),
+	}, nil
+}
+
 // Reload re-reads all enabled endpoints from PostgreSQL and rebuilds every Pool.
 // Safe to call concurrently — uses a write lock only at the swap point.
 func (r *Registry) Reload(ctx context.Context) error {
@@ -84,12 +99,13 @@ func (r *Registry) Reload(ctx context.Context) error {
 		pool := newPools[row.ModelName]
 
 		ep := &Endpoint{
-			ID:       row.ID,
-			ModelID:  row.ModelID,
-			URL:      row.URL(),
-			Weight:   row.Weight,
-			Priority: row.Priority,
-			Status:   row.HealthStatus,
+			ID:          row.ID,
+			ModelID:     row.ModelID,
+			BackendType: row.BackendType,
+			URL:         row.URL(),
+			Weight:      row.Weight,
+			Priority:    row.Priority,
+			Status:      row.HealthStatus,
 		}
 		pool.Add(ep)
 
@@ -135,7 +151,7 @@ func (r *Registry) Resolve(modelName string) (*Endpoint, Backend, error) {
 		return nil, nil, err
 	}
 
-	backend, err := r.backendForEndpoint(ep.ModelID)
+	backend, err := r.BackendForEndpoint(ep)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -163,7 +179,7 @@ func (r *Registry) ResolveWithFailover(modelName string, maxAttempts int) (*Endp
 		}
 		tried[ep.ID] = true
 		if ep.IsAvailable() {
-			b, err := r.backendForEndpoint(ep.ModelID)
+			b, err := r.BackendForEndpoint(ep)
 			if err != nil {
 				continue
 			}
@@ -242,14 +258,51 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 	return rows, err
 }
 
+// BackendForEndpoint returns the Backend implementation for a given endpoint.
+// It uses the endpoint's BackendType field which is populated during Reload.
+func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
+	r.mu.RLock()
+	b, ok := r.bends[string(ep.BackendType)]
+	r.mu.RUnlock()
+	if ok {
+		return b, nil
+	}
+	// BackendType not yet registered — build and cache it
+	built, err := r.factory.Build(ep.BackendType)
+	if err != nil {
+		// Unknown backend type — fall back to openai_compat which is the most
+		// permissive (attempts /v1/models for health, accepts any JSON response)
+		r.log.Warn("unknown backend type in endpoint, falling back to openai_compat",
+			zap.String("backend_type", string(ep.BackendType)),
+			zap.String("endpoint_id", ep.ID),
+		)
+		built = r.factory.MustBuild(BackendOpenAICompat)
+	}
+	r.mu.Lock()
+	r.bends[string(ep.BackendType)] = built
+	r.mu.Unlock()
+	return built, nil
+}
+
 func (r *Registry) backendForEndpoint(modelID string) (Backend, error) {
-	// Find the backend type for this model from the DB row we loaded into pools.
-	// We stored it in bends keyed by backend type string.
-	// Fallback to vllm if not found.
+	// Legacy path used by proxy handler — finds a backend by scanning pools.
+	// The proxy resolves an *Endpoint first, so it should call BackendForEndpoint
+	// directly. This method is kept for the Resolve/ResolveWithFailover path.
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// Scan all pools to find the endpoint's backend type
+	for _, pool := range r.pools {
+		for _, ep := range pool.Endpoints() {
+			if ep.ModelID == modelID {
+				if b, ok := r.bends[string(ep.BackendType)]; ok {
+					return b, nil
+				}
+			}
+		}
+	}
+	// Fallback: return any registered backend (should not happen after Reload)
 	for _, b := range r.bends {
-		return b, nil // simplified: return first; production would key by model
+		return b, nil
 	}
 	return r.factory.Build(BackendVLLM)
 }
