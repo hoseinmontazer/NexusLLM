@@ -27,11 +27,34 @@ Cluster-ready: adding nodes requires only inserting rows into the `nodes` table.
 
 ---
 
-## Quick Start
+## Documentation
 
-```bash
-# 1. Start postgres + redis + run all migrations (001–006)
-make dev-up
+Full documentation is in the [`docs/`](docs/README.md) folder:
+
+| Page | Description |
+|---|---|
+| [What is NexusLLM?](docs/01-what-is-nexusllm.md) | Platform overview, service types, hardware targets |
+| [Quick Start](docs/02-quick-start.md) | Get running in 5 minutes — Ollama or vLLM |
+| [Architecture](docs/03-architecture.md) | Request flow, design decisions, schema overview |
+| [Organizations & Teams](docs/04-orgs-and-teams.md) | Multi-tenant setup, policies, model permissions |
+| [API Keys & Auth](docs/05-api-keys-and-auth.md) | Create keys, SDK usage, security |
+| [Model Registry](docs/06-models.md) | Import Ollama, deploy vLLM, lifecycle management |
+| [AI Service Registry](docs/07-ai-services.md) | Embeddings, STT, TTS, OCR, rerankers, MCP |
+| [Placement Engine](docs/08-placement.md) | Auto GPU/CPU placement, simulation, NUMA |
+| [Cluster Nodes](docs/09-nodes.md) | Node agent, telemetry, multi-server expansion |
+| [GPU Inventory](docs/10-gpu-inventory.md) | GPU registration, allocation, packing |
+| [Gateway API](docs/11-gateway-api.md) | Full inference API reference with examples |
+| [Policies](docs/12-policies.md) | Rate limits, quotas, priority queuing |
+| [Model Aliases](docs/13-aliases.md) | Virtual model names, OpenAI compatibility layer |
+| [Prompt Policies](docs/14-prompt-policies.md) | System prompt injection, PII, content filtering |
+| [Usage & Billing](docs/15-usage.md) | Token tracking, cost estimation, reporting |
+| [Web Admin UI](docs/16-web-ui.md) | All UI pages explained |
+| [Configuration](docs/17-configuration.md) | All environment variables, Prometheus metrics |
+| [Troubleshooting](docs/18-troubleshooting.md) | Common errors and fixes |
+
+---
+
+
 
 # 2. Run services (3 terminals)
 make run-gateway     # inference API  → :8080
