@@ -1,5 +1,5 @@
-.PHONY: build build-gateway build-admin build-scheduler \
-        run-gateway run-admin run-scheduler run-web web-install \
+.PHONY: build build-gateway build-admin build-scheduler build-nodeagent \
+        run-gateway run-admin run-scheduler run-nodeagent run-web web-install \
         test lint \
         docker-build docker-push \
         migrate dev-up dev-up-gpu dev-down \
@@ -21,7 +21,7 @@ endef
 # ─────────────────────────────────────────────────────────────────────────────
 # Build
 # ─────────────────────────────────────────────────────────────────────────────
-build: build-gateway build-admin build-scheduler
+build: build-gateway build-admin build-scheduler build-nodeagent
 
 build-gateway:
 	@echo "→ Building nexus-gateway..."
@@ -37,6 +37,11 @@ build-scheduler:
 	@echo "→ Building nexus-scheduler..."
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-scheduler ./cmd/scheduler
+
+build-nodeagent:
+	@echo "→ Building nexus-nodeagent..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-nodeagent ./cmd/nodeagent
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run locally (postgres + redis must be running via make dev-up)
@@ -59,6 +64,14 @@ run-admin: build-admin
 run-scheduler: build-scheduler
 	NEXUS_REDIS_ADDR="localhost:6379" \
 	./$(BINARY_DIR)/nexus-scheduler
+
+# Run the node agent — points at the local admin by default.
+# On remote nodes, set NEXUS_ADMIN_URL=http://<control-plane-ip>:8081
+run-nodeagent: build-nodeagent
+	NEXUS_ADMIN_URL="http://localhost:8081" \
+	NEXUS_AGENT_INTERVAL="30s" \
+	NEXUS_HEARTBEAT_INTERVAL="15s" \
+	./$(BINARY_DIR)/nexus-nodeagent
 
 run-web:
 	@echo "→ Starting Web Admin UI on http://localhost:3001"
@@ -85,11 +98,13 @@ docker-build:
 	docker build -f Dockerfile.gateway   -t $(REGISTRY)/gateway:$(VERSION)   .
 	docker build -f Dockerfile.admin     -t $(REGISTRY)/admin:$(VERSION)     .
 	docker build -f Dockerfile.scheduler -t $(REGISTRY)/scheduler:$(VERSION) .
+	docker build -f Dockerfile.nodeagent -t $(REGISTRY)/nodeagent:$(VERSION) .
 
 docker-push: docker-build
 	docker push $(REGISTRY)/gateway:$(VERSION)
 	docker push $(REGISTRY)/admin:$(VERSION)
 	docker push $(REGISTRY)/scheduler:$(VERSION)
+	docker push $(REGISTRY)/nodeagent:$(VERSION)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Database migrations

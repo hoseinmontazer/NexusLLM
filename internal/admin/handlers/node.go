@@ -293,7 +293,52 @@ func (h *NodeHandler) PushInventory(c *gin.Context) {
 	})
 }
 
-// GetTelemetry handles GET /admin/v1/nodes/:id/telemetry
+// PushTelemetry handles POST /admin/v1/nodes/:id/telemetry
+// Called by the node agent to push a hardware telemetry snapshot.
+func (h *NodeHandler) PushTelemetry(c *gin.Context) {
+	nodeID := c.Param("id")
+	var input struct {
+		CPUCoresTotal int     `json:"cpu_cores_total"`
+		CPUUtilPct    float64 `json:"cpu_util_pct"`
+		RAMTotalMB    int64   `json:"ram_total_mb"`
+		RAMUsedMB     int64   `json:"ram_used_mb"`
+		RAMAvailMB    int64   `json:"ram_avail_mb"`
+		NUMANodes     int     `json:"numa_nodes"`
+		DiskTotalGB   int64   `json:"disk_total_gb"`
+		DiskUsedGB    int64   `json:"disk_used_gb"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO node_telemetry
+		  (node_id, cpu_cores_total, cpu_util_pct,
+		   ram_total_mb, ram_used_mb, ram_avail_mb,
+		   numa_nodes, disk_total_gb, disk_used_gb, recorded_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
+		nodeID,
+		input.CPUCoresTotal, input.CPUUtilPct,
+		input.RAMTotalMB, input.RAMUsedMB, input.RAMAvailMB,
+		input.NUMANodes, input.DiskTotalGB, input.DiskUsedGB,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update the node's total_ram_mb if the agent reports a different value
+	// (e.g. first time or hardware change)
+	if input.RAMTotalMB > 0 {
+		_, _ = h.db.ExecContext(c.Request.Context(), `
+			UPDATE nodes SET total_ram_mb = $1, updated_at = NOW()
+			WHERE id = $2 AND total_ram_mb != $1`,
+			input.RAMTotalMB, nodeID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"acknowledged": true})
+}
 func (h *NodeHandler) GetTelemetry(c *gin.Context) {
 	nodeID := c.Param("id")
 	type telRow struct {

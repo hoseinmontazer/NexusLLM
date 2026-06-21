@@ -1,12 +1,184 @@
 # Cluster Nodes & Node Agent
 
-NexusLLM is multi-server ready. All servers are registered in the `nodes` table and the placement engine schedules across them. Currently optimized for single-server deployment, easily expandable.
+NexusLLM is multi-server ready. All servers are registered in the `nodes` table and the placement engine schedules across them. The **Node Agent** (`nexus-nodeagent`) is a standalone binary that runs on each server and keeps the control plane up to date automatically — no manual data entry needed.
 
 ---
 
-## Default node
+## How it works
 
-Migration 006 automatically seeds a node named `nexus-h200-01` for the H200 server:
+```
+Each server runs:
+  nexus-nodeagent
+      │
+      │  HTTP → POST /admin/v1/nodes/:id/heartbeat     (every 15s)
+      │          POST /admin/v1/nodes/:id/inventory     (on startup + every 30s)
+      │          POST /admin/v1/nodes/:id/telemetry     (on startup + every 30s)
+      │          POST /admin/v1/gpu/nodes               (creates GPU node if missing)
+      │          POST /admin/v1/gpu/nodes/:id/devices   (registers GPU devices)
+      ▼
+  nexus-admin (control plane)
+      │
+      ▼
+  PostgreSQL  →  Web UI shows live data
+```
+
+On **first run**, the agent:
+1. Reads `/proc/cpuinfo`, `/proc/meminfo`, `nvidia-smi` to discover hardware
+2. Calls `POST /admin/v1/nodes` to register itself — **no manual step needed**
+3. Saves the assigned node ID to `/var/lib/nexus-agent/node-id` for restarts
+4. Creates a `gpu_node` and registers each GPU device
+
+On **every tick** (default: 30s), the agent pushes fresh CPU utilization, RAM usage, disk, and GPU metrics.
+
+---
+
+## Running the node agent
+
+### Single-server (same machine as admin)
+
+```bash
+# Terminal 5 (or add to systemd)
+make run-nodeagent
+# equivalent to:
+NEXUS_ADMIN_URL="http://localhost:8081" \
+NEXUS_AGENT_INTERVAL="30s" \
+NEXUS_HEARTBEAT_INTERVAL="15s" \
+./bin/nexus-nodeagent
+```
+
+That's it. The agent auto-registers and starts pushing data immediately.
+
+### Remote server (multi-node cluster)
+
+Copy the binary to the remote server and run:
+
+```bash
+# On the remote server — point at the central admin
+NEXUS_ADMIN_URL="http://10.0.0.1:8081" \
+NEXUS_AGENT_INTERVAL="30s" \
+NEXUS_HEARTBEAT_INTERVAL="15s" \
+./nexus-nodeagent
+```
+
+The remote server appears in the Nodes page within seconds.
+
+### As a systemd service (production)
+
+```ini
+# /etc/systemd/system/nexus-nodeagent.service
+[Unit]
+Description=NexusLLM Node Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/nexus-nodeagent
+Restart=always
+RestartSec=10
+Environment=NEXUS_ADMIN_URL=http://10.0.0.1:8081
+Environment=NEXUS_AGENT_INTERVAL=30s
+Environment=NEXUS_HEARTBEAT_INTERVAL=15s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable --now nexus-nodeagent
+```
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEXUS_ADMIN_URL` | `http://localhost:8081` | URL of the nexus-admin control plane |
+| `NEXUS_NODE_ID` | _(auto)_ | Skip auto-registration, use this node ID |
+| `NEXUS_AGENT_INTERVAL` | `30s` | How often to push telemetry + inventory |
+| `NEXUS_HEARTBEAT_INTERVAL` | `15s` | How often to send heartbeat |
+
+Node ID is persisted in `/var/lib/nexus-agent/node-id` after first registration.
+
+---
+
+## What is collected
+
+| Data | How | Pushed to |
+|---|---|---|
+| CPU utilization | `/proc/stat` delta (200ms) | `node_telemetry` table |
+| RAM total / used / available | `/proc/meminfo` | `node_telemetry` + `nodes.total_ram_mb` |
+| Disk usage | `df -BG /` | `node_telemetry` |
+| NUMA node count | `numactl --hardware` | `node_telemetry` |
+| GPU utilization, VRAM, temp, power, fan | `nvidia-smi` | `gpu_devices` + `gpu_telemetry` |
+| GPU PCIe bus ID → NUMA affinity | `/sys/bus/pci/devices/*/numa_node` | `gpu_devices.numa_node` |
+| Full inventory snapshot | All of the above | `node_inventory_snapshots` |
+| CPU model, kernel version, OS | `/proc/cpuinfo`, `uname -r` | inventory snapshot |
+
+---
+
+## Register a new node manually (optional)
+
+The agent auto-registers on first run, but you can pre-register a node:
+
+```bash
+curl -X POST http://localhost:8081/admin/v1/nodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostname":      "nexus-h200-02",
+    "display_name":  "Secondary AI Server",
+    "total_cpu":     384,
+    "total_ram_mb":  1048576,
+    "labels": {"tier": "gpu", "gpu": "h200"}
+  }'
+```
+
+Then run the agent on that server with `NEXUS_NODE_ID=<uuid>` to skip re-registration.
+
+---
+
+## Labels
+
+Labels are arbitrary key-value tags set on registration or updated via API:
+
+```bash
+curl -X PUT http://localhost:8081/admin/v1/nodes/NODE_ID/labels \
+  -H "Content-Type: application/json" \
+  -d '{"labels": {"tier":"primary","gpu":"h200","rack":"A1"}}'
+```
+
+The placement engine can use labels for preferred/required placement in future versions.
+
+---
+
+## Default node (H200 server)
+
+Migration 006 seeds a `nexus-h200-01` node. Run the agent on the H200 server to start populating it with real data:
+
+```bash
+NEXUS_ADMIN_URL="http://<admin-ip>:8081" ./bin/nexus-nodeagent
+```
+
+The agent will:
+- Detect the H200 server already exists (by hostname lookup)
+- Reuse the existing node ID
+- Start pushing real GPU telemetry from `nvidia-smi`
+
+---
+
+## Troubleshooting
+
+**Agent registers a new node instead of finding the existing one:**
+The hostname on the server doesn't match `nexus-h200-01`. Either rename the machine or pre-set `NEXUS_NODE_ID`:
+```bash
+export NEXUS_NODE_ID=$(curl -s http://localhost:8081/admin/v1/nodes | python3 -c "import sys,json; print(next(n['id'] for n in json.load(sys.stdin)['data'] if 'h200' in n['hostname']))")
+```
+
+**`nvidia-smi` not found:**
+No GPU or driver not installed. The agent degrades gracefully — CPU/RAM telemetry still works, GPU section shows 0 devices.
+
+**Telemetry shows stale data:**
+Check the agent is running: `pgrep -a nexus-nodeagent`. Restart it if needed.
+
 
 ```sql
 hostname:     nexus-h200-01

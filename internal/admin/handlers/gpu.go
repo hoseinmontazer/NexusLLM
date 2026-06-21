@@ -20,9 +20,13 @@ func NewGPUHandler(inv *gpu.Inventory) *GPUHandler {
 // RegisterNode handles POST /admin/v1/gpu/nodes
 func (h *GPUHandler) RegisterNode(c *gin.Context) {
 	var input struct {
-		Name       string `json:"name"        binding:"required"`
-		Host       string `json:"host"        binding:"required"`
-		DriverType string `json:"driver_type"`
+		Name          string  `json:"name"           binding:"required"`
+		Host          string  `json:"host"           binding:"required"`
+		DriverType    string  `json:"driver_type"`
+		TotalVRAMMB   int     `json:"total_vram_mb"`
+		// ClusterNodeID links this GPU node to the cluster node (from /admin/v1/nodes)
+		// Set by the standalone node agent on auto-registration.
+		ClusterNodeID string  `json:"node_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -31,7 +35,10 @@ func (h *GPUHandler) RegisterNode(c *gin.Context) {
 	if input.DriverType == "" {
 		input.DriverType = "docker"
 	}
-	node, err := h.inv.RegisterNode(c.Request.Context(), input.Name, input.Host, input.DriverType)
+	node, err := h.inv.RegisterNodeWithCluster(c.Request.Context(),
+		input.Name, input.Host, input.DriverType,
+		input.TotalVRAMMB, input.ClusterNodeID,
+	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -60,8 +67,10 @@ func (h *GPUHandler) RegisterDevice(c *gin.Context) {
 }
 
 // ListNodes handles GET /admin/v1/gpu/nodes
+// Supports optional ?cluster_node_id= query parameter to filter by cluster node.
 func (h *GPUHandler) ListNodes(c *gin.Context) {
-	nodes, err := h.inv.ListNodes(c.Request.Context())
+	clusterNodeID := c.Query("cluster_node_id")
+	nodes, err := h.inv.ListNodesByClusterNode(c.Request.Context(), clusterNodeID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

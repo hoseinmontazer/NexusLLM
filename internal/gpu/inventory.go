@@ -82,6 +82,13 @@ func NewInventory(db *sqlx.DB, log *zap.Logger) *Inventory {
 
 // RegisterNode adds a GPU node to the inventory.
 func (inv *Inventory) RegisterNode(ctx context.Context, name, host, driverType string) (*Node, error) {
+	return inv.RegisterNodeWithCluster(ctx, name, host, driverType, 0, "")
+}
+
+// RegisterNodeWithCluster adds a GPU node linked to a cluster node.
+// clusterNodeID may be empty for standalone GPU nodes.
+// totalVRAMMB is optional (0 = auto from devices).
+func (inv *Inventory) RegisterNodeWithCluster(ctx context.Context, name, host, driverType string, totalVRAMMB int, clusterNodeID string) (*Node, error) {
 	n := &Node{
 		ID:          uuid.New().String(),
 		Name:        name,
@@ -90,10 +97,16 @@ func (inv *Inventory) RegisterNode(ctx context.Context, name, host, driverType s
 		IsAvailable: true,
 		CreatedAt:   time.Now(),
 	}
+
+	var clusterNodeIDVal interface{}
+	if clusterNodeID != "" {
+		clusterNodeIDVal = clusterNodeID
+	}
+
 	_, err := inv.db.ExecContext(ctx,
-		`INSERT INTO gpu_nodes (id, name, host, driver_type, is_available, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,TRUE,$5,$5)`,
-		n.ID, n.Name, n.Host, n.DriverType, n.CreatedAt,
+		`INSERT INTO gpu_nodes (id, name, host, driver_type, total_vram_mb, is_available, node_id, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$7)`,
+		n.ID, n.Name, n.Host, n.DriverType, totalVRAMMB, clusterNodeIDVal, n.CreatedAt,
 	)
 	return n, err
 }
@@ -199,7 +212,23 @@ func (inv *Inventory) ListNodes(ctx context.Context) ([]Node, error) {
 	var nodes []Node
 	err := inv.db.SelectContext(ctx, &nodes,
 		`SELECT id, name, host, driver_type, total_vram_mb, is_available, created_at
-		 FROM gpu_nodes WHERE is_available = TRUE ORDER BY name`)
+		 FROM gpu_nodes ORDER BY name`)
+	if nodes == nil {
+		nodes = []Node{}
+	}
+	return nodes, err
+}
+
+// ListNodesByClusterNode returns GPU nodes linked to a specific cluster node.
+func (inv *Inventory) ListNodesByClusterNode(ctx context.Context, clusterNodeID string) ([]Node, error) {
+	var nodes []Node
+	var err error
+	if clusterNodeID == "" {
+		return inv.ListNodes(ctx)
+	}
+	err = inv.db.SelectContext(ctx, &nodes,
+		`SELECT id, name, host, driver_type, total_vram_mb, is_available, created_at
+		 FROM gpu_nodes WHERE node_id = $1 ORDER BY name`, clusterNodeID)
 	if nodes == nil {
 		nodes = []Node{}
 	}

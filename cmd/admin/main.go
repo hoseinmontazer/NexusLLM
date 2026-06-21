@@ -203,6 +203,7 @@ func main() {
 	a.PUT("/nodes/:id/labels",           nodeH.UpdateLabels)
 	a.POST("/nodes/:id/heartbeat",       nodeH.Heartbeat)
 	a.POST("/nodes/:id/inventory",       nodeH.PushInventory)
+	a.POST("/nodes/:id/telemetry",       nodeH.PushTelemetry)
 	a.GET("/nodes/:id/telemetry",        nodeH.GetTelemetry)
 	a.GET("/nodes/:id/inventory",        nodeH.GetInventory)
 

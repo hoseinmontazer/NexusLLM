@@ -70,7 +70,10 @@ make run-gateway     # inference API  → http://localhost:8080
 make run-admin       # management API → http://localhost:8081
 make run-scheduler   # queue dispatcher
 
-# 4. Start the web admin UI
+# 4. Start the node agent (auto-discovers hardware, updates nodes page live)
+make run-nodeagent   # → auto-registers this machine
+
+# 5. Start the web admin UI
 make web-install     # first time only
 make run-web         # → http://localhost:3001
 
