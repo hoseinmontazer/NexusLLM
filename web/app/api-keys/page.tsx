@@ -16,6 +16,7 @@ export default function ApiKeysPage() {
   const [selectedTeam, setSelectedTeam] = useState('')
   const [keyName, setKeyName] = useState('')
   const [newKey, setNewKey] = useState<string | null>(null)
+  const [revokeConfirm, setRevokeConfirm] = useState<string | null>(null)
 
   const { data: keys, isLoading } = useQuery({
     queryKey: ['api-keys', selectedTeam],
@@ -38,7 +39,12 @@ export default function ApiKeysPage() {
     mutationFn: (id: string) => api.apiKeys.revoke(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['api-keys', selectedTeam] })
+      setRevokeConfirm(null)
       toast({ title: 'Key revoked' })
+    },
+    onError: (e: any) => {
+      setRevokeConfirm(null)
+      toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' })
     },
   })
 
@@ -131,13 +137,26 @@ export default function ApiKeysPage() {
                           {k.active ? 'active' : 'revoked'}
                         </span>
                         {k.active && (
-                          <Button
-                            variant="ghost" size="sm"
-                            className="text-red-500 hover:text-red-700"
-                            onClick={() => { if (confirm('Revoke this key?')) revoke.mutate(k.id) }}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </Button>
+                          revokeConfirm === k.id ? (
+                            <div className="flex gap-1 items-center">
+                              <span className="text-xs text-red-700 mr-1">Revoke?</span>
+                              <Button size="sm" variant="destructive" className="h-6 text-xs"
+                                disabled={revoke.isPending}
+                                onClick={() => revoke.mutate(k.id)}>
+                                {revoke.isPending ? '…' : 'Yes'}
+                              </Button>
+                              <Button size="sm" variant="outline" className="h-6 text-xs"
+                                onClick={() => setRevokeConfirm(null)}>No</Button>
+                            </div>
+                          ) : (
+                            <Button
+                              variant="ghost" size="sm"
+                              className="text-red-500 hover:text-red-700"
+                              onClick={() => setRevokeConfirm(k.id)}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </Button>
+                          )
                         )}
                       </div>
                     </div>

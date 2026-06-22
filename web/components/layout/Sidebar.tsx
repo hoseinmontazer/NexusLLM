@@ -5,7 +5,7 @@ import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard, Building2, Users, KeyRound,
   Cpu, Server, Gauge, BarChart3, Settings, Zap,
-  Network, Box, MapPin,
+  Network, Box, MapPin, FolderKanban,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -13,6 +13,7 @@ const nav = [
   { href: '/',           label: 'Dashboard',     icon: LayoutDashboard },
   { href: '/orgs',       label: 'Organizations',  icon: Building2 },
   { href: '/teams',      label: 'Teams',          icon: Users },
+  { href: '/projects',   label: 'Projects',       icon: FolderKanban },
   { href: '/api-keys',   label: 'API Keys',       icon: KeyRound },
   { href: '/models',     label: 'Models',         icon: Cpu },
   { href: '/services',   label: 'AI Services',    icon: Box },

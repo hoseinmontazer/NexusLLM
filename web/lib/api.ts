@@ -14,7 +14,10 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(err.error ?? res.statusText)
   }
-  return res.json()
+  // For 204 No Content or empty body responses, return undefined
+  const text = await res.text()
+  if (!text) return undefined as T
+  return JSON.parse(text) as T
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -107,6 +110,22 @@ export interface ClusterNode {
   last_heartbeat_at?: string; labels: string; created_at: string
 }
 
+export interface NodeGPUDevice {
+  id: string
+  device_index: number
+  name: string
+  vram_mb: number
+  status: string
+  pcie_bus_id: string
+  numa_node: number
+  utilization_pct: number
+  mem_used_mb: number
+  temperature_c: number
+  power_draw_w: number
+  power_limit_w: number
+  last_seen_at?: string
+}
+
 export interface NodeTelemetry {
   cpu_cores_total: number; cpu_util_pct: number
   ram_total_mb: number; ram_used_mb: number; ram_avail_mb: number
@@ -171,6 +190,97 @@ export interface RegisterModelInput {
   max_context?: number; max_output?: number
 }
 
+// ── Project types ─────────────────────────────────────────────────────────────
+export type ProjectPriority = 'CRITICAL' | 'HIGH' | 'NORMAL' | 'LOW' | 'BEST_EFFORT'
+export type ProjectStatus    = 'active' | 'inactive' | 'archived'
+export type AdmissionPolicy  = 'queue' | 'preempt_then_queue' | 'reject'
+
+export interface Project {
+  id: string
+  organization_id: string
+  team_id: string
+  name: string
+  description: string
+  priority: ProjectPriority
+  priority_score: number
+  status: ProjectStatus
+  runtime_count: number
+  reserved_vram_mb: number
+  reserved_cpu_cores: number
+  reserved_memory_mb: number
+  always_running: boolean
+  protected: boolean
+  minimum_replicas: number
+  admission_policy: AdmissionPolicy
+  created_at: string
+  updated_at: string
+}
+
+export interface ProjectRuntime {
+  id: string
+  model_id: string
+  state: string
+  node_id: string
+  gpu_ids: string
+  bind_host: string
+  bind_port: number
+  last_used_at?: string
+  updated_at: string
+}
+
+export interface ProjectUsage {
+  project_id: string
+  from: string
+  to: string
+  total_requests: number
+  total_tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_usd: number
+  gpu_time_ms: number
+  avg_latency_ms: number
+  error_count: number
+  runtime_count: number
+  preemption_count: number
+  breakdown?: ProjectUsageModelRow[]
+}
+
+export interface ProjectUsageModelRow {
+  model_name: string
+  total_requests: number
+  total_tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_usd: number
+  gpu_time_ms: number
+  avg_latency_ms: number
+  error_count: number
+}
+
+export interface PreemptionEvent {
+  id: string
+  node_id?: string
+  preempted_runtime_id?: string
+  preempted_project_id?: string
+  preempted_priority?: string
+  requesting_runtime_id?: string
+  requesting_project_id?: string
+  requesting_priority?: string
+  trigger: string
+  created_at: string
+}
+
+export interface DeploymentQueueEntry {
+  id: string
+  priority_score: number
+  admission_policy: string
+  status: string
+  attempts: number
+  enqueued_at: string
+  expires_at?: string
+  error_msg: string
+}
+
 // ── Organisations ─────────────────────────────────────────────────────────────
 export const api = {
   orgs: {
@@ -185,6 +295,8 @@ export const api = {
     get: (id: string) => req<Team>('GET', `/teams/${id}`),
     create: (b: { org_id: string; name: string; slug: string; priority?: number }) =>
       req<Team>('POST', '/teams', b),
+    update: (id: string, b: { name?: string; slug?: string; priority?: number; active?: boolean }) =>
+      req<{ message: string }>('PUT', `/teams/${id}`, b),
     delete: (id: string) => req<void>('DELETE', `/teams/${id}`),
     getPolicy: (id: string) => req<Policy>('GET', `/teams/${id}/policy`),
     updatePolicy: (id: string, b: Partial<Policy>) =>
@@ -193,6 +305,8 @@ export const api = {
       req<{ message: string }>('POST', `/teams/${id}/models`, { model_name: modelName }),
     removeModel: (id: string, model: string) =>
       req<void>('DELETE', `/teams/${id}/models/${model}`),
+    listModels: (id: string) =>
+      req<{ models: string[]; total: number }>('GET', `/teams/${id}/models`),
   },
 
   apiKeys: {
@@ -282,12 +396,16 @@ export const api = {
     get: (id: string) => req<{ node: ClusterNode; telemetry?: NodeTelemetry }>('GET', `/nodes/${id}`),
     register: (b: { hostname: string; display_name?: string; total_cpu?: number; total_ram_mb?: number; labels?: Record<string, string> }) =>
       req<{ id: string; hostname: string }>('POST', '/nodes', b),
+    delete: (id: string) =>
+      req<{ message: string; node_id: string }>('DELETE', `/nodes/${id}`),
     getTelemetry: (id: string) =>
       req<{ data: NodeTelemetry[]; node_id: string }>('GET', `/nodes/${id}/telemetry`),
     getInventory: (id: string) =>
       req<{ id: string; snapshot: string; agent_version: string; reported_at: string }>('GET', `/nodes/${id}/inventory`),
     getModelCache: (id: string) =>
       req<{ data: { model_ref: string; backend: string; size_bytes: number; cached_at?: string }[]; node_id: string; total: number }>('GET', `/nodes/${id}/model-cache`),
+    getGPUs: (id: string) =>
+      req<{ data: NodeGPUDevice[]; node_id: string; total: number }>('GET', `/nodes/${id}/gpus`),
     drain: (id: string) =>
       req<{ message: string; node_id: string }>('POST', `/nodes/${id}/drain`, {}),
     getHealthEvents: (id: string) =>
@@ -309,5 +427,36 @@ export const api = {
     }) => req<{ feasible: boolean; decision?: Record<string, unknown>; error?: string }>('POST', '/placement/simulate', b),
     listDecisions: () =>
       req<{ data: PlacementDecision[]; total: number }>('GET', '/placement/decisions'),
+  },
+
+  projects: {
+    list: (params?: { org_id?: string; team_id?: string; priority?: string; status?: string }) => {
+      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v).map(([k,v]) => `${k}=${v}`).join('&') : ''
+      return req<{ data: Project[]; total: number }>('GET', `/projects${qs}`)
+    },
+    get: (id: string) => req<Project>('GET', `/projects/${id}`),
+    create: (b: {
+      organization_id: string; team_id: string; name: string
+      description?: string; priority?: ProjectPriority; status?: ProjectStatus
+    }) => req<{ id: string; name: string; priority: string; status: string }>('POST', '/projects', b),
+    update: (id: string, b: { name?: string; description?: string; priority?: ProjectPriority; status?: ProjectStatus }) =>
+      req<{ message: string }>('PUT', `/projects/${id}`, b),
+    delete: (id: string) => req<{ message: string }>('DELETE', `/projects/${id}`),
+    reserve: (id: string, b: { reserved_vram_mb?: number; reserved_cpu_cores?: number; reserved_memory_mb?: number }) =>
+      req<{ message: string }>('POST', `/projects/${id}/reserve`, b),
+    setPriority: (id: string, priority: ProjectPriority) =>
+      req<{ message: string; old_priority: string; new_priority: string; changed: boolean }>('POST', `/projects/${id}/priority`, { priority }),
+    setProtection: (id: string, b: { always_running?: boolean; protected?: boolean; minimum_replicas?: number; admission_policy?: AdmissionPolicy }) =>
+      req<{ message: string }>('PUT', `/projects/${id}/protection`, b),
+    getRuntimes: (id: string) =>
+      req<{ data: ProjectRuntime[]; total: number; project_id: string }>('GET', `/projects/${id}/runtimes`),
+    getUsage: (id: string, from?: string, to?: string, breakdown?: 'model') => {
+      const qs = [from && `from=${from}`, to && `to=${to}`, breakdown && `breakdown=${breakdown}`].filter(Boolean).join('&')
+      return req<ProjectUsage>('GET', `/projects/${id}/usage${qs ? '?' + qs : ''}`)
+    },
+    getPreemptions: (id: string, limit = 50, offset = 0) =>
+      req<{ data: PreemptionEvent[]; total: number; limit: number; offset: number }>('GET', `/projects/${id}/preemptions?limit=${limit}&offset=${offset}`),
+    getQueue: (id: string) =>
+      req<{ data: DeploymentQueueEntry[]; total: number }>('GET', `/projects/${id}/queue`),
   },
 }
