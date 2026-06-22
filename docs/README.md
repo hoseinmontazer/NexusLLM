@@ -24,3 +24,4 @@
 16. [Web Admin UI](16-web-ui.md)
 17. [Configuration Reference](17-configuration.md)
 18. [Troubleshooting](18-troubleshooting.md)
+19. [Node Agent Architecture](19-node-agent-architecture.md)

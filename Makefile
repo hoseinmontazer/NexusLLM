@@ -5,6 +5,7 @@
         migrate dev-up dev-up-gpu dev-down \
         generate-key \
         placement-simulate node-status \
+        deploy-gemma2-2b pull-gguf runtime-status \
         clean
 
 BINARY_DIR := bin
@@ -65,12 +66,15 @@ run-scheduler: build-scheduler
 	NEXUS_REDIS_ADDR="localhost:6379" \
 	./$(BINARY_DIR)/nexus-scheduler
 
-# Run the node agent — points at the local admin by default.
+# Run the node agent — uses new task-based system with JWT auth.
+# On first run it auto-registers and saves credentials to /var/lib/nexus-agent/.
 # On remote nodes, set NEXUS_ADMIN_URL=http://<control-plane-ip>:8081
 run-nodeagent: build-nodeagent
 	NEXUS_ADMIN_URL="http://localhost:8081" \
 	NEXUS_AGENT_INTERVAL="30s" \
 	NEXUS_HEARTBEAT_INTERVAL="15s" \
+	NEXUS_TASK_WORKERS="4" \
+	NEXUS_LOG_LEVEL="info" \
 	./$(BINARY_DIR)/nexus-nodeagent
 
 run-web:
@@ -126,6 +130,14 @@ migrate:
 	$(call run_migration,005_ai_platform.sql)
 	@echo "→ 006 H200 platform seed"
 	$(call run_migration,006_h200_platform_seed.sql)
+	@echo "→ 007 agent tasks + runtimes"
+	$(call run_migration,007_agent_tasks.sql)
+	@echo "→ 008 node model cache"
+	$(call run_migration,008_node_model_cache.sql)
+	@echo "→ 009 resilience & lifecycle"
+	$(call run_migration,009_resilience.sql)
+	@echo "→ 010 lazy-load runtime manager"
+	$(call run_migration,010_lazy_runtime.sql)
 	@echo "✓ All migrations complete"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +196,43 @@ service-list:
 # ─────────────────────────────────────────────────────────────────────────────
 generate-key:
 	go run ./tools/genkey/main.go
+
+# ─────────────────────────────────────────────────────────────────────────────
+# llama.cpp model shortcuts
+# Deploy gemma-2-2b on a node:
+#   make deploy-gemma2-2b NODE_ID=<id> PORT=8090
+# ─────────────────────────────────────────────────────────────────────────────
+NODE_ID  ?= $(shell curl -s $(ADMIN_URL)/nodes | jq -r '.data[0].id')
+PORT     ?= 8090
+
+deploy-gemma2-2b:
+	@test -n "$(NODE_ID)" || (echo "ERROR: NODE_ID not set" && exit 1)
+	$(eval MODEL_ID := $(shell curl -s -X POST $(ADMIN_URL)/models/deploy \
+	  -H 'Content-Type: application/json' \
+	  -d '{"name":"gemma2-2b","display_name":"Gemma 2 2B","backend_type":"llamacpp","image":"ghcr.io/ggml-org/llama.cpp:server","host":"localhost","port":$(PORT),"node_id":"$(NODE_ID)","start_now":false}' \
+	  | jq -r '.model_id'))
+	@echo "→ Model registered: $(MODEL_ID)"
+	@curl -s -X PUT $(ADMIN_URL)/models/$(MODEL_ID)/lazy-config \
+	  -H 'Content-Type: application/json' \
+	  -d '{"hf_repo":"bartowski/gemma-2-2b-it-GGUF","hf_file":"gemma-2-2b-it-Q4_K_M.gguf","ctx_size":8192,"n_gpu_layers":-1,"idle_timeout_secs":900}' | jq .
+	@echo "→ Dispatching PULL_MODEL to node $(NODE_ID)..."
+	@curl -s -X POST $(ADMIN_URL)/nodes/$(NODE_ID)/tasks \
+	  -H 'Content-Type: application/json' \
+	  -d '{"task_type":"PULL_MODEL","priority":80,"actor":"makefile","payload":{"model_id":"$(MODEL_ID)","hf_repo":"bartowski/gemma-2-2b-it-GGUF","hf_file":"gemma-2-2b-it-Q4_K_M.gguf","backend":"llamacpp","local_path":"llamacpp_models"}}' | jq .
+	@echo "✓ gemma2-2b ready — send requests to port $(PORT) once download completes"
+
+pull-gguf:
+	@test -n "$(NODE_ID)"   || (echo "ERROR: NODE_ID not set"   && exit 1)
+	@test -n "$(HF_REPO)"   || (echo "ERROR: HF_REPO not set"   && exit 1)
+	@test -n "$(HF_FILE)"   || (echo "ERROR: HF_FILE not set"   && exit 1)
+	@curl -s -X POST $(ADMIN_URL)/nodes/$(NODE_ID)/tasks \
+	  -H 'Content-Type: application/json' \
+	  -d '{"task_type":"PULL_MODEL","priority":80,"actor":"makefile","payload":{"model_id":"","hf_repo":"$(HF_REPO)","hf_file":"$(HF_FILE)","backend":"llamacpp","local_path":"llamacpp_models"}}' | jq .
+
+runtime-status:
+	@test -n "$(MODEL)"  || (echo "ERROR: MODEL not set" && exit 1)
+	$(eval MODEL_ID := $(shell curl -s "$(ADMIN_URL)/models" | jq -r '.data[] | select(.name=="$(MODEL)") | .id'))
+	@curl -s $(ADMIN_URL)/models/$(MODEL_ID)/runtime-status | jq '.runtimes[] | {hostname, state, container_id, last_used_at}'
 
 clean:
 	rm -rf $(BINARY_DIR)

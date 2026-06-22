@@ -63,6 +63,25 @@ type RuntimeSpec struct {
 	CPUSetCPUs  string // e.g. "0-31" or "0,2,4"
 	NUMANode    int    // -1 = no preference
 	RuntimeType string // "GPU_RUNTIME" | "CPU_RUNTIME"
+
+	// ─── llamacpp-specific ────────────────────────────────────────────────────
+	// LlamaCppModelPath is the path to a local GGUF file inside the container
+	// (e.g. "/models/7B/ggml-model-q4_0.gguf"). Takes precedence over HF fields.
+	LlamaCppModelPath string
+	// LlamaCppHFRepo + LlamaCppHFFile: if set, llama-server downloads the GGUF
+	// directly from HuggingFace at startup via --hf-repo / --hf-file flags.
+	// Set HUGGING_FACE_HUB_TOKEN in Env for gated repos.
+	LlamaCppHFRepo string
+	LlamaCppHFFile string
+	// LlamaCppCtxSize overrides the default context window size (default: 4096).
+	LlamaCppCtxSize int
+	// LlamaCppNGPULayers controls how many transformer layers are offloaded to GPU.
+	// 0 = CPU-only, -1 = all layers on GPU (full offload).
+	LlamaCppNGPULayers int
+	// LlamaCppModelsVolume is the host-side source for the /models bind-mount.
+	// Defaults to the named Docker volume "llamacpp_models" when empty.
+	// Set to an absolute host path (e.g. "/mnt/models") for a bind-mount.
+	LlamaCppModelsVolume string
 }
 
 // RuntimeStatus is a point-in-time snapshot of a running runtime.

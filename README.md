@@ -51,6 +51,7 @@ Full documentation is in the [`docs/`](docs/README.md) folder:
 | [Web Admin UI](docs/16-web-ui.md) | All UI pages explained |
 | [Configuration](docs/17-configuration.md) | All environment variables, Prometheus metrics |
 | [Troubleshooting](docs/18-troubleshooting.md) | Common errors and fixes |
+| [Node Agent Architecture](docs/19-node-agent-architecture.md) | Task system, auth, sequence diagrams, multi-node |
 
 ---
 

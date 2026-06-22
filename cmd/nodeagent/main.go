@@ -1,21 +1,24 @@
-// nexus-nodeagent — Standalone Node Agent
+// nexus-nodeagent — Production Node Agent v2
 //
-// Run this binary on every server in the cluster. It will:
-//   1. Auto-register the node with the NexusLLM control plane (no manual setup)
-//   2. Discover and register GPU devices from nvidia-smi
-//   3. Collect CPU / RAM / disk / GPU metrics continuously
-//   4. Push telemetry and heartbeat to the Admin API
+// Architecture: Control Plane is the brain. Node Agent is the executor.
 //
-// Required environment variables:
-//   NEXUS_ADMIN_URL   — URL of the nexus-admin server (e.g. http://10.0.0.1:8081)
+// The agent:
+//   1. Registers with the control plane (auto-discovers hardware)
+//   2. Receives a JWT token for authenticated communication
+//   3. Sends heartbeat + telemetry every 30s
+//   4. Long-polls for tasks — claims, executes, reports back
+//   5. NEVER makes placement or scheduling decisions
+//
+// Required:
+//   NEXUS_ADMIN_URL  — URL of the nexus-admin control plane
 //
 // Optional:
-//   NEXUS_NODE_ID           — skip auto-registration, use this node ID
-//   NEXUS_AGENT_INTERVAL    — telemetry push interval (default: 30s)
+//   NEXUS_NODE_ID            — skip re-registration, use stored/provided node ID
+//   NEXUS_AGENT_TOKEN        — use this token (skip re-registration)
+//   NEXUS_AGENT_INTERVAL     — telemetry push interval (default: 30s)
 //   NEXUS_HEARTBEAT_INTERVAL — heartbeat interval (default: 15s)
-//
-// The agent stores its node ID in /var/lib/nexus-agent/node-id after first
-// registration so it survives restarts without re-registering.
+//   NEXUS_TASK_WORKERS       — concurrent task executors (default: 4)
+//   NEXUS_LOG_LEVEL          — debug | info | warn (default: info)
 package main
 
 import (
@@ -33,79 +36,87 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/nexusllm/nexusllm/internal/nodeagent"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
-	agentVersion       = "1.0.0"
+	agentVersion       = "2.0.0"
 	stateDir           = "/var/lib/nexus-agent"
 	nodeIDFile         = "/var/lib/nexus-agent/node-id"
-	defaultInterval    = 30 * time.Second
-	defaultHeartbeat   = 15 * time.Second
+	tokenFile          = "/var/lib/nexus-agent/token"
 	registerRetryDelay = 10 * time.Second
+	taskPollWait       = 25 // seconds for long-poll
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-
 func main() {
-	log, _ := zap.NewProduction()
+	log := buildLogger(getenv("NEXUS_LOG_LEVEL", "info"))
 	defer log.Sync()
 
 	adminURL := getenv("NEXUS_ADMIN_URL", "http://localhost:8081")
-	intervalStr := getenv("NEXUS_AGENT_INTERVAL", "30s")
-	heartbeatStr := getenv("NEXUS_HEARTBEAT_INTERVAL", "15s")
-
-	interval, err := time.ParseDuration(intervalStr)
-	if err != nil {
-		interval = defaultInterval
+	interval, _ := time.ParseDuration(getenv("NEXUS_AGENT_INTERVAL", "30s"))
+	if interval == 0 {
+		interval = 30 * time.Second
 	}
-	heartbeatInterval, err := time.ParseDuration(heartbeatStr)
-	if err != nil {
-		heartbeatInterval = defaultHeartbeat
+	heartbeatInterval, _ := time.ParseDuration(getenv("NEXUS_HEARTBEAT_INTERVAL", "15s"))
+	if heartbeatInterval == 0 {
+		heartbeatInterval = 15 * time.Second
+	}
+	taskWorkers := 4
+	if n, err := strconv.Atoi(getenv("NEXUS_TASK_WORKERS", "4")); err == nil && n > 0 {
+		taskWorkers = n
 	}
 
 	agent := &Agent{
-		adminURL:  adminURL,
-		interval:  interval,
-		heartbeat: heartbeatInterval,
-		log:       log,
+		adminURL:    adminURL,
+		interval:    interval,
+		heartbeat:   heartbeatInterval,
+		taskWorkers: taskWorkers,
+		log:         log,
+		executor:    nodeagent.NewExecutor(log),
 		client: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout: 35 * time.Second, // longer than long-poll wait
 		},
 	}
 
 	hostname, _ := os.Hostname()
 	agent.hostname = hostname
+
 	log.Info("nexus-nodeagent starting",
+		zap.String("version", agentVersion),
 		zap.String("hostname", hostname),
 		zap.String("admin_url", adminURL),
 		zap.Duration("telemetry_interval", interval),
 		zap.Duration("heartbeat_interval", heartbeatInterval),
-		zap.String("version", agentVersion),
+		zap.Int("task_workers", taskWorkers),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// ── 1. Get or register node ───────────────────────────────────────────────
-	nodeID := getenv("NEXUS_NODE_ID", "")
-	if nodeID == "" {
-		nodeID = agent.loadStoredNodeID()
-	}
-	if nodeID == "" {
-		log.Info("node not registered — registering with control plane...")
+	// ── 1. Register and get token ─────────────────────────────────────────────
+	nodeID := getenv("NEXUS_NODE_ID", loadFile(nodeIDFile))
+	token := getenv("NEXUS_AGENT_TOKEN", loadFile(tokenFile))
+
+	if nodeID == "" || token == "" {
+		log.Info("registering with control plane...")
 		for {
-			id, regErr := agent.register(ctx)
+			id, tok, regErr := agent.register(ctx)
 			if regErr == nil {
 				nodeID = id
-				agent.saveNodeID(id)
-				log.Info("node registered", zap.String("node_id", id))
+				token = tok
+				saveFile(nodeIDFile, id)
+				saveFile(tokenFile, tok)
+				log.Info("registration complete",
+					zap.String("node_id", id),
+				)
 				break
 			}
 			log.Warn("registration failed, retrying",
@@ -119,22 +130,30 @@ func main() {
 			}
 		}
 	}
+
 	agent.nodeID = nodeID
+	agent.token = token
 	log.Info("node identity confirmed", zap.String("node_id", nodeID))
 
-	// ── 2. Push full inventory on startup ─────────────────────────────────────
+	// ── Prometheus metrics ────────────────────────────────────────────────────
+	metrics := nodeagent.NewAgentMetrics(nodeID, hostname)
+	agent.metrics = metrics
+	metricsAddr := getenv("NEXUS_AGENT_METRICS_ADDR", ":9092")
+	go nodeagent.StartMetricsServer(metricsAddr)
+	log.Info("agent metrics listening", zap.String("addr", metricsAddr))
+
+	// ── 2. Initial inventory push ─────────────────────────────────────────────
 	if err := agent.pushInventory(ctx); err != nil {
-		log.Warn("inventory push failed (non-fatal)", zap.Error(err))
+		log.Warn("initial inventory push failed (non-fatal)", zap.Error(err))
 	}
-
-	// ── 3. Run loops ──────────────────────────────────────────────────────────
-	go agent.heartbeatLoop(ctx)
-
-	// Push telemetry immediately before starting the tick loop
 	agent.pushTelemetry(ctx)
 
+	// ── 3. Start background loops ─────────────────────────────────────────────
+	go agent.heartbeatLoop(ctx)
 	go agent.telemetryLoop(ctx)
+	go agent.taskPollLoop(ctx)
 
+	log.Info("nexus-nodeagent running — waiting for tasks")
 	<-quit
 	log.Info("nexus-nodeagent shutting down...")
 	cancel()
@@ -147,20 +166,22 @@ func main() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Agent struct {
-	adminURL  string
-	nodeID    string
-	hostname  string
-	interval  time.Duration
-	heartbeat time.Duration
-	log       *zap.Logger
-	client    *http.Client
+	adminURL    string
+	nodeID      string
+	hostname    string
+	token       string
+	interval    time.Duration
+	heartbeat   time.Duration
+	taskWorkers int
+	log         *zap.Logger
+	executor    *nodeagent.Executor
+	metrics     *nodeagent.AgentMetrics
+	client      *http.Client
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
 
-// register auto-detects hardware and registers this node with the control plane.
-// Returns the assigned node ID.
-func (a *Agent) register(ctx context.Context) (string, error) {
+func (a *Agent) register(ctx context.Context) (nodeID, token string, err error) {
 	cpuCores := runtime.NumCPU()
 	ramMB := a.readTotalRAMMB()
 	gpus := a.querySMI()
@@ -170,59 +191,51 @@ func (a *Agent) register(ctx context.Context) (string, error) {
 		totalVRAMMB += int64(g.VRAMMB)
 	}
 
+	capabilities := map[string]interface{}{
+		"docker":    a.hasDocker(),
+		"vllm":      false, // will be confirmed by successful task
+		"ollama":    a.hasOllama(),
+		"tgi":       false,
+		"whisper":   false,
+		"tts":       false,
+		"embedding": false,
+		"gpu":       len(gpus) > 0,
+		"gpu_count": len(gpus),
+	}
+
 	body := map[string]interface{}{
-		"hostname":       a.hostname,
-		"display_name":   a.hostname,
-		"total_cpu":      cpuCores,
-		"total_ram_mb":   ramMB,
-		"total_vram_mb":  totalVRAMMB,
+		"hostname":      a.hostname,
+		"ip_address":    a.localIP(),
+		"total_cpu":     cpuCores,
+		"total_ram_mb":  ramMB,
+		"total_vram_mb": totalVRAMMB,
+		"agent_version": agentVersion,
+		"capabilities":  capabilities,
 		"labels": map[string]string{
-			"agent_version": agentVersion,
 			"os":            runtime.GOOS + "/" + runtime.GOARCH,
+			"agent_version": agentVersion,
 		},
 	}
 
 	var result struct {
-		ID       string `json:"id"`
-		Hostname string `json:"hostname"`
+		NodeID  string `json:"node_id"`
+		Token   string `json:"token"`
+		Message string `json:"message"`
 	}
-	if err := a.post(ctx, "/admin/v1/nodes", body, &result); err != nil {
-		// Node may already exist — try to find it by hostname
-		existing, findErr := a.findNodeByHostname(ctx)
-		if findErr != nil {
-			return "", fmt.Errorf("register: %w (find existing: %v)", err, findErr)
-		}
-		a.log.Info("node already registered", zap.String("node_id", existing))
-		return existing, nil
+	// Register does NOT need auth token (bootstrapping)
+	if err := a.postNoAuth(ctx, "/agent/v1/register", body, &result); err != nil {
+		return "", "", err
 	}
-	return result.ID, nil
+	if result.NodeID == "" || result.Token == "" {
+		return "", "", fmt.Errorf("registration response missing node_id or token")
+	}
+	return result.NodeID, result.Token, nil
 }
 
-// findNodeByHostname searches the nodes list for a matching hostname.
-func (a *Agent) findNodeByHostname(ctx context.Context) (string, error) {
-	var result struct {
-		Data []struct {
-			ID       string `json:"id"`
-			Hostname string `json:"hostname"`
-		} `json:"data"`
-	}
-	if err := a.get(ctx, "/admin/v1/nodes", &result); err != nil {
-		return "", err
-	}
-	for _, n := range result.Data {
-		if n.Hostname == a.hostname {
-			return n.ID, nil
-		}
-	}
-	return "", fmt.Errorf("hostname %q not found in nodes list", a.hostname)
-}
-
-// ─── Heartbeat loop ───────────────────────────────────────────────────────────
+// ─── Heartbeat ────────────────────────────────────────────────────────────────
 
 func (a *Agent) heartbeatLoop(ctx context.Context) {
-	// Send one immediately
 	a.sendHeartbeat(ctx)
-
 	t := time.NewTicker(a.heartbeat)
 	defer t.Stop()
 	for {
@@ -240,14 +253,12 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		"agent_version": agentVersion,
 		"status":        "online",
 	}
-	if err := a.post(ctx, "/admin/v1/nodes/"+a.nodeID+"/heartbeat", body, nil); err != nil {
+	if err := a.post(ctx, "/agent/v1/heartbeat", body, nil); err != nil {
 		a.log.Warn("heartbeat failed", zap.Error(err))
-	} else {
-		a.log.Debug("heartbeat sent")
 	}
 }
 
-// ─── Telemetry loop ───────────────────────────────────────────────────────────
+// ─── Telemetry ────────────────────────────────────────────────────────────────
 
 func (a *Agent) telemetryLoop(ctx context.Context) {
 	t := time.NewTicker(a.interval)
@@ -257,22 +268,37 @@ func (a *Agent) telemetryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.collectAndPush(ctx)
+			if err := a.pushInventory(ctx); err != nil {
+				a.log.Warn("inventory push failed", zap.Error(err))
+			}
+			a.pushTelemetry(ctx)
+			a.pushModelCache(ctx)
 		}
 	}
 }
 
-func (a *Agent) collectAndPush(ctx context.Context) {
-	// Re-push inventory (updates totals, GPU devices, stores snapshot)
-	if err := a.pushInventory(ctx); err != nil {
-		a.log.Warn("inventory push failed", zap.Error(err))
+// pushModelCache scans local HF and Ollama caches and reports them to the control plane.
+func (a *Agent) pushModelCache(ctx context.Context) {
+	models := nodeagent.ScanModelCache()
+	if len(models) == 0 {
+		return
 	}
-
-	// Push telemetry snapshot directly into the admin's telemetry endpoint
-	a.pushTelemetry(ctx)
+	items := make([]map[string]interface{}, len(models))
+	for i, m := range models {
+		items[i] = map[string]interface{}{
+			"model_ref":  m.ModelRef,
+			"backend":    m.Backend,
+			"size_bytes": m.SizeBytes,
+			"is_cached":  m.IsCached,
+		}
+	}
+	if err := a.post(ctx, "/agent/v1/model-cache", map[string]interface{}{"models": items}, nil); err != nil {
+		a.log.Debug("model cache push failed", zap.Error(err))
+	} else {
+		a.log.Debug("model cache pushed", zap.Int("count", len(models)))
+	}
 }
 
-// pushTelemetry posts a single telemetry snapshot to the node telemetry endpoint.
 func (a *Agent) pushTelemetry(ctx context.Context) {
 	cpuUtil := a.readCPUUtil()
 	ramTotal := a.readTotalRAMMB()
@@ -280,6 +306,16 @@ func (a *Agent) pushTelemetry(ctx context.Context) {
 	diskTotal, diskUsed := a.readDiskInfo()
 	numaNodes := a.readNUMANodes()
 	gpus := a.querySMI()
+
+	gpuList := make([]map[string]interface{}, len(gpus))
+	for i, g := range gpus {
+		gpuList[i] = map[string]interface{}{
+			"index": g.DeviceIndex, "name": g.Name,
+			"vram_mb": g.VRAMMB, "mem_used_mb": g.MemUsedMB,
+			"util_pct": g.UtilizationPct, "temp_c": g.TemperatureC,
+			"power_w": g.PowerDrawW,
+		}
+	}
 
 	body := map[string]interface{}{
 		"cpu_cores_total": runtime.NumCPU(),
@@ -290,180 +326,201 @@ func (a *Agent) pushTelemetry(ctx context.Context) {
 		"numa_nodes":      numaNodes,
 		"disk_total_gb":   diskTotal,
 		"disk_used_gb":    diskUsed,
-		"gpus":            len(gpus),
+		"gpus":            gpuList,
 	}
 
-	if err := a.post(ctx, "/admin/v1/nodes/"+a.nodeID+"/telemetry", body, nil); err != nil {
+	if err := a.post(ctx, "/agent/v1/telemetry", body, nil); err != nil {
 		a.log.Debug("telemetry push failed", zap.Error(err))
 	} else {
 		a.log.Debug("telemetry pushed",
-			zap.Float64("cpu_util_pct", cpuUtil),
+			zap.Float64("cpu_pct", cpuUtil),
 			zap.Int64("ram_used_mb", ramUsed),
 		)
 	}
-}
 
-// ─── Inventory push ───────────────────────────────────────────────────────────
-
-// pushInventory sends the full hardware inventory to the control plane.
-// This updates node totals, registers GPU devices, and stores a snapshot.
-func (a *Agent) pushInventory(ctx context.Context) error {
-	cpuModel := a.readCPUModel()
-	cpuCores := runtime.NumCPU()
-	ramMB := a.readTotalRAMMB()
-	ramUsedMB, ramAvailMB := a.readRAMUsage()
-	cpuUtil := a.readCPUUtil()
-	numaNodes := a.readNUMANodes()
-	diskTotal, diskUsed := a.readDiskInfo()
-	kernelVer := a.readKernelVersion()
-	gpus := a.querySMI()
-
-	// Build GPU JSON array
-	gpuList := make([]map[string]interface{}, len(gpus))
-	for i, g := range gpus {
-		gpuList[i] = map[string]interface{}{
-			"index":       g.DeviceIndex,
-			"name":        g.Name,
-			"vram_mb":     g.VRAMMB,
-			"mem_used_mb": g.MemUsedMB,
-			"util_pct":    g.UtilizationPct,
-			"temp_c":      g.TemperatureC,
-			"power_w":     g.PowerDrawW,
-			"power_limit": g.PowerLimitW,
-			"fan_pct":     g.FanSpeedPct,
-			"pcie_bus_id": g.PCIeBusID,
-			"numa_node":   g.NUMANode,
+	// Update Prometheus metrics
+	if a.metrics != nil {
+		a.metrics.CPUUsage.With(prometheus.Labels{}).Set(cpuUtil)
+		a.metrics.MemoryUsage.With(prometheus.Labels{}).Set(float64(ramUsed))
+		a.metrics.MemoryTotal.With(prometheus.Labels{}).Set(float64(ramTotal))
+		for _, g := range gpus {
+			idxStr := strconv.Itoa(g.DeviceIndex)
+			lbls := prometheus.Labels{"device_index": idxStr, "device_name": g.Name}
+			a.metrics.GPUMemoryUsed.With(lbls).Set(float64(g.MemUsedMB))
+			a.metrics.GPUMemoryTotal.With(lbls).Set(float64(g.VRAMMB))
+			a.metrics.GPUUtilization.With(lbls).Set(float64(g.UtilizationPct))
+			a.metrics.GPUTemperature.With(lbls).Set(float64(g.TemperatureC))
+			a.metrics.GPUPowerDraw.With(lbls).Set(float64(g.PowerDrawW))
 		}
 	}
+}
 
+func (a *Agent) pushInventory(ctx context.Context) error {
+	cpuModel := a.readCPUModel()
+	gpus := a.querySMI()
 	var totalVRAMMB int64
 	for _, g := range gpus {
 		totalVRAMMB += int64(g.VRAMMB)
 	}
 
+	gpuList := make([]map[string]interface{}, len(gpus))
+	for i, g := range gpus {
+		gpuList[i] = map[string]interface{}{
+			"index": g.DeviceIndex, "name": g.Name, "vram_mb": g.VRAMMB,
+			"pcie_bus_id": g.PCIeBusID, "numa_node": g.NUMANode,
+		}
+	}
+
+	diskTotal, diskUsed := a.readDiskInfo()
 	snapshot := map[string]interface{}{
-		"hostname":      a.hostname,
-		"agent_version": agentVersion,
-		"cpu_model":     cpuModel,
-		"cpu_cores":     cpuCores,
-		"cpu_util_pct":  cpuUtil,
-		"ram_total_mb":  ramMB,
-		"ram_used_mb":   ramUsedMB,
-		"ram_avail_mb":  ramAvailMB,
-		"numa_nodes":    numaNodes,
-		"disk_total_gb": diskTotal,
-		"disk_used_gb":  diskUsed,
-		"total_vram_mb": totalVRAMMB,
-		"os":            runtime.GOOS + "/" + runtime.GOARCH,
-		"kernel":        kernelVer,
-		"gpus":          gpuList,
+		"hostname": a.hostname, "agent_version": agentVersion,
+		"cpu_model": cpuModel, "cpu_cores": runtime.NumCPU(),
+		"ram_total_mb": a.readTotalRAMMB(), "numa_nodes": a.readNUMANodes(),
+		"disk_total_gb": diskTotal, "disk_used_gb": diskUsed,
+		"total_vram_mb": totalVRAMMB, "os": runtime.GOOS + "/" + runtime.GOARCH,
+		"kernel": a.readKernelVersion(), "gpus": gpuList,
 	}
 
-	if err := a.post(ctx, "/admin/v1/nodes/"+a.nodeID+"/inventory", snapshot, nil); err != nil {
-		return fmt.Errorf("push inventory: %w", err)
-	}
-
-	// Also register/update GPU devices in the GPU inventory
-	a.syncGPUDevices(ctx, gpus)
-
-	a.log.Info("inventory pushed",
-		zap.Int("cpus", cpuCores),
-		zap.Float64("cpu_util_pct", cpuUtil),
-		zap.Int64("ram_mb", ramMB),
-		zap.Int("gpus", len(gpus)),
-		zap.Int64("total_vram_mb", totalVRAMMB),
-	)
-	return nil
+	return a.post(ctx, "/agent/v1/inventory", snapshot, nil)
 }
 
-// syncGPUDevices ensures GPU devices are registered in the GPU inventory
-// and updates their live telemetry.
-func (a *Agent) syncGPUDevices(ctx context.Context, gpus []GPUMetrics) {
-	if len(gpus) == 0 {
-		return
-	}
+// ─── Task poll loop ───────────────────────────────────────────────────────────
 
-	// Get existing gpu_nodes for this cluster node
-	var gpuNodes struct {
-		Data []struct {
-			ID     string `json:"id"`
-			NodeID string `json:"node_id"`
-			Name   string `json:"name"`
-		} `json:"data"`
-	}
-	if err := a.get(ctx, "/admin/v1/gpu/nodes?cluster_node_id="+a.nodeID, &gpuNodes); err != nil {
-		a.log.Debug("could not list gpu nodes", zap.Error(err))
-		return
-	}
+func (a *Agent) taskPollLoop(ctx context.Context) {
+	// Semaphore to limit concurrent task executions
+	sem := make(chan struct{}, a.taskWorkers)
+	var wg sync.WaitGroup
 
-	// Find the gpu_node associated with this cluster node
-	var gpuNodeID string
-	for _, gn := range gpuNodes.Data {
-		if gn.NodeID == a.nodeID || gn.ID != "" && gpuNodeID == "" {
-			gpuNodeID = gn.ID
-			break
-		}
-	}
-	// If no gpu_node exists yet, create one
-	if gpuNodeID == "" {
-		var totalVRAMMB int64
-		for _, g := range gpus {
-			totalVRAMMB += int64(g.VRAMMB)
-		}
-		var result struct {
-			ID string `json:"id"`
-		}
-		err := a.post(ctx, "/admin/v1/gpu/nodes", map[string]interface{}{
-			"name":          a.hostname + "-gpu",
-			"host":          a.hostname,
-			"driver_type":   "docker",
-			"total_vram_mb": totalVRAMMB,
-			"node_id":       a.nodeID,
-		}, &result)
-		if err != nil {
-			a.log.Debug("could not create gpu node", zap.Error(err))
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
 			return
+		default:
 		}
-		gpuNodeID = result.ID
-		a.log.Info("gpu node created", zap.String("gpu_node_id", gpuNodeID))
-	}
 
-	// Get existing devices for this gpu_node
-	var devices struct {
-		Data []struct {
-			ID          string `json:"id"`
-			DeviceIndex int    `json:"device_index"`
-		} `json:"data"`
-	}
-	_ = a.get(ctx, "/admin/v1/gpu/nodes/"+gpuNodeID+"/devices", &devices)
-
-	existingIdx := make(map[int]bool)
-	for _, d := range devices.Data {
-		existingIdx[d.DeviceIndex] = true
-	}
-
-	// Register any new GPU devices
-	for _, g := range gpus {
-		if !existingIdx[g.DeviceIndex] {
-			body := map[string]interface{}{
-				"device_index": g.DeviceIndex,
-				"name":         g.Name,
-				"vram_mb":      g.VRAMMB,
+		tasks, err := a.pollTasks(ctx)
+		if err != nil {
+			a.log.Warn("task poll failed", zap.Error(err))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
 			}
-			if err := a.post(ctx, "/admin/v1/gpu/nodes/"+gpuNodeID+"/devices", body, nil); err == nil {
-				a.log.Info("GPU device registered",
-					zap.Int("index", g.DeviceIndex),
-					zap.String("name", g.Name),
-					zap.Int("vram_mb", g.VRAMMB),
-				)
+		}
+
+		for _, task := range tasks {
+			// Claim the task before executing
+			ok, claimErr := a.claimTask(ctx, task.ID)
+			if claimErr != nil || !ok {
+				continue // already claimed by another worker
 			}
+
+			// Execute concurrently up to taskWorkers
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(t nodeagent.RemoteTask) {
+				defer func() { <-sem; wg.Done() }()
+				a.executeTask(ctx, t)
+			}(task)
+		}
+
+		// If no tasks, the long-poll already waited; if tasks found, loop immediately
+	}
+}
+
+func (a *Agent) pollTasks(ctx context.Context) ([]nodeagent.RemoteTask, error) {
+	url := fmt.Sprintf("/agent/v1/tasks/pending?wait=%d&limit=5", taskPollWait)
+	var result struct {
+		Tasks []nodeagent.RemoteTask `json:"tasks"`
+		Count int                   `json:"count"`
+	}
+	if err := a.getAuth(ctx, url, &result); err != nil {
+		return nil, err
+	}
+	return result.Tasks, nil
+}
+
+func (a *Agent) claimTask(ctx context.Context, taskID string) (bool, error) {
+	var result struct {
+		Claimed bool `json:"claimed"`
+	}
+	err := a.post(ctx, "/agent/v1/tasks/"+taskID+"/claim", map[string]interface{}{}, &result)
+	if err != nil {
+		return false, err
+	}
+	return result.Claimed, nil
+}
+
+func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
+	a.log.Info("executing task",
+		zap.String("task_id", task.ID),
+		zap.String("task_type", string(task.TaskType)),
+	)
+
+	start := time.Now()
+
+	// Mark running
+	_ = a.post(ctx, "/agent/v1/tasks/"+task.ID+"/running", map[string]interface{}{}, nil)
+
+	// Execute
+	result := a.executor.Execute(ctx, task)
+	elapsed := time.Since(start)
+
+	// Record Prometheus metrics
+	if a.metrics != nil {
+		taskType := string(task.TaskType)
+		status := "success"
+		if !result.Success {
+			status = "failed"
+		}
+		a.metrics.TasksTotal.With(prometheus.Labels{
+			"task_type": taskType, "status": status,
+		}).Inc()
+		a.metrics.TaskDuration.With(prometheus.Labels{
+			"task_type": taskType,
+		}).Observe(elapsed.Seconds())
+	}
+
+	// Report result
+	if result.Success {
+		resultMap := map[string]interface{}{
+			"runtime_id":    result.RuntimeID,
+			"runtime_state": result.RuntimeState,
+			"container_id":  result.ContainerID,
+		}
+		for k, v := range result.Data {
+			resultMap[k] = v
+		}
+		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/complete", resultMap, nil); err != nil {
+			a.log.Warn("failed to report task completion", zap.Error(err))
+		}
+		if result.RuntimeID != "" && result.RuntimeState != "" {
+			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, map[string]interface{}{
+				"state":        result.RuntimeState,
+				"container_id": result.ContainerID,
+			}, nil)
+		}
+	} else {
+		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/fail",
+			map[string]interface{}{
+				"error":      result.Error,
+				"runtime_id": result.RuntimeID,
+			}, nil); err != nil {
+			a.log.Warn("failed to report task failure", zap.Error(err))
+		}
+		if result.RuntimeID != "" {
+			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, map[string]interface{}{
+				"state": "failed",
+			}, nil)
 		}
 	}
 }
 
 // ─── Hardware collection ──────────────────────────────────────────────────────
 
-type GPUMetrics struct {
+type gpuInfo struct {
 	DeviceIndex    int
 	Name           string
 	VRAMMB         int
@@ -471,8 +528,6 @@ type GPUMetrics struct {
 	UtilizationPct int
 	TemperatureC   int
 	PowerDrawW     int
-	PowerLimitW    int
-	FanSpeedPct    int
 	PCIeBusID      string
 	NUMANode       int
 }
@@ -485,9 +540,9 @@ func (a *Agent) readTotalRAMMB() int64 {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		parts := strings.Fields(sc.Text())
-		if len(parts) >= 2 && strings.TrimSuffix(parts[0], ":") == "MemTotal" {
-			v, _ := strconv.ParseInt(parts[1], 10, 64)
+		p := strings.Fields(sc.Text())
+		if len(p) >= 2 && strings.TrimSuffix(p[0], ":") == "MemTotal" {
+			v, _ := strconv.ParseInt(p[1], 10, 64)
 			return v / 1024
 		}
 	}
@@ -503,67 +558,60 @@ func (a *Agent) readRAMUsage() (usedMB, availMB int64) {
 	vals := make(map[string]int64)
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		parts := strings.Fields(sc.Text())
-		if len(parts) >= 2 {
-			vals[strings.TrimSuffix(parts[0], ":")] = func() int64 {
-				v, _ := strconv.ParseInt(parts[1], 10, 64)
-				return v
-			}()
+		p := strings.Fields(sc.Text())
+		if len(p) >= 2 {
+			v, _ := strconv.ParseInt(p[1], 10, 64)
+			vals[strings.TrimSuffix(p[0], ":")] = v
 		}
 	}
 	totalMB := vals["MemTotal"] / 1024
-	availMBVal := vals["MemAvailable"] / 1024
-	return totalMB - availMBVal, availMBVal
+	avail := vals["MemAvailable"] / 1024
+	return totalMB - avail, avail
 }
 
 func (a *Agent) readCPUUtil() float64 {
-	s1, err := a.readCPUStat()
+	type stat struct{ total, idle int64 }
+	read := func() (stat, error) {
+		f, err := os.Open("/proc/stat")
+		if err != nil {
+			return stat{}, err
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "cpu ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			var vals [10]int64
+			for i := 1; i < len(fields) && i <= 10; i++ {
+				vals[i-1], _ = strconv.ParseInt(fields[i], 10, 64)
+			}
+			idle := vals[3] + vals[4]
+			var total int64
+			for _, v := range vals {
+				total += v
+			}
+			return stat{total, idle}, nil
+		}
+		return stat{}, fmt.Errorf("not found")
+	}
+	s1, err := read()
 	if err != nil {
 		return 0
 	}
 	time.Sleep(200 * time.Millisecond)
-	s2, err := a.readCPUStat()
+	s2, err := read()
 	if err != nil {
 		return 0
 	}
-	dTotal := float64(s2.total - s1.total)
-	dIdle := float64(s2.idle - s1.idle)
-	if dTotal == 0 {
+	dt := float64(s2.total - s1.total)
+	di := float64(s2.idle - s1.idle)
+	if dt == 0 {
 		return 0
 	}
-	return (1 - dIdle/dTotal) * 100
-}
-
-type cpuStat struct{ total, idle int64 }
-
-func (a *Agent) readCPUStat() (cpuStat, error) {
-	f, err := os.Open("/proc/stat")
-	if err != nil {
-		return cpuStat{}, err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "cpu ") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			break
-		}
-		var vals [10]int64
-		for i := 1; i < len(fields) && i <= 10; i++ {
-			vals[i-1], _ = strconv.ParseInt(fields[i], 10, 64)
-		}
-		idle := vals[3] + vals[4]
-		var total int64
-		for _, v := range vals {
-			total += v
-		}
-		return cpuStat{total: total, idle: idle}, nil
-	}
-	return cpuStat{}, fmt.Errorf("cpu stat not found")
+	return (1 - di/dt) * 100
 }
 
 func (a *Agent) readDiskInfo() (totalGB, usedGB int64) {
@@ -592,9 +640,9 @@ func (a *Agent) readNUMANodes() int {
 	sc := bufio.NewScanner(strings.NewReader(string(out)))
 	for sc.Scan() {
 		if strings.HasPrefix(sc.Text(), "available:") {
-			fields := strings.Fields(sc.Text())
-			if len(fields) >= 2 {
-				n, _ := strconv.Atoi(fields[1])
+			f := strings.Fields(sc.Text())
+			if len(f) >= 2 {
+				n, _ := strconv.Atoi(f[1])
 				return n
 			}
 		}
@@ -612,9 +660,9 @@ func (a *Agent) readCPUModel() string {
 	for sc.Scan() {
 		line := sc.Text()
 		if strings.HasPrefix(line, "model name") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
+			p := strings.SplitN(line, ":", 2)
+			if len(p) == 2 {
+				return strings.TrimSpace(p[1])
 			}
 		}
 	}
@@ -629,17 +677,15 @@ func (a *Agent) readKernelVersion() string {
 	return strings.TrimSpace(string(out))
 }
 
-func (a *Agent) querySMI() []GPUMetrics {
+func (a *Agent) querySMI() []gpuInfo {
 	out, err := exec.Command("nvidia-smi",
-		"--query-gpu=index,name,memory.total,memory.used,utilization.gpu,"+
-			"temperature.gpu,power.draw,power.limit,fan.speed,pci.bus_id",
+		"--query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,pci.bus_id",
 		"--format=csv,noheader,nounits",
 	).Output()
 	if err != nil {
-		return nil // no GPU or no nvidia-smi
+		return nil
 	}
-
-	var gpus []GPUMetrics
+	var gpus []gpuInfo
 	sc := bufio.NewScanner(strings.NewReader(string(out)))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -647,10 +693,10 @@ func (a *Agent) querySMI() []GPUMetrics {
 			continue
 		}
 		fields := strings.Split(line, ", ")
-		if len(fields) < 10 {
+		if len(fields) < 8 {
 			continue
 		}
-		g := GPUMetrics{}
+		g := gpuInfo{}
 		g.DeviceIndex, _ = strconv.Atoi(strings.TrimSpace(fields[0]))
 		g.Name = strings.TrimSpace(fields[1])
 		g.VRAMMB, _ = strconv.Atoi(strings.TrimSpace(fields[2]))
@@ -659,17 +705,14 @@ func (a *Agent) querySMI() []GPUMetrics {
 		g.TemperatureC, _ = strconv.Atoi(strings.TrimSpace(fields[5]))
 		p, _ := strconv.ParseFloat(strings.TrimSpace(fields[6]), 64)
 		g.PowerDrawW = int(p)
-		l, _ := strconv.ParseFloat(strings.TrimSpace(fields[7]), 64)
-		g.PowerLimitW = int(l)
-		g.FanSpeedPct, _ = strconv.Atoi(strings.TrimSpace(fields[8]))
-		g.PCIeBusID = strings.TrimSpace(fields[9])
-		g.NUMANode = a.gpuNUMANode(g.PCIeBusID)
+		g.PCIeBusID = strings.TrimSpace(fields[7])
+		g.NUMANode = gpuNUMANode(g.PCIeBusID)
 		gpus = append(gpus, g)
 	}
 	return gpus
 }
 
-func (a *Agent) gpuNUMANode(pcieID string) int {
+func gpuNUMANode(pcieID string) int {
 	if pcieID == "" {
 		return 0
 	}
@@ -685,44 +728,76 @@ func (a *Agent) gpuNUMANode(pcieID string) int {
 	return n
 }
 
-// ─── Node ID persistence ──────────────────────────────────────────────────────
+func (a *Agent) hasDocker() bool {
+	_, err := exec.LookPath("docker")
+	return err == nil
+}
 
-func (a *Agent) loadStoredNodeID() string {
-	data, err := os.ReadFile(nodeIDFile)
+func (a *Agent) hasOllama() bool {
+	_, err := exec.LookPath("ollama")
+	return err == nil
+}
+
+func (a *Agent) localIP() string {
+	out, err := exec.Command("hostname", "-I").Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
-}
-
-func (a *Agent) saveNodeID(id string) {
-	_ = os.MkdirAll(filepath.Dir(nodeIDFile), 0755)
-	_ = os.WriteFile(nodeIDFile, []byte(id), 0644)
+	fields := strings.Fields(string(out))
+	if len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 func (a *Agent) post(ctx context.Context, path string, body interface{}, out interface{}) error {
-	data, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+	return a.doRequest(ctx, http.MethodPost, path, body, out, true)
+}
+
+func (a *Agent) postNoAuth(ctx context.Context, path string, body interface{}, out interface{}) error {
+	return a.doRequest(ctx, http.MethodPost, path, body, out, false)
+}
+
+func (a *Agent) getAuth(ctx context.Context, path string, out interface{}) error {
+	return a.doRequest(ctx, http.MethodGet, path, nil, out, true)
+}
+
+func (a *Agent) put(ctx context.Context, path string, body interface{}, out interface{}) error {
+	return a.doRequest(ctx, http.MethodPut, path, body, out, true)
+}
+
+func (a *Agent) doRequest(ctx context.Context, method, path string, body interface{}, out interface{}, auth bool) error {
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		a.adminURL+path, bytes.NewReader(data))
+
+	req, err := http.NewRequestWithContext(ctx, method, a.adminURL+path, bodyReader)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if auth && a.token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.token)
+	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s: %w", path, err)
+		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST %s → HTTP %d: %s", path, resp.StatusCode, string(b))
+		return fmt.Errorf("%s %s → HTTP %d: %s", method, path, resp.StatusCode, string(b))
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -730,21 +805,35 @@ func (a *Agent) post(ctx context.Context, path string, body interface{}, out int
 	return nil
 }
 
-func (a *Agent) get(ctx context.Context, path string, out interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.adminURL+path, nil)
+// ─── Persistence ─────────────────────────────────────────────────────────────
+
+func loadFile(path string) string {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return ""
 	}
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", path, err)
+	return strings.TrimSpace(string(data))
+}
+
+func saveFile(path, content string) {
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.WriteFile(path, []byte(content), 0600)
+}
+
+// ─── Logger ───────────────────────────────────────────────────────────────────
+
+func buildLogger(level string) *zap.Logger {
+	lvl := zapcore.InfoLevel
+	switch level {
+	case "debug":
+		lvl = zapcore.DebugLevel
+	case "warn":
+		lvl = zapcore.WarnLevel
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GET %s → HTTP %d: %s", path, resp.StatusCode, string(b))
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	cfg := zap.NewProductionConfig()
+	cfg.Level = zap.NewAtomicLevelAt(lvl)
+	l, _ := cfg.Build()
+	return l
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

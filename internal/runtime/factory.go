@@ -24,6 +24,8 @@ func NewFactory(client *http.Client) *Factory {
 	f.Register(BackendOpenAICompat,  NewOpenAICompatBackend)
 	// CPU-native services (embeddings, rerankers, STT, TTS, OCR, MCP, agents)
 	f.Register(BackendCPUNative,     NewCPUNativeBackend)
+	// llama.cpp server — OpenAI-compatible, CPU inference
+	f.Register(BackendType("llamacpp"), NewOpenAICompatBackend) // wire format is identical to openai_compat
 	return f
 }
 

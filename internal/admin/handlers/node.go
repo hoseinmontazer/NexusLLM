@@ -87,6 +87,7 @@ func (h *NodeHandler) ListNodes(c *gin.Context) {
 		ID               string     `db:"id"               json:"id"`
 		Hostname         string     `db:"hostname"         json:"hostname"`
 		DisplayName      string     `db:"display_name"     json:"display_name"`
+		IPAddress        string     `db:"ip_address"       json:"ip_address"`
 		TotalCPU         int        `db:"total_cpu"        json:"total_cpu"`
 		TotalRAMMB       int64      `db:"total_ram_mb"     json:"total_ram_mb"`
 		TotalVRAMMB      int64      `db:"total_vram_mb"    json:"total_vram_mb"`
@@ -101,7 +102,8 @@ func (h *NodeHandler) ListNodes(c *gin.Context) {
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `
 		SELECT id, hostname, display_name, total_cpu, total_ram_mb, total_vram_mb,
 		       status, COALESCE(agent_version,'') AS agent_version,
-		       last_heartbeat_at, labels, created_at
+		       last_heartbeat_at, labels, created_at,
+		       COALESCE(host(ip_address), '') AS ip_address
 		FROM nodes ORDER BY hostname`); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -395,4 +397,48 @@ func (h *NodeHandler) GetInventory(c *gin.Context) {
 
 func marshalLabels(m map[string]interface{}) ([]byte, error) {
 	return json.Marshal(m)
+}
+
+// DrainNode handles POST /admin/v1/nodes/:id/drain
+// Puts the node into DRAINING state — no new deployments, finish existing.
+func (h *NodeHandler) DrainNode(c *gin.Context) {
+	nodeID := c.Param("id")
+	res, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE nodes SET status='draining', updated_at=NOW() WHERE id=$1`, nodeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO node_health_events (node_id, from_status, to_status, reason)
+		SELECT id, status, 'draining', 'admin requested drain' FROM nodes WHERE id=$1`, nodeID)
+	c.JSON(http.StatusOK, gin.H{"message": "node draining — no new deployments will be scheduled", "node_id": nodeID})
+}
+
+// GetNodeHealthEvents handles GET /admin/v1/nodes/:id/health-events
+func (h *NodeHandler) GetNodeHealthEvents(c *gin.Context) {
+	nodeID := c.Param("id")
+	type eventRow struct {
+		ID         int64     `db:"id"          json:"id"`
+		FromStatus string    `db:"from_status" json:"from_status"`
+		ToStatus   string    `db:"to_status"   json:"to_status"`
+		Reason     string    `db:"reason"      json:"reason"`
+		CreatedAt  time.Time `db:"created_at"  json:"created_at"`
+	}
+	var rows []eventRow
+	_ = h.db.SelectContext(c.Request.Context(), &rows, `
+		SELECT id, COALESCE(from_status,'') AS from_status, to_status,
+		       COALESCE(reason,'') AS reason, created_at
+		FROM node_health_events
+		WHERE node_id = $1
+		ORDER BY created_at DESC LIMIT 100`, nodeID)
+	if rows == nil {
+		rows = []eventRow{}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "node_id": nodeID})
 }

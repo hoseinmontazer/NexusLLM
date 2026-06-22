@@ -28,8 +28,19 @@ func (d *dockerDriver) Start(ctx context.Context, spec RuntimeSpec) (string, err
 		args = d.buildTGIArgs(spec)
 	case "cpu_native":
 		args = d.buildCPUNativeArgs(spec)
+	case "llamacpp":
+		args = d.buildLlamaCppArgs(spec)
 	default: // vllm and openai_compat
 		args = d.buildVLLMArgs(spec)
+	}
+
+	// Remove any existing container with the same name before starting.
+	// This prevents "container name already in use" errors when redeploying.
+	name := containerName(spec)
+	rmOut, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+	if rmErr != nil && !strings.Contains(string(rmOut), "No such container") {
+		// Non-fatal — log and continue; docker run will surface the real error if needed.
+		_ = rmOut
 	}
 
 	// Run and capture container ID
@@ -133,7 +144,107 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 	return args
 }
 
-// applyCommonResourceArgs appends env vars, CPU limit, and memory limit
+// buildLlamaCppArgs builds docker run args for llama.cpp server.
+// Image: ghcr.io/ggml-org/llama.cpp:server
+// The server binary is `llama-server` which exposes an OpenAI-compatible API.
+//
+// Model loading (first match wins):
+//   a) LlamaCppModelPath set → --model /models/file.gguf  (local GGUF on volume)
+//   b) LlamaCppHFRepo + LlamaCppHFFile set → --hf-repo ORG/REPO --hf-file file.gguf
+//   c) LlamaCppHFRepo only → --hf-repo ORG/REPO  (server picks default GGUF)
+//   d) ModelName is a local path (starts with "/") → --model <ModelName>
+//
+// For (b) and (c), set HUGGING_FACE_HUB_TOKEN in Env for gated repos.
+// GPU offload is controlled by LlamaCppNGPULayers:
+//   0   = CPU-only (default when no GPUDevices assigned)
+//   -1  = all layers on GPU (default when GPUDevices is non-empty)
+//   N>0 = offload N layers to GPU (partial offload)
+func (d *dockerDriver) buildLlamaCppArgs(spec RuntimeSpec) []string {
+	args := []string{"run", "-d",
+		"--name", containerName(spec),
+		"--restart", "unless-stopped",
+		"--network", "host",
+	}
+
+	// CPU affinity from placement engine
+	if spec.CPUSetCPUs != "" {
+		args = append(args, "--cpuset-cpus", spec.CPUSetCPUs)
+	}
+	if spec.NUMANode >= 0 {
+		args = append(args, "--cpuset-mems", strconv.Itoa(spec.NUMANode))
+	}
+
+	// GPU assignment — only set --gpus when devices are specified
+	if len(spec.GPUDevices) > 0 {
+		devList := make([]string, len(spec.GPUDevices))
+		for i, idx := range spec.GPUDevices {
+			devList[i] = strconv.Itoa(idx)
+		}
+		args = append(args, "--gpus", fmt.Sprintf("device=%s", strings.Join(devList, ",")))
+	}
+
+	args = d.applyCommonResourceArgs(args, spec)
+
+	// Volume for GGUF model files.
+	// Use an absolute host path as a bind-mount, or fall back to named volume.
+	vol := spec.LlamaCppModelsVolume
+	if vol == "" {
+		vol = "llamacpp_models"
+	}
+	args = append(args, "-v", vol+":/models")
+
+	// Image — must be the :server tag for serving
+	args = append(args, spec.Image)
+
+	// ── Model source (first match wins) ───────────────────────────────────────
+	switch {
+	case spec.LlamaCppModelPath != "":
+		args = append(args, "--model", spec.LlamaCppModelPath)
+	case spec.LlamaCppHFRepo != "" && spec.LlamaCppHFFile != "":
+		args = append(args, "--hf-repo", spec.LlamaCppHFRepo, "--hf-file", spec.LlamaCppHFFile)
+	case spec.LlamaCppHFRepo != "":
+		args = append(args, "--hf-repo", spec.LlamaCppHFRepo)
+	case strings.HasPrefix(spec.ModelName, "/"):
+		// explicit absolute path in ModelName
+		args = append(args, "--model", spec.ModelName)
+	}
+	// NOTE: a bare model name (no "/" prefix, not an HF repo) is intentionally
+	// not passed as --model. Callers should set LlamaCppModelPath or LlamaCppHFRepo.
+
+	// ── Server flags ──────────────────────────────────────────────────────────
+	ctxSize := spec.LlamaCppCtxSize
+	if ctxSize == 0 {
+		ctxSize = 4096
+	}
+	args = append(args,
+		"--host", "0.0.0.0",
+		"--port", strconv.Itoa(spec.BindPort),
+		"--ctx-size", strconv.Itoa(ctxSize),
+	)
+
+	// Thread count — use CPULimit if set (e.g. "8"), otherwise let llama-server auto-detect
+	if spec.CPULimit != "" {
+		args = append(args, "--threads", spec.CPULimit)
+	}
+
+	// GPU offload layers
+	nGPULayers := spec.LlamaCppNGPULayers
+	if nGPULayers == 0 && len(spec.GPUDevices) > 0 {
+		nGPULayers = -1 // full GPU offload by default when GPUs are assigned
+	}
+	if nGPULayers != 0 {
+		args = append(args, "--n-gpu-layers", strconv.Itoa(nGPULayers))
+	}
+
+	// Append any extra args last (overrides / additions from the operator)
+	args = append(args, spec.ExtraArgs...)
+	return args
+}
+
+// isHFRepo returns true if the model name looks like a HuggingFace repo ID (org/model).
+func isHFRepo(s string) bool {
+	return len(s) > 0 && strings.Count(s, "/") == 1 && !strings.HasPrefix(s, "/")
+}
 // to an args slice. Used by all backend builders.
 func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) []string {
 	// Environment variables

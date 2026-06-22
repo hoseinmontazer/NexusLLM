@@ -9,12 +9,13 @@ import (
 
 // Config aggregates all subsystem configurations.
 type Config struct {
-	Server    ServerConfig
-	Database  DatabaseConfig
-	Redis     RedisConfig
-	Auth      AuthConfig
-	Scheduler SchedulerConfig
-	VLLM      VLLMConfig
+	Server     ServerConfig
+	Database   DatabaseConfig
+	Redis      RedisConfig
+	Auth       AuthConfig
+	Scheduler  SchedulerConfig
+	VLLM       VLLMConfig
+	RuntimeMgr RuntimeMgrConfig
 }
 
 // ServerConfig controls the HTTP listener.
@@ -64,6 +65,26 @@ type VLLMConfig struct {
 	Endpoints map[string]string
 }
 
+// RuntimeMgrConfig controls the lazy-load runtime manager.
+type RuntimeMgrConfig struct {
+	// DefaultIdleTimeout is how long a container stays running with no traffic.
+	// Override per-model via model_runtime_configs.idle_timeout_secs.
+	// Env: NEXUS_RUNTIMEMGR_IDLETIMEOUT  (default: 15m)
+	DefaultIdleTimeout time.Duration
+
+	// ColdStartTimeout is the max time EnsureRunning waits for a model to become healthy.
+	// Env: NEXUS_RUNTIMEMGR_COLDSTARTTIMEOUT  (default: 5m)
+	ColdStartTimeout time.Duration
+
+	// DefaultModelsVolume is the Docker volume or host path mounted as /models.
+	// Env: NEXUS_RUNTIMEMGR_MODELSVOLUME  (default: llamacpp_models)
+	DefaultModelsVolume string
+
+	// DefaultImage is the default llama-server Docker image.
+	// Env: NEXUS_RUNTIMEMGR_DEFAULTIMAGE  (default: ghcr.io/ggml-org/llama.cpp:server)
+	DefaultImage string
+}
+
 // Load reads configuration from environment variables (prefix NEXUS_) and any
 // config file found on the search path, then applies sensible defaults.
 func Load() (*Config, error) {
@@ -96,6 +117,11 @@ func Load() (*Config, error) {
 	v.SetDefault("scheduler.dispatchinterval", "100ms")
 
 	v.SetDefault("vllm.pollinterval", "5s")
+
+	v.SetDefault("runtimemgr.idletimeout", "15m")
+	v.SetDefault("runtimemgr.coldstarttimeout", "5m")
+	v.SetDefault("runtimemgr.modelsvolume", "llamacpp_models")
+	v.SetDefault("runtimemgr.defaultimage", "ghcr.io/ggml-org/llama.cpp:server")
 
 	// --- env ---
 	v.SetEnvPrefix("NEXUS")
@@ -144,14 +170,15 @@ func Load() (*Config, error) {
 	// VLLM
 	cfg.VLLM.PollInterval = v.GetDuration("vllm.pollinterval")
 	cfg.VLLM.Endpoints = v.GetStringMapString("vllm.endpoints")
-	if len(cfg.VLLM.Endpoints) == 0 {
-		// sensible local defaults matching docker-compose service names
-		cfg.VLLM.Endpoints = map[string]string{
-			"gemma-27b":     "http://vllm-gemma:8000",
-			"llama-3.3-70b": "http://vllm-llama:8000",
-			"qwen-2.5-72b":  "http://vllm-qwen:8000",
-		}
-	}
+	// No hardcoded defaults — endpoints are populated dynamically from the
+	// model registry (model_endpoints table). Configure via env if needed:
+	//   NEXUS_VLLM_ENDPOINTS_<MODEL>=http://host:port
+
+	// RuntimeMgr
+	cfg.RuntimeMgr.DefaultIdleTimeout  = v.GetDuration("runtimemgr.idletimeout")
+	cfg.RuntimeMgr.ColdStartTimeout    = v.GetDuration("runtimemgr.coldstarttimeout")
+	cfg.RuntimeMgr.DefaultModelsVolume = v.GetString("runtimemgr.modelsvolume")
+	cfg.RuntimeMgr.DefaultImage        = v.GetString("runtimemgr.defaultimage")
 
 	return cfg, nil
 }

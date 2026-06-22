@@ -12,26 +12,18 @@ import (
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/redis/go-redis/v9"
 )
 
 // RuntimeHandler manages the runtime lifecycle API.
-//
-// Correct flow for deploying a model:
-//
-//	POST /admin/v1/models/deploy
-//	  1. Insert model row into DB
-//	  2. Insert endpoint row into DB
-//	  3. Start vLLM Docker container (controller)
-//	  4. Reload registry → gateway starts routing
-//
-// All in one atomic API call. No seed data needed.
 type RuntimeHandler struct {
 	db        *sqlx.DB
 	rdb       *redis.Client
 	registry  *runtime.Registry
 	ctrl      *controller.ModelController
-	placement placement.Placer // optional; nil = manual GPU assignment only
+	placement placement.Placer     // optional; nil = manual GPU assignment only
+	taskMgr   *taskmanager.Manager // optional; nil = local Docker deployment only
 }
 
 // NewRuntimeHandler constructs a RuntimeHandler.
@@ -39,10 +31,15 @@ func NewRuntimeHandler(db *sqlx.DB, rdb *redis.Client, registry *runtime.Registr
 	return &RuntimeHandler{db: db, rdb: rdb, registry: registry, ctrl: ctrl}
 }
 
-// WithPlacement attaches a placement engine to the handler, enabling the
-// auto_place option on DeployModel.
+// WithPlacement attaches a placement engine to the handler.
 func (h *RuntimeHandler) WithPlacement(p placement.Placer) *RuntimeHandler {
 	h.placement = p
+	return h
+}
+
+// WithTaskManager attaches a task manager, enabling node-agent based deployment.
+func (h *RuntimeHandler) WithTaskManager(tm *taskmanager.Manager) *RuntimeHandler {
+	h.taskMgr = tm
 	return h
 }
 
@@ -88,6 +85,30 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		MinVRAMMB  int64 `json:"min_vram_mb"` // used when auto_place=true
 		MaxVRAMMB  int64 `json:"max_vram_mb"` // used when auto_place=true
 		Priority   string `json:"priority"`   // used when auto_place=true
+
+		// NodeID: if set, deploy via DEPLOY_RUNTIME task to the specified node agent.
+		// The node agent executes the container start on that server.
+		// If empty, the control plane starts the container directly (legacy behaviour).
+		NodeID string `json:"node_id"`
+
+		// ── llamacpp-specific ─────────────────────────────────────────────────
+		// LlamaCppModelPath: local GGUF path inside the container, e.g.
+		//   "/models/7B/ggml-model-q4_0.gguf"
+		// Pre-download the model with PULL_MODEL (TaskPullModel) first.
+		LlamaCppModelPath string `json:"llamacpp_model_path"`
+		// LlamaCppHFRepo + LlamaCppHFFile: download GGUF directly from HuggingFace
+		// at container startup via llama-server's built-in --hf-repo / --hf-file.
+		// No separate PULL_MODEL step needed, but startup is slower on first run.
+		LlamaCppHFRepo string `json:"llamacpp_hf_repo"`
+		LlamaCppHFFile string `json:"llamacpp_hf_file"`
+		// LlamaCppCtxSize overrides the default context window (default: 4096).
+		LlamaCppCtxSize int `json:"llamacpp_ctx_size"`
+		// LlamaCppNGPULayers controls how many transformer layers to offload to GPU.
+		// 0 = CPU-only, -1 = all layers on GPU (default when gpu_devices is non-empty).
+		LlamaCppNGPULayers int `json:"llamacpp_n_gpu_layers"`
+		// LlamaCppModelsVolume is the host path or named volume to mount as /models.
+		// Defaults to Docker named volume "llamacpp_models" when empty.
+		LlamaCppModelsVolume string `json:"llamacpp_models_volume"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -128,6 +149,28 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		modelID = input.Name
 	}
 
+	// ── Resolve bind host from node IP ────────────────────────────────────
+	// When deploying to a specific node, the endpoint host must be the node's
+	// real IP address (not localhost) so the gateway can route to it over the network.
+	bindHost := input.Host
+	if input.NodeID != "" {
+		var nodeIP string
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
+		).Scan(&nodeIP)
+		if nodeIP != "" {
+			bindHost = nodeIP
+		} else {
+			var hostname string
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
+			).Scan(&hostname)
+			if hostname != "" {
+				bindHost = hostname
+			}
+		}
+	}
+
 	// ── 1. Insert model row ────────────────────────────────────────────────
 	mID := uuid.New().String()
 	_, err := h.db.ExecContext(c.Request.Context(), `
@@ -138,7 +181,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
-		fmt.Sprintf("http://%s:%d", input.Host, input.Port),
+		fmt.Sprintf("http://%s:%d", bindHost, input.Port),
 	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -169,7 +212,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		  (id, model_id, host, port, base_path, weight, priority,
 		   health_status, is_enabled, lifecycle_state, runtime_image)
 		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'registered',$5)`,
-		epID, mID, input.Host, input.Port, runtimeImage,
+		epID, mID, bindHost, input.Port, runtimeImage,
 	)
 	if err != nil {
 		// Rollback model row
@@ -178,16 +221,13 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		return
 	}
 
-	// ── 3. Start container for all Docker-managed backends ──────────────────
-	var containerID string
-	// vllm, ollama, and tgi all support Docker deployment
-	canDeploy := input.BackendType == "vllm" || input.BackendType == "ollama" || input.BackendType == "tgi"
+	// ── 3. Deploy the runtime ─────────────────────────────────────────────────
+	canDeploy := input.BackendType == "vllm" || input.BackendType == "ollama" ||
+		input.BackendType == "tgi" || input.BackendType == "llamacpp" || input.BackendType == "cpu_native"
 	shouldStart := startNow && canDeploy && input.Image != ""
 
-	// ── Auto-placement ────────────────────────────────────────────────────
-	// If auto_place=true and a placement engine is wired, ask it to choose
-	// GPUs for this model. The result overwrites input.GPUDevices.
-	if input.AutoPlace && h.placement != nil {
+	// ── Auto-placement (placement engine picks GPU/NUMA) ──────────────────
+	if (input.AutoPlace || input.NodeID != "") && h.placement != nil && input.NodeID == "" {
 		gpuCount := len(input.GPUDevices)
 		if gpuCount == 0 {
 			gpuCount = input.TensorParallel
@@ -205,17 +245,113 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			MaxVRAMMB:   input.MaxVRAMMB,
 			GPUCount:    gpuCount,
 		}
-		dec, placErr := h.placement.Decide(c.Request.Context(), pReq)
-		if placErr != nil {
-			// Non-fatal: proceed without auto-placement, log the issue
-			_ = placErr
-		} else {
+		if dec, placErr := h.placement.Decide(c.Request.Context(), pReq); placErr == nil {
 			input.GPUDevices = dec.GPUDeviceIndices
 			input.TensorParallel = len(dec.GPUDeviceIndices)
 			_ = h.placement.Apply(c.Request.Context(), dec, pReq, epID)
 		}
 	}
 
+	// ── Path A: Deploy via Node Agent ──────────────────────────────────────
+	// When node_id is set, dispatch a DEPLOY_RUNTIME task to the agent on that
+	// node. The agent executes docker run locally and reports back.
+	if shouldStart && input.NodeID != "" && h.taskMgr != nil {
+		// Create agent_runtime row
+		runtimeID := uuid.New().String()
+		containerName := "nexus-" + input.Name
+		_, _ = h.db.ExecContext(c.Request.Context(), `
+			INSERT INTO agent_runtimes
+			  (id, node_id, endpoint_id, model_id, runtime_name, backend,
+			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node)
+			VALUES ($1,$2,$3,$4,$5,$6,'pending','[]',$7,$8,'',-1)`,
+			runtimeID, input.NodeID, epID, mID,
+			containerName, input.BackendType,
+			input.Host, input.Port,
+		)
+
+		// Build task payload — control plane passes all decisions to the agent
+		payload := taskmanager.DeployRuntimePayload{
+			RuntimeID:      runtimeID,
+			EndpointID:     epID,
+			ModelID:        mID,
+			RuntimeName:    containerName,
+			Backend:        input.BackendType,
+			Image:          runtimeImage,
+			ModelName:      modelID,
+			ServedAs:       input.Name,
+			BindHost:       bindHost,  // node's real IP, not localhost
+			BindPort:       input.Port,
+			GPUDevices:     input.GPUDevices,
+			TensorParallel: input.TensorParallel,
+			GPUMemoryUtil:  input.GPUMemoryUtil,
+			MaxModelLen:    input.MaxModelLen,
+			Dtype:          input.Dtype,
+			Quantization:   input.Quantization,
+			ExtraArgs:      input.ExtraArgs,
+			Env:            map[string]string{},
+			// llamacpp fields
+			LlamaCppModelPath:    input.LlamaCppModelPath,
+			LlamaCppHFRepo:       input.LlamaCppHFRepo,
+			LlamaCppHFFile:       input.LlamaCppHFFile,
+			LlamaCppCtxSize:      input.LlamaCppCtxSize,
+			LlamaCppNGPULayers:   input.LlamaCppNGPULayers,
+			LlamaCppModelsVolume: input.LlamaCppModelsVolume,
+		}
+		if input.HFToken != "" {
+			payload.HFToken = input.HFToken
+		}
+
+		priority := 70
+		if input.Priority == "critical" {
+			priority = 90
+		} else if input.Priority == "high" {
+			priority = 80
+		}
+
+		taskID, taskErr := h.taskMgr.Enqueue(
+			c.Request.Context(),
+			input.NodeID,
+			taskmanager.TaskDeployRuntime,
+			payload,
+			taskmanager.WithPriority(priority),
+			taskmanager.WithActor("admin-deploy"),
+			taskmanager.WithRuntimeID(runtimeID),
+		)
+
+		// Mark endpoint as pending (agent will transition it)
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET lifecycle_state='downloading', updated_at=NOW() WHERE id=$1`, epID)
+		// Link endpoint to node
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET node_id=$1 WHERE id=$2`, input.NodeID, epID)
+
+		_ = h.registry.Reload(c.Request.Context())
+
+		if taskErr != nil {
+			c.JSON(http.StatusAccepted, gin.H{
+				"model_id":    mID,
+				"endpoint_id": epID,
+				"runtime_id":  runtimeID,
+				"warning":     "model registered but task dispatch failed: " + taskErr.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{
+			"model_id":    mID,
+			"model_name":  input.Name,
+			"endpoint_id": epID,
+			"runtime_id":  runtimeID,
+			"task_id":     taskID,
+			"node_id":     input.NodeID,
+			"status":      "pending",
+			"note":        "DEPLOY_RUNTIME task dispatched — agent will start container and report back",
+		})
+		return
+	}
+
+	// ── Path B: Deploy locally via Docker (legacy / single-server) ──────────
+	var containerID string
 	if shouldStart {
 		env := map[string]string{}
 		if input.HFToken != "" {
@@ -223,8 +359,8 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		}
 
 		spec := controller.RuntimeSpec{
-			ModelName:       modelID,       // HF model ID (e.g. "google/gemma-3-27b-it")
-			ServedModelName: input.Name,    // short name for routing (e.g. "gemma-3-27b")
+			ModelName:       modelID,
+			ServedModelName: input.Name,
 			Version:         "v1",
 			EndpointID:      epID,
 			BackendType:     input.BackendType,
@@ -239,11 +375,17 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			Quantization:    input.Quantization,
 			ExtraArgs:       input.ExtraArgs,
 			Env:             env,
+			// llamacpp fields
+			LlamaCppModelPath:    input.LlamaCppModelPath,
+			LlamaCppHFRepo:       input.LlamaCppHFRepo,
+			LlamaCppHFFile:       input.LlamaCppHFFile,
+			LlamaCppCtxSize:      input.LlamaCppCtxSize,
+			LlamaCppNGPULayers:   input.LlamaCppNGPULayers,
+			LlamaCppModelsVolume: input.LlamaCppModelsVolume,
 		}
 
 		containerID, err = h.ctrl.StartRaw(c.Request.Context(), epID, mID, spec, "admin")
 		if err != nil {
-			// Container failed to start — mark endpoint as failed but keep DB rows
 			_, _ = h.db.ExecContext(c.Request.Context(),
 				`UPDATE model_endpoints SET lifecycle_state = 'failed', updated_at = NOW() WHERE id = $1`, epID)
 			c.JSON(http.StatusAccepted, gin.H{
@@ -522,6 +664,12 @@ func (h *RuntimeHandler) GetModelHealth(c *gin.Context) {
 }
 
 func (h *RuntimeHandler) ListModels(c *gin.Context) {
+	// By default, show only active models. Pass ?lifecycle=archived or ?lifecycle=all to see others.
+	lifecycle := c.Query("lifecycle")
+	if lifecycle == "" {
+		lifecycle = "active"
+	}
+
 	type mRow struct {
 		ID          string `db:"id"           json:"id"`
 		Name        string `db:"name"         json:"name"`
@@ -531,23 +679,34 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		MaxContext  int    `db:"max_context"  json:"max_context"`
 		MaxOutput   int    `db:"max_output"   json:"max_output"`
 		Enabled     bool   `db:"enabled"      json:"enabled"`
+		Lifecycle   string `db:"lifecycle"    json:"lifecycle"`
 		EndpointCnt int    `db:"endpoint_cnt" json:"endpoint_count"`
 		HealthyCnt  int    `db:"healthy_cnt"  json:"healthy_count"`
 	}
 	rows := make([]mRow, 0)
-	if err := h.db.SelectContext(c.Request.Context(), &rows, `
+
+	query := `
 		SELECT m.id, m.name, m.display_name, m.provider, m.backend_type,
 		       m.max_context, m.max_output, m.enabled,
+		       COALESCE(m.lifecycle,'active') AS lifecycle,
 		       COUNT(me.id) AS endpoint_cnt,
 		       COUNT(me.id) FILTER (WHERE me.health_status='healthy') AS healthy_cnt
 		FROM models m
-		LEFT JOIN model_endpoints me ON me.model_id = m.id AND me.is_enabled = TRUE
-		GROUP BY m.id ORDER BY m.name`); err != nil {
+		LEFT JOIN model_endpoints me ON me.model_id = m.id AND me.is_enabled = TRUE`
+
+	switch lifecycle {
+	case "all":
+		query += " WHERE m.lifecycle != 'deleted'"
+	case "archived":
+		query += " WHERE m.lifecycle = 'archived'"
+	default:
+		query += " WHERE COALESCE(m.lifecycle,'active') = 'active'"
+	}
+	query += " GROUP BY m.id ORDER BY m.name"
+
+	if err := h.db.SelectContext(c.Request.Context(), &rows, query); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
-	}
-	if rows == nil {
-		rows = make([]mRow, 0)
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
 }
@@ -771,4 +930,65 @@ func (h *RuntimeHandler) ImportOllamaModels(c *gin.Context) {
 		"results": results,
 		"total":   len(results),
 	})
+}
+
+// ─── Model Lifecycle (Archive / Restore) ─────────────────────────────────────
+
+// ArchiveModel handles POST /admin/v1/models/:id/archive
+// Archived models stay in the DB and audit logs but cannot be deployed
+// and do not appear in default listings.
+func (h *RuntimeHandler) ArchiveModel(c *gin.Context) {
+	modelID := c.Param("id")
+
+	// First stop all running endpoints
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		UPDATE model_endpoints
+		SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
+		WHERE model_id = $1`, modelID)
+
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE models SET lifecycle = 'archived', enabled = FALSE, updated_at = NOW()
+		WHERE id = $1 AND lifecycle = 'active'`, modelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO model_lifecycle_events_v2 (model_id, from_state, to_state, reason, actor)
+		VALUES ($1, 'active', 'archived', 'admin archived', 'admin')`, modelID)
+
+	_ = h.registry.Reload(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{"message": "model archived", "model_id": modelID})
+}
+
+// RestoreModel handles POST /admin/v1/models/:id/restore
+// Restores an archived model to active state.
+func (h *RuntimeHandler) RestoreModel(c *gin.Context) {
+	modelID := c.Param("id")
+
+	res, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE models SET lifecycle = 'active', enabled = TRUE, updated_at = NOW()
+		WHERE id = $1 AND lifecycle = 'archived'`, modelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is not archived"})
+		return
+	}
+
+	// Re-enable endpoints
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		UPDATE model_endpoints SET is_enabled = TRUE, health_status = 'unknown', updated_at = NOW()
+		WHERE model_id = $1`, modelID)
+
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO model_lifecycle_events_v2 (model_id, from_state, to_state, reason, actor)
+		VALUES ($1, 'archived', 'active', 'admin restored', 'admin')`, modelID)
+
+	_ = h.registry.Reload(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{"message": "model restored to active", "model_id": modelID})
 }

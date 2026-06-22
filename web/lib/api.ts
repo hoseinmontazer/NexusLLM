@@ -40,7 +40,26 @@ export interface Model {
   backend_type: string; service_type: string; runtime_type: string
   max_context: number; max_output: number
   enabled: boolean; endpoint_count: number; healthy_count: number
+  lifecycle: string  // active | archived | deleted
   tags?: string
+}
+
+export interface RuntimeRequirements {
+  id: string; model_id: string
+  execution_type: string   // GPU | CPU | ANY
+  required_vram_mb: number; gpu_count: number
+  required_cpu: number; required_memory_mb: number
+  requires_docker: boolean; requires_gpu: boolean
+  requires_vllm: boolean; requires_ollama: boolean
+  requires_tts: boolean; requires_whisper: boolean
+  priority: string
+  updated_at: string
+}
+
+export interface CompatibleNode {
+  id: string; hostname: string; ip_address: string; status: string
+  total_vram_mb: number; total_cpu: number; total_ram_mb: number
+  compatible: boolean; reason: string
 }
 export interface Endpoint {
   id: string; host: string; port: number; health_status: string
@@ -50,12 +69,12 @@ export interface Endpoint {
 }
 export interface GpuNode {
   id: string; name: string; host: string; driver_type: string
-  total_vram_mb: number; is_available: boolean
+  total_vram_mb: number; is_available: boolean; node_id?: string
 }
 export interface GpuDevice {
   id: string; node_id: string; device_index: number; name: string
   vram_mb: number; status: string; utilization_pct: number
-  temperature_c: number; power_draw_w: number
+  temperature_c: number; power_draw_w: number; numa_node: number
 }
 export interface UsageSummary {
   team_id: string; model_name: string; day: string
@@ -82,6 +101,7 @@ export interface ResourceReservation {
 
 export interface ClusterNode {
   id: string; hostname: string; display_name: string
+  ip_address: string     // real IP reported by node agent (empty string if not registered)
   total_cpu: number; total_ram_mb: number; total_vram_mb: number
   status: string; agent_version: string
   last_heartbeat_at?: string; labels: string; created_at: string
@@ -107,6 +127,43 @@ export interface DeployModelInput {
   tensor_parallel?: number; gpu_memory_util?: number
   max_model_len?: number; dtype?: string; hf_token?: string
   start_now?: boolean
+  // Node agent deployment
+  node_id?: string
+  auto_place?: boolean
+  min_vram_mb?: number
+  priority?: string
+  // llamacpp-specific
+  llamacpp_model_path?: string
+  llamacpp_hf_repo?: string
+  llamacpp_hf_file?: string
+  llamacpp_ctx_size?: number
+  llamacpp_n_gpu_layers?: number
+  llamacpp_models_volume?: string
+}
+
+export interface LazyConfig {
+  gguf_path?: string
+  hf_repo?: string
+  hf_file?: string
+  ctx_size: number
+  n_gpu_layers: number
+  cpu_threads?: number
+  memory_limit?: string
+  models_volume?: string
+  idle_timeout_secs?: number
+  updated_at: string
+}
+
+export interface RuntimeStatus {
+  runtime_id: string
+  node_id: string
+  hostname: string
+  state: string
+  container_id: string
+  bind_host: string
+  bind_port: number
+  last_used_at?: string
+  updated_at: string
 }
 export interface RegisterModelInput {
   name: string; display_name: string; backend_type: string
@@ -147,9 +204,9 @@ export const api = {
   },
 
   models: {
-    list: () => req<{ data: Model[]; total: number }>('GET', '/models'),
+    list: (lifecycle?: string) => req<{ data: Model[]; total: number }>('GET', lifecycle ? `/models?lifecycle=${lifecycle}` : '/models'),
     deploy: (b: DeployModelInput) =>
-      req<{ model_id: string; endpoint_id: string; started: boolean; note?: string }>('POST', '/models/deploy', b),
+      req<{ model_id: string; endpoint_id: string; started: boolean; note?: string; task_id?: string }>('POST', '/models/deploy', b),
     register: (b: RegisterModelInput) =>
       req<{ model_id: string; endpoint_id: string }>('POST', '/models', b),
     importOllama: (host = 'localhost', port = 11434) =>
@@ -160,6 +217,10 @@ export const api = {
     resetHealth: (id: string, epId?: string) =>
       req<{ message: string; endpoints_updated: number }>(
         'POST', epId ? `/models/${id}/reset-health?endpoint_id=${epId}` : `/models/${id}/reset-health`, {}),
+    archive: (id: string) =>
+      req<{ message: string; model_id: string }>('POST', `/models/${id}/archive`, {}),
+    restore: (id: string) =>
+      req<{ message: string; model_id: string }>('POST', `/models/${id}/restore`, {}),
     enable: (id: string) => req<void>('POST', `/models/${id}/enable`),
     disable: (id: string) => req<void>('POST', `/models/${id}/disable`),
     drain: (id: string) => req<void>('POST', `/models/${id}/drain`),
@@ -170,6 +231,20 @@ export const api = {
       req<void>('POST', `/models/${id}/stop?endpoint_id=${epId}`),
     restart: (id: string, epId: string) =>
       req<void>('POST', `/models/${id}/restart?endpoint_id=${epId}`),
+    getRequirements: (id: string) =>
+      req<RuntimeRequirements>('GET', `/models/${id}/requirements`),
+    setRequirements: (id: string, b: Partial<RuntimeRequirements>) =>
+      req<{ message: string }>('POST', `/models/${id}/requirements`, b),
+    compatibleNodes: (modelId: string) =>
+      req<{ compatible: CompatibleNode[]; incompatible: CompatibleNode[]; model_id: string }>(
+        'GET', `/scheduler/compatible-nodes?model_id=${modelId}`),
+    getLazyConfig: (id: string) =>
+      req<LazyConfig>('GET', `/models/${id}/lazy-config`),
+    setLazyConfig: (id: string, b: Partial<LazyConfig>) =>
+      req<{ message: string }>('PUT', `/models/${id}/lazy-config`, b),
+    getRuntimeStatus: (id: string) =>
+      req<{ model_id: string; runtimes: RuntimeStatus[]; count: number }>(
+        'GET', `/models/${id}/runtime-status`),
   },
 
   gpu: {
@@ -211,6 +286,19 @@ export const api = {
       req<{ data: NodeTelemetry[]; node_id: string }>('GET', `/nodes/${id}/telemetry`),
     getInventory: (id: string) =>
       req<{ id: string; snapshot: string; agent_version: string; reported_at: string }>('GET', `/nodes/${id}/inventory`),
+    getModelCache: (id: string) =>
+      req<{ data: { model_ref: string; backend: string; size_bytes: number; cached_at?: string }[]; node_id: string; total: number }>('GET', `/nodes/${id}/model-cache`),
+    drain: (id: string) =>
+      req<{ message: string; node_id: string }>('POST', `/nodes/${id}/drain`, {}),
+    getHealthEvents: (id: string) =>
+      req<{ data: { id: number; from_status: string; to_status: string; reason: string; created_at: string }[]; node_id: string }>('GET', `/nodes/${id}/health-events`),
+    // Task management
+    dispatchTask: (nodeId: string, taskType: string, payload: Record<string, unknown>, priority?: number) =>
+      req<{ task_id: string; node_id: string; status: string }>('POST', `/nodes/${nodeId}/tasks`, {
+        task_type: taskType, payload, priority: priority ?? 70, actor: 'admin-ui',
+      }),
+    listTasks: (nodeId: string) =>
+      req<{ data: unknown[]; total: number }>('GET', `/nodes/${nodeId}/tasks`),
   },
 
   placement: {

@@ -33,12 +33,9 @@ func main() {
 	}
 	log.Info("redis connected")
 
-	// Default per-model capacity (configurable via env in production)
-	capacity := map[string]int{
-		"gemma-27b":     50,
-		"llama-3.3-70b": 30,
-		"qwen-2.5-72b":  30,
-	}
+	// Per-model capacity — read from env NEXUS_VLLM_CAPACITY_<MODEL>=N
+	// or left empty (defaults to 100 per model in GPUWatcher.maxCapacity).
+	capacity := map[string]int{}
 
 	gpuWatcher := scheduler.NewGPUWatcher(
 		rdb,

@@ -22,6 +22,8 @@ import (
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/proxy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/runtimemgr"
+	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -115,6 +117,20 @@ func main() {
 	lifecycleMgr := lifecycle.NewManager(db, rdb, 30*time.Minute, nil, log)
 	go lifecycleMgr.Start(watchCtx)
 
+	// ── Runtime Manager (lazy-load architecture) ──────────────────────────────
+	// Connects to the admin control plane's task manager via the DB.
+	// The gateway uses it to start models on demand instead of returning 503.
+	taskMgr := taskmanager.NewManager(db, log)
+	rmCfg := runtimemgr.DefaultConfig()
+	rmCfg.DefaultIdleTimeout  = cfg.RuntimeMgr.DefaultIdleTimeout
+	rmCfg.ColdStartTimeout    = cfg.RuntimeMgr.ColdStartTimeout
+	rmCfg.DefaultModelsVolume = cfg.RuntimeMgr.DefaultModelsVolume
+	rmCfg.DefaultImage        = cfg.RuntimeMgr.DefaultImage
+	guard     := runtimemgr.NewResourceGuard(db, log)
+	activator := runtimemgr.NewActivator(db, taskMgr, registry, guard, rmCfg, log)
+	idleMgr   := runtimemgr.NewIdleManager(db, taskMgr, rmCfg, log)
+	go idleMgr.Start(watchCtx)
+
 	// Usage consumer
 	go usageTracker.StartConsumer(watchCtx)
 
@@ -138,7 +154,7 @@ func main() {
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		lifecycleMgr, registry, usageTracker, teamPolicies, log,
-	)
+	).WithActivator(activator)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)

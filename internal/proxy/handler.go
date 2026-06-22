@@ -1,6 +1,6 @@
 // Package proxy handles OpenAI-compatible inference requests.
 // Request pipeline:
-//   Auth → Gateway Policy → Alias Resolution → Prompt Policy → Registry → Backend
+//   Auth → Gateway Policy → Alias Resolution → Prompt Policy → Registry → Activator (on miss) → Backend
 package proxy
 
 import (
@@ -24,6 +24,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/runtimemgr"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"go.uber.org/zap"
 )
@@ -38,11 +39,10 @@ type Handler struct {
 	aliasResolver *alias.Resolver
 	lifecycleMgr  *lifecycle.Manager
 	registry      *runtime.Registry
+	activator     runtimemgr.Activator // lazy-load: starts model on demand
 	usageTracker  *usage.Tracker
 	log           *zap.Logger
 	teamPolicies  map[string]*policy.TeamPolicy
-	// httpClient is used by multi-service handlers (rerank, STT, TTS, OCR) to
-	// forward requests directly to backend endpoints.
 	httpClient    *http.Client
 }
 
@@ -76,6 +76,13 @@ func NewHandler(
 			},
 		},
 	}
+}
+
+// WithActivator attaches a RuntimeActivator for lazy-loading models on demand.
+// When set, a registry miss triggers EnsureRunning() instead of 503.
+func (h *Handler) WithActivator(a runtimemgr.Activator) *Handler {
+	h.activator = a
+	return h
 }
 
 // ─── public handlers ──────────────────────────────────────────────────────────
@@ -149,8 +156,37 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// ── 5. Resolve endpoint ────────────────────────────────────────────────
 	ep, backend, err := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
 	if err != nil {
-		abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint", err.Error())
-		return
+		// Registry miss — try lazy-loading via the runtime activator.
+		if h.activator != nil {
+			h.log.Info("registry miss — triggering lazy-load",
+				zap.String("model", req.Model),
+			)
+			// On the very first cold-start the request can take minutes.
+			// Return 503 with Retry-After so the client retries; don't hold
+			// the HTTP connection for the full cold-start duration.
+			warmup, warmErr := h.activator.EnsureRunning(c.Request.Context(), req.Model)
+			if warmErr != nil {
+				h.log.Warn("activator failed",
+					zap.String("model", req.Model),
+					zap.Error(warmErr),
+				)
+				abortErr(c, http.StatusServiceUnavailable, "model_starting",
+					fmt.Sprintf("model %q is starting up, please retry in a moment: %s", req.Model, warmErr.Error()))
+				return
+			}
+			// Record how long the cold start took.
+			c.Header("X-Nexus-Warmup-Ms", fmt.Sprintf("%d", warmup.WarmupMs))
+			// Re-resolve now that the model is warm.
+			ep, backend, err = h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
+			if err != nil {
+				abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint",
+					fmt.Sprintf("model started but endpoint not yet routable: %s", err.Error()))
+				return
+			}
+		} else {
+			abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint", err.Error())
+			return
+		}
 	}
 
 	// ── 6. Track inflight ─────────────────────────────────────────────────
@@ -158,6 +194,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	middleware.ActiveRequests.WithLabelValues(claims.TeamName, req.Model).Inc()
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
+	if h.activator != nil {
+		h.activator.RecordActivity(c.Request.Context(), ep.ID)
+	}
 
 	start := time.Now()
 	defer func() {

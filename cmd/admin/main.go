@@ -13,16 +13,19 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/admin/handlers"
+	"github.com/nexusllm/nexusllm/internal/agentauth"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/gpu"
 	"github.com/nexusllm/nexusllm/internal/nodeagent"
+	"github.com/nexusllm/nexusllm/internal/nodehealth"
 	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/services"
+	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -82,10 +85,28 @@ func main() {
 	modelCtrl      := controller.NewModelController(db, rdb, dockerDriver, log)
 	placementEng   := placement.NewEngine(db, log)
 	svcRegistry    := services.NewRegistry(db, log)
+	agentAuthSvc   := agentauth.NewService(db, cfg.Auth.JWTSecret)
+	taskMgr        := taskmanager.NewManager(db, log)
 
 	usageCtx, usageCancel := context.WithCancel(ctx)
 	defer usageCancel()
 	go usageTracker.StartConsumer(usageCtx)
+
+	// Task timeout goroutine — marks stale tasks as timed-out every minute
+	go func() {
+		t := time.NewTicker(1 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-usageCtx.Done():
+				return
+			case <-t.C:
+				if n, err := taskMgr.TimeoutStale(usageCtx); err == nil && n > 0 {
+					log.Info("timed out stale tasks", zap.Int64("count", n))
+				}
+			}
+		}
+	}()
 
 	// ── Node Agent (in-process for single-server deployment) ──────────────────
 	// Find the default node ID from the DB (seeded by migration 006).
@@ -97,11 +118,19 @@ func main() {
 		log.Info("node agent started", zap.String("node_id", defaultNodeID))
 	}
 
+	// ── Node Health Monitor ────────────────────────────────────────────────────
+	// Watches heartbeat timestamps and transitions nodes ONLINE→UNHEALTHY→OFFLINE.
+	// When a node goes OFFLINE, all its runtimes become LOST and endpoints are
+	// removed from gateway routing.
+	nodeMonitor := nodehealth.NewMonitor(db, log)
+	go nodeMonitor.Start(usageCtx)
+	log.Info("node health monitor started")
+
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	orgH        := handlers.NewOrgHandler(db)
 	teamH       := handlers.NewTeamHandler(db, rdb, policyEngine)
 	apikeyH     := handlers.NewAPIKeyHandler(db, rdb)
-	runtimeH    := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithPlacement(placementEng)
+	runtimeH    := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithPlacement(placementEng).WithTaskManager(taskMgr)
 	controllerH := handlers.NewControllerHandler(modelCtrl)
 	gpuH        := handlers.NewGPUHandler(gpuInventory)
 	usageH      := handlers.NewUsageHandler(usageTracker)
@@ -110,6 +139,10 @@ func main() {
 	serviceH    := handlers.NewServiceHandler(db, svcRegistry, placementEng, registry, modelCtrl)
 	nodeH       := handlers.NewNodeHandler(db)
 	placementH  := handlers.NewPlacementHandler(db, placementEng)
+	agentH      := handlers.NewAgentHandler(db, agentAuthSvc, taskMgr)
+	taskH       := handlers.NewTaskHandler(taskMgr)
+	requireH    := handlers.NewRequirementsHandler(db)
+	lazyH       := handlers.NewLazyRuntimeHandler(db)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -206,10 +239,54 @@ func main() {
 	a.POST("/nodes/:id/telemetry",       nodeH.PushTelemetry)
 	a.GET("/nodes/:id/telemetry",        nodeH.GetTelemetry)
 	a.GET("/nodes/:id/inventory",        nodeH.GetInventory)
+	a.POST("/nodes/:id/drain",           nodeH.DrainNode)
+	a.GET("/nodes/:id/health-events",    nodeH.GetNodeHealthEvents)
 
-	// ── Placement Engine ──────────────────────────────────────────────────────
-	a.POST("/placement/simulate",        placementH.Simulate)
-	a.GET("/placement/decisions",        placementH.ListDecisions)
+	// ── Model Lifecycle (archive/restore) ────────────────────────────────────
+	a.POST("/models/:id/archive",           runtimeH.ArchiveModel)
+	a.POST("/models/:id/restore",           runtimeH.RestoreModel)
+
+	// ── Runtime Requirements ──────────────────────────────────────────────────
+	a.POST("/models/:id/requirements",      requireH.UpsertRequirements)
+	a.GET("/models/:id/requirements",       requireH.GetRequirements)
+	a.GET("/scheduler/compatible-nodes",    requireH.CompatibleNodes)
+	a.POST("/placement/simulate",           placementH.Simulate)
+	a.GET("/placement/decisions",           placementH.ListDecisions)
+
+	// ── Lazy-Load Runtime Config ──────────────────────────────────────────────
+	// Configure per-model GGUF source, idle timeout, GPU layers, etc.
+	a.PUT("/models/:id/lazy-config",        lazyH.SetLazyConfig)
+	a.GET("/models/:id/lazy-config",        lazyH.GetLazyConfig)
+	a.GET("/models/:id/runtime-status",     lazyH.GetRuntimeStatus)
+
+	// ── Agent API (called by node agents, not human operators) ────────────────
+	// Registration does NOT require auth (bootstrapping)
+	r.POST("/agent/v1/register", agentH.Register)
+
+	// All other agent routes require a valid node JWT
+	agent := r.Group("/agent/v1", agentH.AgentAuthMiddleware())
+	{
+		agent.POST("/heartbeat",              agentH.Heartbeat)
+		agent.GET("/tasks/pending",           agentH.PollTasks)
+		agent.POST("/tasks/:id/claim",        agentH.ClaimTask)
+		agent.POST("/tasks/:id/running",      agentH.MarkTaskRunning)
+		agent.POST("/tasks/:id/complete",     agentH.CompleteTask)
+		agent.POST("/tasks/:id/fail",         agentH.FailTask)
+		agent.POST("/inventory",              agentH.PushInventory)
+		agent.POST("/telemetry",              agentH.PushTelemetry)
+		agent.POST("/model-cache",            agentH.PushModelCache)
+		agent.PUT("/runtimes/:id",            agentH.UpdateRuntime)
+		agent.GET("/runtimes",                agentH.ListRuntimes)
+	}
+
+	// ── Task Management (admin operator API for dispatching tasks) ────────────
+	a.POST("/nodes/:id/tasks",    taskH.DispatchTask)
+	a.GET("/nodes/:id/tasks",     taskH.ListNodeTasks)
+	a.GET("/tasks/:id",           taskH.GetTask)
+	a.DELETE("/tasks/:id",        taskH.CancelTask)
+	a.GET("/nodes/:id/runtimes",  taskH.ListNodeRuntimes)
+	// Model cache (read by admin UI deploy form)
+	a.GET("/nodes/:id/model-cache", agentH.GetNodeModelCache)
 
 	// ── Metrics ───────────────────────────────────────────────────────────────
 	// Admin uses port 9091 to avoid conflict with gateway's 9090

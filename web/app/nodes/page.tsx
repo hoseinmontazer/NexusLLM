@@ -15,9 +15,11 @@ import { Plus, Activity, RefreshCw } from 'lucide-react'
 function StatusBadge({ status }: { status: string }) {
   const cls =
     status === 'online'      ? 'bg-green-100 text-green-700' :
+    status === 'unhealthy'   ? 'bg-yellow-100 text-yellow-800' :
     status === 'degraded'    ? 'bg-yellow-100 text-yellow-700' :
     status === 'offline'     ? 'bg-red-100 text-red-700' :
-    status === 'maintenance' ? 'bg-blue-100 text-blue-700' :
+    status === 'draining'    ? 'bg-blue-100 text-blue-700' :
+    status === 'maintenance' ? 'bg-purple-100 text-purple-700' :
                                'bg-gray-100 text-gray-600'
   return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${cls}`}>{status}</span>
 }
@@ -88,11 +90,23 @@ function TelemetryPanel({ nodeId }: { nodeId: string }) {
 
 // ─── Node detail modal ────────────────────────────────────────────────────────
 function NodeModal({ node }: { node: ClusterNode }) {
-  const [tab, setTab] = useState<'telemetry' | 'inventory'>('telemetry')
+  const qc = useQueryClient()
+  const [tab, setTab] = useState<'telemetry' | 'inventory' | 'events'>('telemetry')
   const { data: inv } = useQuery({
     queryKey: ['node-inventory', node.id],
     queryFn:  () => api.nodes.getInventory(node.id),
     enabled:  tab === 'inventory',
+  })
+  const { data: eventsData } = useQuery({
+    queryKey: ['node-health-events', node.id],
+    queryFn:  () => api.nodes.getHealthEvents(node.id),
+    enabled:  tab === 'events',
+    refetchInterval: 15_000,
+  })
+  const drainMut = useMutation({
+    mutationFn: () => api.nodes.drain(node.id),
+    onSuccess: () => { toast({ title: 'Node draining', description: 'No new deployments will be scheduled' }); qc.invalidateQueries({ queryKey: ['nodes'] }) },
+    onError: (e: any) => toast({ title: 'Drain failed', description: e.message, variant: 'destructive' }),
   })
 
   let labels: Record<string, string> = {}
@@ -100,7 +114,19 @@ function NodeModal({ node }: { node: ClusterNode }) {
 
   return (
     <DialogContent className="max-w-2xl">
-      <DialogHeader><DialogTitle>{node.hostname} — {node.display_name}</DialogTitle></DialogHeader>
+      <DialogHeader>
+        <div className="flex items-center justify-between pr-6">
+          <DialogTitle>{node.hostname} — {node.display_name}</DialogTitle>
+          {node.status === 'online' && (
+            <Button size="sm" variant="outline"
+              className="text-yellow-600 border-yellow-300 hover:bg-yellow-50"
+              onClick={() => drainMut.mutate()}
+              disabled={drainMut.isPending}>
+              {drainMut.isPending ? 'Draining…' : '⏸ Drain Node'}
+            </Button>
+          )}
+        </div>
+      </DialogHeader>
 
       {/* Hardware summary */}
       <div className="grid grid-cols-3 gap-3 text-sm">
@@ -131,11 +157,11 @@ function NodeModal({ node }: { node: ClusterNode }) {
 
       {/* Tabs */}
       <div className="flex gap-1 border-b">
-        {(['telemetry', 'inventory'] as const).map(t => (
+        {(['telemetry', 'inventory', 'events'] as const).map(t => (
           <button key={t} onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
               tab === t ? 'border-blue-600 text-blue-600' : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}>{t.charAt(0).toUpperCase() + t.slice(1)}</button>
+            }`}>{t === 'events' ? 'Health Events' : t.charAt(0).toUpperCase() + t.slice(1)}</button>
         ))}
       </div>
 
@@ -153,6 +179,31 @@ function NodeModal({ node }: { node: ClusterNode }) {
         ) : (
           <p className="text-sm text-muted-foreground py-4 text-center">No inventory snapshot yet.</p>
         )
+      )}
+      {tab === 'events' && (
+        <div className="space-y-1 max-h-64 overflow-y-auto">
+          {(eventsData?.data ?? []).length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No health events yet.</p>
+          ) : (eventsData?.data ?? []).map(e => (
+            <div key={e.id} className="flex items-center gap-3 text-xs py-1.5 border-b last:border-0">
+              <span className="text-muted-foreground whitespace-nowrap">
+                {new Date(e.created_at).toLocaleString()}
+              </span>
+              <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
+                e.from_status ? 'bg-gray-100' : ''
+              }`}>{e.from_status || '—'}</span>
+              <span className="text-muted-foreground">→</span>
+              <span className={`px-1.5 py-0.5 rounded text-xs font-semibold ${
+                e.to_status === 'online' ? 'bg-green-100 text-green-700' :
+                e.to_status === 'offline' ? 'bg-red-100 text-red-700' :
+                e.to_status === 'unhealthy' ? 'bg-yellow-100 text-yellow-700' :
+                e.to_status === 'draining' ? 'bg-blue-100 text-blue-700' :
+                'bg-gray-100 text-gray-700'
+              }`}>{e.to_status}</span>
+              <span className="text-muted-foreground flex-1 truncate">{e.reason}</span>
+            </div>
+          ))}
+        </div>
       )}
     </DialogContent>
   )
