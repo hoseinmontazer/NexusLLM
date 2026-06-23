@@ -139,6 +139,12 @@ type StartModelPayload struct {
 	// Empty string is treated as "auto" for backward compatibility.
 	ExecutionMode string `json:"execution_mode,omitempty"` // cpu | gpu | auto
 
+	// WorkloadPolicy controls the runtime lifecycle behaviour.
+	//   "lazy_load" — start on first request, evict when idle (LLMs, default)
+	//   "always_on" — start on deploy, never idle-evict, restart on crash (services)
+	// Empty string is treated as "lazy_load" for backward compatibility.
+	WorkloadPolicy string `json:"workload_policy,omitempty"` // lazy_load | always_on
+
 	// ── vLLM / TGI / generic backend args ────────────────────────────────
 	TensorParallel int               `json:"tensor_parallel,omitempty"`
 	GPUMemoryUtil  float64           `json:"gpu_memory_util,omitempty"`

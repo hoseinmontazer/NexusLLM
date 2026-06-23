@@ -19,7 +19,6 @@ import (
 	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/services"
-	"github.com/nexusllm/nexusllm/internal/taskmanager"
 )
 
 // ServiceHandler manages AI Service Registry admin operations.
@@ -29,7 +28,6 @@ type ServiceHandler struct {
 	placement *placement.Engine
 	runtime   *runtime.Registry
 	ctrl      *controller.ModelController
-	taskMgr   *taskmanager.Manager // optional; nil = local Docker deployment only
 }
 
 // NewServiceHandler constructs a ServiceHandler.
@@ -47,13 +45,6 @@ func NewServiceHandler(
 		runtime:   runtimeRegistry,
 		ctrl:      ctrl,
 	}
-}
-
-// WithTaskManager wires in a task manager so DeployService can use the
-// node-agent pipeline (START_MODEL) instead of direct Docker calls.
-func (h *ServiceHandler) WithTaskManager(tm *taskmanager.Manager) *ServiceHandler {
-	h.taskMgr = tm
-	return h
 }
 
 // RegisterService handles POST /admin/v1/services

@@ -135,6 +135,11 @@ type ModelConfig struct {
 	// Defaults to "auto" if unset.
 	ExecutionMode string
 
+	// WorkloadPolicy controls lifecycle management.
+	//   "lazy_load" — start on first request, evict when idle (default for LLMs)
+	//   "always_on" — start on deploy, never idle-evict, restart on crash (services)
+	WorkloadPolicy string
+
 	// ── llamacpp model source (first non-empty wins) ──────────────────────
 	GGUFPath string // container path: "/models/gemma-2-2b-it-Q4_K_M.gguf"
 	HFRepo   string // "bartowski/gemma-2-2b-it-GGUF"

@@ -710,6 +710,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		NUMANode       int     `db:"numa_node"`
 		IdleTimeout    *int    `db:"idle_timeout_secs"`
 		ExecutionMode  string  `db:"execution_mode"`
+		WorkloadPolicy string  `db:"workload_policy"`
 	}
 	// Node assignment priority:
 	//   1. model_endpoints.node_id  — set by admin deploy or placement engine
@@ -740,7 +741,8 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    COALESCE(ar.cpu_affinity, '')                 AS cpu_affinity,
 		    COALESCE(ar.numa_node, -1)                    AS numa_node,
 		    mrc.idle_timeout_secs,
-		    %s                                             AS execution_mode
+		    %s                                             AS execution_mode,
+		    %s                                             AS workload_policy
 		FROM models m
 		LEFT JOIN model_endpoints me
 		       ON me.model_id = m.id
@@ -758,10 +760,12 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		LIMIT 1`
 
 	execModeExpr := `COALESCE(mrc.execution_mode, 'auto')`
+	policyExpr := `COALESCE(mrc.workload_policy, 'lazy_load')`
 	if !withExecutionMode {
 		execModeExpr = `'auto'`
+		policyExpr = `'lazy_load'`
 	}
-	q := fmt.Sprintf(baseQuery, execModeExpr)
+	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr)
 
 	err := a.db.GetContext(ctx, &row, q, modelName)
 	if err != nil {
@@ -802,6 +806,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		CPUSetCPUs:     row.CPUSetCPUs,
 		NUMANode:       row.NUMANode,
 		ExecutionMode:  row.ExecutionMode,
+		WorkloadPolicy: row.WorkloadPolicy,
 	}
 	if row.IdleTimeout != nil {
 		cfg.IdleTimeout = time.Duration(*row.IdleTimeout) * time.Second
