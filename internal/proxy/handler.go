@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
@@ -44,6 +45,7 @@ type Handler struct {
 	log           *zap.Logger
 	teamPolicies  map[string]*policy.TeamPolicy
 	httpClient    *http.Client
+	db            *sqlx.DB // for project context lookup; may be nil
 }
 
 // NewHandler constructs the proxy Handler.
@@ -83,6 +85,35 @@ func NewHandler(
 func (h *Handler) WithActivator(a runtimemgr.Activator) *Handler {
 	h.activator = a
 	return h
+}
+
+// WithDB attaches a database connection for project context enrichment.
+func (h *Handler) WithDB(db *sqlx.DB) *Handler {
+	h.db = db
+	return h
+}
+
+// lookupProjectContext returns project_id, project_name, project_priority for a model name.
+// Returns nil values if project is not set (legacy models).
+func (h *Handler) lookupProjectContext(ctx context.Context, modelName string) (projectID, projectName, projectPriority *string) {
+	if h.db == nil {
+		return nil, nil, nil
+	}
+	var row struct {
+		ProjectID       *string `db:"project_id"`
+		ProjectName     *string `db:"project_name"`
+		ProjectPriority *string `db:"project_priority"`
+	}
+	err := h.db.GetContext(ctx, &row, `
+		SELECT p.id::text AS project_id, p.name AS project_name, p.priority AS project_priority
+		FROM models m
+		JOIN projects p ON p.id = m.project_id
+		WHERE m.name = $1 AND m.enabled = TRUE
+		LIMIT 1`, modelName)
+	if err != nil {
+		return nil, nil, nil
+	}
+	return row.ProjectID, row.ProjectName, row.ProjectPriority
 }
 
 // ─── public handlers ──────────────────────────────────────────────────────────
@@ -197,7 +228,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if h.activator != nil {
 		h.activator.RecordActivity(c.Request.Context(), ep.ID)
 	}
-
 	start := time.Now()
 	defer func() {
 		_ = h.policy.DecrementInflight(context.Background(), claims.TeamID)
@@ -330,12 +360,14 @@ func (h *Handler) syncChat(
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 	middleware.RecordTokens(claims.TeamName, req.Model,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	projID, projName, projPriority := h.lookupProjectContext(context.Background(), req.Model)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
 		CompletionTokens: chatResp.Usage.CompletionTokens,
 		TotalTokens:      chatResp.Usage.TotalTokens,
-		LatencyMs: latencyMs, Status: "success",
+		LatencyMs:        latencyMs, Status: "success",
+		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 	})
 	c.JSON(resp.StatusCode, chatResp)
 }
@@ -403,12 +435,14 @@ func (h *Handler) streamChat(
 		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, promptTokens, completionTokens)
 		middleware.RecordTokens(claims.TeamName, req.Model, promptTokens, completionTokens)
 	}
+	projID, projName, projPriority := h.lookupProjectContext(context.Background(), req.Model)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
-		LatencyMs: latencyMs, Status: "success",
+		LatencyMs:        latencyMs, Status: "success",
+		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 	})
 }
 

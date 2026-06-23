@@ -95,7 +95,33 @@ func (h *GPUHandler) ListDevices(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": devs, "total": len(devs)})
 }
 
-// PackModels handles POST /admin/v1/gpu/pack
+// DeleteGPUNode handles DELETE /admin/v1/gpu/nodes/:id
+func (h *GPUHandler) DeleteGPUNode(c *gin.Context) {
+	nodeID := c.Param("id")
+	if err := h.inv.DeleteNode(c.Request.Context(), nodeID); err != nil {
+		if err.Error() == "gpu node not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "GPU node deleted", "id": nodeID})
+}
+
+// DeleteGPUDevice handles DELETE /admin/v1/gpu/nodes/:id/devices/:device_id
+func (h *GPUHandler) DeleteGPUDevice(c *gin.Context) {
+	deviceID := c.Param("device_id")
+	if err := h.inv.DeleteDevice(c.Request.Context(), deviceID); err != nil {
+		if err.Error() == "gpu device not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "GPU device deleted", "id": deviceID})
+}
 // Simulates GPU packing for a set of models and returns the placement plan.
 func (h *GPUHandler) PackModels(c *gin.Context) {
 	var input struct {

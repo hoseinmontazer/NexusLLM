@@ -108,73 +108,151 @@ function PolicyCard({ team }: { team: Team }) {
 
 // ── Model access management ───────────────────────────────────────────────────
 function ModelAccessSection({ team }: { team: Team }) {
-  const qc = useQueryClient()
-  const [modelName, setModelName] = useState('')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [revokeTarget, setRevokeTarget] = useState<string | null>(null)
 
-  // Load all available models to pick from
   const { data: allModels } = useQuery({
     queryKey: ['models'],
     queryFn:  () => api.models.list(),
   })
 
-  const grant = useMutation({
-    mutationFn: (name: string) => api.teams.addModel(team.id, name),
-    onSuccess: (_, name) => {
-      toast({ title: 'Access granted', description: name })
-      setModelName('')
-      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
-    },
-    onError: (e: any) => toast({ title: 'Failed', description: e.message, variant: 'destructive' }),
+  const { data: grantedData, refetch: refetchGranted } = useQuery({
+    queryKey: ['team-models', team.id],
+    queryFn:  () => api.teams.listModels(team.id),
   })
 
-  const revoke = useMutation({
+  const grantedModels: string[] = grantedData?.models ?? []
+  const allModelNames = (allModels?.data ?? []).map(m => m.name)
+  const notGranted = allModelNames.filter(n => !grantedModels.includes(n))
+
+  const grantMut = useMutation({
+    // Grant all selected models in parallel
+    mutationFn: async (names: string[]) => {
+      await Promise.all(names.map(n => api.teams.addModel(team.id, n)))
+    },
+    onSuccess: () => {
+      toast({ title: `Access granted to ${selected.size} model${selected.size > 1 ? 's' : ''}` })
+      setSelected(new Set())
+      refetchGranted()
+    },
+    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const revokeMut = useMutation({
     mutationFn: (name: string) => api.teams.removeModel(team.id, name),
     onSuccess: (_, name) => {
       toast({ title: 'Access removed', description: name })
-      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
+      setRevokeTarget(null)
+      refetchGranted()
     },
-    onError: (e: any) => toast({ title: 'Failed', description: e.message, variant: 'destructive' }),
+    onError: (e: any) => {
+      toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' })
+      setRevokeTarget(null)
+    },
   })
 
-  // We derive which models the team can access from the policy endpoint
-  // (team_model_permissions — the models list endpoint shows all platform models)
-  const models = allModels?.data ?? []
+  const toggleSelect = (name: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
 
   return (
-    <div className="mt-3 border-t pt-3 space-y-3">
+    <div className="mt-3 border-t pt-3 space-y-4">
       <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
         <Cpu className="w-3.5 h-3.5" />Model Access
       </p>
 
-      {/* Grant access */}
-      <div className="flex gap-2 items-end">
-        <div className="flex-1">
-          <Label className="text-xs">Grant model access</Label>
-          {models.length > 0 ? (
-            <select
-              className="w-full border rounded-md h-8 px-2 text-sm mt-1"
-              value={modelName}
-              onChange={e => setModelName(e.target.value)}
-            >
-              <option value="">Select a model…</option>
-              {models.map(m => (
-                <option key={m.id} value={m.name}>{m.name}</option>
-              ))}
-            </select>
-          ) : (
-            <Input className="h-8 text-sm mt-1" value={modelName}
-              onChange={e => setModelName(e.target.value)}
-              placeholder="Model name (e.g. gemma-2)" />
-          )}
-        </div>
-        <Button size="sm" onClick={() => grant.mutate(modelName)}
-          disabled={!modelName || grant.isPending}>
-          {grant.isPending ? '…' : 'Grant'}
-        </Button>
+      {/* Currently granted */}
+      <div>
+        <p className="text-xs text-muted-foreground mb-2">
+          Granted ({grantedModels.length}):
+        </p>
+        {grantedModels.length === 0 ? (
+          <p className="text-xs text-muted-foreground italic">No models granted yet.</p>
+        ) : (
+          <div className="space-y-1">
+            {grantedModels.map(name => (
+              <div key={name} className="flex items-center justify-between border rounded px-2 py-1.5 bg-green-50">
+                {revokeTarget === name ? (
+                  <>
+                    <span className="text-xs text-red-700">Remove <strong>{name}</strong>?</span>
+                    <div className="flex gap-1">
+                      <Button size="sm" variant="destructive" className="h-6 text-xs"
+                        disabled={revokeMut.isPending}
+                        onClick={() => revokeMut.mutate(name)}>
+                        {revokeMut.isPending ? '…' : 'Remove'}
+                      </Button>
+                      <Button size="sm" variant="outline" className="h-6 text-xs"
+                        onClick={() => setRevokeTarget(null)}>Cancel</Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm font-medium text-green-800">{name}</span>
+                    <Button variant="ghost" size="sm"
+                      className="h-6 text-xs text-red-400 hover:text-red-600 hover:bg-red-50"
+                      onClick={() => setRevokeTarget(name)}>
+                      Revoke
+                    </Button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Current permissions */}
-      <TeamModelList teamId={team.id} onRevoke={name => revoke.mutate(name)} revoking={revoke.isPending} />
+      {/* Grant multiple via checkboxes */}
+      {notGranted.length > 0 && (
+        <div>
+          <p className="text-xs text-muted-foreground mb-2">
+            Grant access — tick models then click Grant:
+          </p>
+          <div className="border rounded-md divide-y max-h-48 overflow-y-auto">
+            {notGranted.map(name => (
+              <label key={name}
+                className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-gray-50 text-sm">
+                <input
+                  type="checkbox"
+                  checked={selected.has(name)}
+                  onChange={() => toggleSelect(name)}
+                  className="w-4 h-4 accent-blue-600"
+                />
+                {name}
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center justify-between mt-2">
+            <span className="text-xs text-muted-foreground">
+              {selected.size > 0 ? `${selected.size} selected` : 'None selected'}
+            </span>
+            <div className="flex gap-2">
+              {selected.size > 0 && (
+                <Button size="sm" variant="ghost" className="h-7 text-xs"
+                  onClick={() => setSelected(new Set())}>
+                  Clear
+                </Button>
+              )}
+              <Button size="sm" className="h-7"
+                disabled={selected.size === 0 || grantMut.isPending}
+                onClick={() => grantMut.mutate(Array.from(selected))}>
+                {grantMut.isPending ? 'Granting…' : `Grant ${selected.size > 0 ? `(${selected.size})` : ''}`}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {notGranted.length === 0 && allModelNames.length > 0 && (
+        <p className="text-xs text-green-700">All platform models are already granted to this team.</p>
+      )}
+      {allModelNames.length === 0 && (
+        <p className="text-xs text-muted-foreground">No models registered on this platform yet.</p>
+      )}
     </div>
   )
 }

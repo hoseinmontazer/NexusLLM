@@ -18,10 +18,20 @@ ALTER TABLE model_runtime_configs
     ADD COLUMN IF NOT EXISTS hf_token          TEXT,          -- HF token for gated repos
     ADD COLUMN IF NOT EXISTS ctx_size          INTEGER NOT NULL DEFAULT 4096,
     ADD COLUMN IF NOT EXISTS n_gpu_layers      INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS cpu_threads       INTEGER,       -- --threads N (NULL = auto)
+    ADD COLUMN IF NOT EXISTS cpu_threads       INTEGER,       -- NULL = auto-detect
     ADD COLUMN IF NOT EXISTS memory_limit      TEXT,          -- docker --memory e.g. "8g"
     ADD COLUMN IF NOT EXISTS models_volume     TEXT,          -- named vol or host path
     ADD COLUMN IF NOT EXISTS idle_timeout_secs INTEGER;       -- NULL = use cluster default
+
+-- Ensure all text columns that may be NULL are actually nullable (idempotent)
+ALTER TABLE model_runtime_configs
+    ALTER COLUMN gguf_path     DROP NOT NULL,
+    ALTER COLUMN hf_repo       DROP NOT NULL,
+    ALTER COLUMN hf_file       DROP NOT NULL,
+    ALTER COLUMN hf_token      DROP NOT NULL,
+    ALTER COLUMN memory_limit  DROP NOT NULL,
+    ALTER COLUMN models_volume DROP NOT NULL,
+    ALTER COLUMN cpu_threads   DROP NOT NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. agent_runtimes — idle tracking and runtime details

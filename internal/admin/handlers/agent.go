@@ -35,9 +35,9 @@ import (
 
 // AgentHandler handles all agent-to-control-plane communication.
 type AgentHandler struct {
-	db          *sqlx.DB
-	authSvc     *agentauth.Service
-	taskMgr     *taskmanager.Manager
+	db      *sqlx.DB
+	authSvc *agentauth.Service
+	taskMgr *taskmanager.Manager
 }
 
 // NewAgentHandler constructs an AgentHandler.
@@ -324,8 +324,9 @@ func (h *AgentHandler) FailTask(c *gin.Context) {
 	}
 	taskID := c.Param("id")
 	var input struct {
-		Error     string `json:"error"`
-		RuntimeID string `json:"runtime_id"`
+		Error        string `json:"error"`
+		RuntimeID    string `json:"runtime_id"`
+		RuntimeState string `json:"runtime_state"` // optional: "stopped" means needs redeploy, not broken
 	}
 	_ = c.ShouldBindJSON(&input)
 
@@ -334,11 +335,24 @@ func (h *AgentHandler) FailTask(c *gin.Context) {
 		return
 	}
 
-	// Mark associated runtime as failed
+	// Mark associated runtime — use the reported state if provided, otherwise "failed".
 	if input.RuntimeID != "" {
+		targetState := "failed"
+		if input.RuntimeState != "" {
+			targetState = input.RuntimeState
+		}
 		_, _ = h.db.ExecContext(c.Request.Context(), `
-			UPDATE agent_runtimes SET state='failed', updated_at=NOW() WHERE id=$1`,
-			input.RuntimeID)
+			UPDATE agent_runtimes SET state=$1, updated_at=NOW(), container_id=''
+			WHERE id=$2`, targetState, input.RuntimeID)
+
+		// When the container is gone (state="stopped"), clear container_id and
+		// let the activator's deployFresh create a new one on the next request.
+		if targetState == "stopped" {
+			_, _ = h.db.ExecContext(c.Request.Context(), `
+				UPDATE agent_runtimes
+				SET container_id = '', error_msg = $1, updated_at = NOW()
+				WHERE id = $2`, input.Error, input.RuntimeID)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"failed": true})
@@ -427,10 +441,10 @@ func (h *AgentHandler) PushModelCache(c *gin.Context) {
 func (h *AgentHandler) GetNodeModelCache(c *gin.Context) {
 	nodeID := c.Param("id")
 	type cacheRow struct {
-		ModelRef  string `db:"model_ref"  json:"model_ref"`
-		Backend   string `db:"backend"    json:"backend"`
-		SizeBytes int64  `db:"size_bytes" json:"size_bytes"`
-		IsCached  bool   `db:"is_cached"  json:"is_cached"`
+		ModelRef  string     `db:"model_ref"  json:"model_ref"`
+		Backend   string     `db:"backend"    json:"backend"`
+		SizeBytes int64      `db:"size_bytes" json:"size_bytes"`
+		IsCached  bool       `db:"is_cached"  json:"is_cached"`
 		CachedAt  *time.Time `db:"cached_at" json:"cached_at"`
 	}
 	var rows []cacheRow
@@ -446,19 +460,20 @@ func (h *AgentHandler) GetNodeModelCache(c *gin.Context) {
 }
 
 // PushTelemetry handles POST /agent/v1/telemetry
-func (h *AgentHandler) PushTelemetry(c *gin.Context) {	claims := h.getAgentClaims(c)
+func (h *AgentHandler) PushTelemetry(c *gin.Context) {
+	claims := h.getAgentClaims(c)
 	if claims == nil {
 		return
 	}
 	var input struct {
-		CPUCoresTotal int     `json:"cpu_cores_total"`
-		CPUUtilPct    float64 `json:"cpu_util_pct"`
-		RAMTotalMB    int64   `json:"ram_total_mb"`
-		RAMUsedMB     int64   `json:"ram_used_mb"`
-		RAMAvailMB    int64   `json:"ram_avail_mb"`
-		NUMANodes     int     `json:"numa_nodes"`
-		DiskTotalGB   int64   `json:"disk_total_gb"`
-		DiskUsedGB    int64   `json:"disk_used_gb"`
+		CPUCoresTotal int                      `json:"cpu_cores_total"`
+		CPUUtilPct    float64                  `json:"cpu_util_pct"`
+		RAMTotalMB    int64                    `json:"ram_total_mb"`
+		RAMUsedMB     int64                    `json:"ram_used_mb"`
+		RAMAvailMB    int64                    `json:"ram_avail_mb"`
+		NUMANodes     int                      `json:"numa_nodes"`
+		DiskTotalGB   int64                    `json:"disk_total_gb"`
+		DiskUsedGB    int64                    `json:"disk_used_gb"`
 		GPUs          []map[string]interface{} `json:"gpus"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -512,9 +527,9 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 		_, err := h.db.ExecContext(c.Request.Context(), `
 			UPDATE agent_runtimes
 			SET state=$1, updated_at=NOW(),
-			    started_at  = CASE WHEN $1='active' AND started_at IS NULL THEN NOW() ELSE started_at END,
-			    last_used_at = CASE WHEN $1='active' THEN NOW() ELSE last_used_at END,
-			    stopped_at  = CASE WHEN $1 IN ('stopped','unloaded','deleted') THEN NOW() ELSE stopped_at END
+			    started_at   = CASE WHEN $1 IN ('ready','active') AND started_at IS NULL THEN NOW() ELSE started_at END,
+			    last_used_at = CASE WHEN $1 IN ('ready','active') THEN NOW() ELSE last_used_at END,
+			    stopped_at   = CASE WHEN $1 IN ('stopped','unloaded','deleted') THEN NOW() ELSE stopped_at END
 			WHERE id=$2 AND node_id=$3`,
 			input.State, runtimeID, claims.NodeID)
 		if err != nil {
@@ -542,7 +557,7 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 	}
 
 	// Sync back to model_endpoints if linked
-	if input.State == "active" || input.HealthStatus != "" {
+	if input.State == "active" || input.State == "ready" || input.HealthStatus != "" {
 		h.syncEndpointFromRuntime(c.Request.Context(), runtimeID, input.State, input.HealthStatus, input.ContainerID)
 	}
 
@@ -556,14 +571,14 @@ func (h *AgentHandler) ListRuntimes(c *gin.Context) {
 		return
 	}
 	type runtimeRow struct {
-		ID           string     `db:"id"            json:"id"`
-		RuntimeName  string     `db:"runtime_name"  json:"runtime_name"`
-		Backend      string     `db:"backend"       json:"backend"`
-		State        string     `db:"state"         json:"state"`
-		ContainerID  string     `db:"container_id"  json:"container_id"`
-		HealthStatus string     `db:"health_status" json:"health_status"`
-		BindPort     int        `db:"bind_port"     json:"bind_port"`
-		UpdatedAt    time.Time  `db:"updated_at"    json:"updated_at"`
+		ID           string    `db:"id"            json:"id"`
+		RuntimeName  string    `db:"runtime_name"  json:"runtime_name"`
+		Backend      string    `db:"backend"       json:"backend"`
+		State        string    `db:"state"         json:"state"`
+		ContainerID  string    `db:"container_id"  json:"container_id"`
+		HealthStatus string    `db:"health_status" json:"health_status"`
+		BindPort     int       `db:"bind_port"     json:"bind_port"`
+		UpdatedAt    time.Time `db:"updated_at"    json:"updated_at"`
 	}
 	var rows []runtimeRow
 	_ = h.db.SelectContext(c.Request.Context(), &rows, `
@@ -642,22 +657,46 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 	_, _ = h.db.ExecContext(ctx, `
 		INSERT INTO node_capabilities
 		  (node_id, has_docker, has_vllm, has_ollama, has_tgi,
-		   has_whisper, has_tts, has_embedding, has_gpu, gpu_count, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+		   has_whisper, has_tts, has_embedding, has_gpu, gpu_count,
+		   gpu_available, gpu_vram_mb, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
 		ON CONFLICT (node_id) DO UPDATE SET
 		  has_docker=$2, has_vllm=$3, has_ollama=$4, has_tgi=$5,
 		  has_whisper=$6, has_tts=$7, has_embedding=$8,
-		  has_gpu=$9, gpu_count=$10, updated_at=NOW()`,
+		  has_gpu=$9, gpu_count=$10,
+		  gpu_available=$11, gpu_vram_mb=$12,
+		  updated_at=NOW()`,
 		nodeID, docker, vllm, ollama, tgi, whisper, tts, embedding, hasGPU, gpuCount,
+		hasGPU, // gpu_available mirrors has_gpu
+		func() int64 {
+			if v, ok := caps["gpu_vram_mb"].(float64); ok {
+				return int64(v)
+			}
+			return 0
+		}(),
 	)
 }
 
 func (h *AgentHandler) syncEndpointFromRuntime(ctx context.Context, runtimeID, state, health, containerID string) {
 	lifecycleMap := map[string]string{
-		"pulling": "downloading", "starting": "loading",
-		"loading": "loading", "warm": "warm", "active": "active",
-		"idle": "idle", "stopping": "draining",
-		"stopped": "unloaded", "failed": "failed",
+		// New unified pipeline states
+		"created":       "registered",
+		"validating":    "loading",
+		"downloading":   "downloading",
+		"starting":      "loading",
+		"loading_model": "loading",
+		"waiting_ready": "loading",
+		"ready":         "active",
+		// Legacy / operational states
+		"pulling":  "downloading",
+		"loading":  "loading",
+		"active":   "active",
+		"warm":     "warm",
+		"idle":     "idle",
+		"stopping": "draining",
+		"stopped":  "unloaded",
+		"failed":   "failed",
+		"lost":     "failed",
 	}
 	var epID string
 	if err := h.db.QueryRowContext(ctx,

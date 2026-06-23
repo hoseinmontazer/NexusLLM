@@ -6,6 +6,7 @@
         generate-key \
         placement-simulate node-status \
         deploy-gemma2-2b pull-gguf runtime-status \
+        project-list project-create project-priority project-reserve project-preemptions \
         clean
 
 BINARY_DIR := bin
@@ -138,6 +139,8 @@ migrate:
 	$(call run_migration,009_resilience.sql)
 	@echo "→ 010 lazy-load runtime manager"
 	$(call run_migration,010_lazy_runtime.sql)
+	@echo "→ 011 projects, preemption, deployment queue"
+	$(call run_migration,011_projects.sql)
 	@echo "✓ All migrations complete"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,3 +239,41 @@ runtime-status:
 
 clean:
 	rm -rf $(BINARY_DIR)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project management shortcuts
+# ─────────────────────────────────────────────────────────────────────────────
+
+# List all projects: make project-list
+project-list:
+	curl -s "$(ADMIN_URL)/projects" | jq '.data[] | {id, name, priority, status, runtime_count, reserved_vram_mb}'
+
+# Create a project: make project-create ORG_ID=<id> TEAM_ID=<id> NAME="My Project" PRIORITY=NORMAL
+project-create:
+	@test -n "$(ORG_ID)"  || (echo "ERROR: ORG_ID not set"  && exit 1)
+	@test -n "$(TEAM_ID)" || (echo "ERROR: TEAM_ID not set" && exit 1)
+	@test -n "$(NAME)"    || (echo "ERROR: NAME not set"    && exit 1)
+	curl -s -X POST $(ADMIN_URL)/projects \
+	  -H 'Content-Type: application/json' \
+	  -d '{"organization_id":"$(ORG_ID)","team_id":"$(TEAM_ID)","name":"$(NAME)","priority":"$(or $(PRIORITY),NORMAL)"}' | jq .
+
+# Set project priority: make project-priority ID=<id> PRIORITY=CRITICAL
+project-priority:
+	@test -n "$(ID)"       || (echo "ERROR: ID not set"       && exit 1)
+	@test -n "$(PRIORITY)" || (echo "ERROR: PRIORITY not set" && exit 1)
+	curl -s -X POST $(ADMIN_URL)/projects/$(ID)/priority \
+	  -H 'Content-Type: application/json' \
+	  -d '{"priority":"$(PRIORITY)"}' | jq .
+
+# Reserve VRAM for a project: make project-reserve ID=<id> VRAM_MB=81920
+project-reserve:
+	@test -n "$(ID)"      || (echo "ERROR: ID not set"      && exit 1)
+	@test -n "$(VRAM_MB)" || (echo "ERROR: VRAM_MB not set" && exit 1)
+	curl -s -X POST $(ADMIN_URL)/projects/$(ID)/reserve \
+	  -H 'Content-Type: application/json' \
+	  -d '{"reserved_vram_mb":$(VRAM_MB),"reserved_cpu_cores":$(or $(CPU),0),"reserved_memory_mb":$(or $(MEM_MB),0)}' | jq .
+
+# Show project preemption history: make project-preemptions ID=<id>
+project-preemptions:
+	@test -n "$(ID)" || (echo "ERROR: ID not set" && exit 1)
+	curl -s "$(ADMIN_URL)/projects/$(ID)/preemptions" | jq '.data[] | {id, preempted_priority, requesting_priority, trigger, created_at}'

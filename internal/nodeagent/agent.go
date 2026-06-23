@@ -12,6 +12,7 @@ package nodeagent
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +24,9 @@ import (
 	"github.com/jmoiron/sqlx"
 	"go.uber.org/zap"
 )
+
+// cryptoRandRead is a var so tests can substitute it.
+var cryptoRandRead = rand.Read
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -61,10 +65,10 @@ type HardwareMetrics struct {
 
 // NUMANodeInfo describes one NUMA node's resources.
 type NUMANodeInfo struct {
-	Node    int
-	CPUs    []int
-	MemMB   int64
-	FreeMB  int64
+	Node   int
+	CPUs   []int
+	MemMB  int64
+	FreeMB int64
 }
 
 // GPUMetrics is a snapshot of a single GPU device's state.
@@ -178,6 +182,22 @@ func (a *Agent) reportInventory(ctx context.Context) {
 	// Sync GPU device telemetry
 	a.syncGPUDevices(ctx, snap.GPUs)
 
+	// If no GPUs found, explicitly mark this node as CPU-only in node_capabilities.
+	// This ensures resolveExecutionMode returns "cpu" for "auto" mode on this node.
+	if len(snap.GPUs) == 0 {
+		_, _ = a.db.ExecContext(ctx, `
+			INSERT INTO node_capabilities (node_id, has_gpu, gpu_count, gpu_available, gpu_vram_mb, updated_at)
+			VALUES ($1, FALSE, 0, FALSE, 0, NOW())
+			ON CONFLICT (node_id) DO UPDATE SET
+			  has_gpu       = FALSE,
+			  gpu_count     = 0,
+			  gpu_available = FALSE,
+			  gpu_vram_mb   = 0,
+			  updated_at    = NOW()`,
+			a.nodeID,
+		)
+	}
+
 	a.log.Info("inventory reported",
 		zap.String("node", a.hostname),
 		zap.Int("cpus", snap.CPUCores),
@@ -202,9 +222,9 @@ func (a *Agent) collectAndPersist(ctx context.Context) {
 // Falls back gracefully on non-Linux platforms.
 func (a *Agent) CollectHardware() HardwareMetrics {
 	m := HardwareMetrics{
-		NodeID:      a.nodeID,
-		Hostname:    a.hostname,
-		CollectedAt: time.Now(),
+		NodeID:       a.nodeID,
+		Hostname:     a.hostname,
+		CollectedAt:  time.Now(),
 		NUMATopology: make(map[int]NUMANodeInfo),
 	}
 
@@ -519,19 +539,99 @@ func (a *Agent) persistGPUTelemetry(ctx context.Context, gpus []GPUMetrics) {
 }
 
 func (a *Agent) syncGPUDevices(ctx context.Context, gpus []GPUMetrics) {
-	for _, g := range gpus {
-		// Update pcie_bus_id and numa_node on the device row (may be empty on first run)
+	if len(gpus) == 0 {
+		return
+	}
+
+	// Ensure a gpu_nodes row exists for this cluster node
+	var gpuNodeID string
+	err := a.db.GetContext(ctx, &gpuNodeID,
+		`SELECT id FROM gpu_nodes WHERE node_id = $1 LIMIT 1`, a.nodeID)
+	if err != nil {
+		// Auto-create the gpu_nodes entry
+		gpuNodeID = newUUID()
+		hostname, _ := os.Hostname()
 		_, _ = a.db.ExecContext(ctx, `
-			UPDATE gpu_devices
-			SET pcie_bus_id = $1, numa_node = $2, compute_cap = $3, updated_at = NOW()
-			WHERE node_id IN (
-			    SELECT d.node_id FROM gpu_nodes gn
-			    JOIN gpu_nodes gn2 ON gn2.node_id = $4
-			    LIMIT 1
-			) AND device_index = $5`,
-			g.PCIeBusID, g.NUMANode, "", a.nodeID, g.DeviceIndex,
+			INSERT INTO gpu_nodes (id, name, host, driver_type, total_vram_mb, is_available, node_id)
+			VALUES ($1,$2,$3,'nvidia',0,TRUE,$4)
+			ON CONFLICT DO NOTHING`,
+			gpuNodeID, hostname+"-gpus", hostname, a.nodeID,
+		)
+		// Re-fetch in case ON CONFLICT DO NOTHING fired
+		_ = a.db.GetContext(ctx, &gpuNodeID,
+			`SELECT id FROM gpu_nodes WHERE node_id = $1 LIMIT 1`, a.nodeID)
+	}
+	if gpuNodeID == "" {
+		return
+	}
+
+	// Total VRAM across all GPUs
+	var totalVRAM int64
+	for _, g := range gpus {
+		totalVRAM += int64(g.VRAMMB)
+	}
+	_, _ = a.db.ExecContext(ctx,
+		`UPDATE gpu_nodes SET total_vram_mb=$1, updated_at=NOW() WHERE id=$2`,
+		totalVRAM, gpuNodeID)
+
+	// Update nodes.total_vram_mb
+	_, _ = a.db.ExecContext(ctx,
+		`UPDATE nodes SET total_vram_mb=$1, updated_at=NOW() WHERE id=$2`,
+		totalVRAM, a.nodeID)
+
+	for _, g := range gpus {
+		// Upsert device row
+		_, _ = a.db.ExecContext(ctx, `
+			INSERT INTO gpu_devices
+			  (id, node_id, device_index, name, vram_mb, status,
+			   utilization_pct, temperature_c, power_draw_w,
+			   pcie_bus_id, numa_node, last_seen_at, created_at, updated_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, 'available', $5, $6, $7, $8, $9, NOW(), NOW(), NOW())
+			ON CONFLICT (node_id, device_index) DO UPDATE SET
+			  name            = EXCLUDED.name,
+			  vram_mb         = EXCLUDED.vram_mb,
+			  utilization_pct = EXCLUDED.utilization_pct,
+			  temperature_c   = EXCLUDED.temperature_c,
+			  power_draw_w    = EXCLUDED.power_draw_w,
+			  pcie_bus_id     = EXCLUDED.pcie_bus_id,
+			  numa_node       = EXCLUDED.numa_node,
+			  last_seen_at    = NOW(),
+			  updated_at      = NOW()`,
+			gpuNodeID, g.DeviceIndex, g.Name, g.VRAMMB,
+			g.UtilizationPct, g.TemperatureC, g.PowerDrawW,
+			g.PCIeBusID, g.NUMANode,
 		)
 	}
+
+	a.log.Info("GPU devices synced",
+		zap.String("node", a.hostname),
+		zap.Int("gpu_count", len(gpus)),
+		zap.Int64("total_vram_mb", totalVRAM),
+	)
+
+	// Update node_capabilities so the activator's resolveExecutionMode query
+	// can determine gpu_available without joining gpu_devices.
+	_, _ = a.db.ExecContext(ctx, `
+		INSERT INTO node_capabilities (node_id, has_gpu, gpu_count, gpu_available, gpu_vram_mb, updated_at)
+		VALUES ($1, TRUE, $2, TRUE, $3, NOW())
+		ON CONFLICT (node_id) DO UPDATE SET
+		  has_gpu       = TRUE,
+		  gpu_count     = EXCLUDED.gpu_count,
+		  gpu_available = TRUE,
+		  gpu_vram_mb   = EXCLUDED.gpu_vram_mb,
+		  updated_at    = NOW()`,
+		a.nodeID, len(gpus), totalVRAM,
+	)
+}
+
+// newUUID generates a new random UUID string using crypto/rand.
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = cryptoRandRead(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // ─── JSON helper ──────────────────────────────────────────────────────────────

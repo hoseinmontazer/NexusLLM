@@ -23,9 +23,10 @@ func NewResourceGuard(db *sqlx.DB, log *zap.Logger) *ResourceGuard {
 
 // CanStart returns nil if the node has enough headroom for the given model.
 // It checks:
-//   1. Available RAM (total - used by running containers)
-//   2. GPU VRAM availability (if GPUDevices is non-empty)
-//   3. No more than MaxConcurrentModels containers already running
+//  1. Available RAM (total - used by running containers)
+//  2. GPU VRAM availability (if GPUDevices is non-empty), accounting for
+//     higher-or-equal priority project reservations on this node
+//  3. No more than MaxConcurrentModels containers already running
 func (g *ResourceGuard) CanStart(ctx context.Context, nodeID string, req ResourceRequest) error {
 	if req.RAMMBNeeded == 0 {
 		// No resource check requested — allow (caller didn't configure requirements)
@@ -79,13 +80,38 @@ func (g *ResourceGuard) CanStart(ctx context.Context, nodeID string, req Resourc
 			WHERE gn.node_id = $1
 			ORDER BY d.device_index`, nodeID); err == nil {
 
-			// Build a map of device_index → free VRAM
-			freeVRAM := make(map[int]int64)
-			for _, g := range gpus {
-				freeVRAM[g.DeviceIndex] = g.VRAMMb - g.MemUsedMb
+			// How much VRAM is reserved by higher-or-equal priority projects on this node?
+			// We subtract this from the raw free VRAM so lower-priority callers cannot
+			// consume resources that belong to higher-priority projects.
+			var reservedForHigherPriority int64
+			if req.ProjectPriority != "" {
+				_ = g.db.GetContext(ctx, &reservedForHigherPriority, `
+					SELECT COALESCE(SUM(pr.reserved_vram_mb), 0)
+					FROM project_reservations pr
+					JOIN projects p ON p.id = pr.project_id
+					JOIN agent_runtimes ar ON ar.project_id = p.id AND ar.node_id = $1
+					WHERE project_priority_score(p.priority) >= project_priority_score($2::varchar)
+					  AND p.id::text != COALESCE($3, '')
+					  AND ar.state IN ('active','warm','idle','loading')`,
+					nodeID, req.ProjectPriority, req.ProjectID)
 			}
 
-			// Each assigned GPU must have enough headroom (use per-GPU RAM estimate)
+			// Build a map of device_index → free VRAM (minus reserved headroom, proportioned)
+			freeVRAM := make(map[int]int64)
+			var totalRawFree int64
+			for _, gpu := range gpus {
+				raw := gpu.VRAMMb - gpu.MemUsedMb
+				freeVRAM[gpu.DeviceIndex] = raw
+				totalRawFree += raw
+			}
+
+			// Distribute the reservation deduction evenly across selected GPUs
+			reservedPerGPU := int64(0)
+			if len(gpus) > 0 && totalRawFree > 0 {
+				reservedPerGPU = reservedForHigherPriority / int64(len(req.GPUDevices))
+			}
+
+			// Each assigned GPU must have enough headroom
 			perGPU := req.RAMMBNeeded
 			if len(req.GPUDevices) > 0 {
 				perGPU = req.RAMMBNeeded / int64(len(req.GPUDevices))
@@ -93,18 +119,20 @@ func (g *ResourceGuard) CanStart(ctx context.Context, nodeID string, req Resourc
 			for _, idx := range req.GPUDevices {
 				free, ok := freeVRAM[idx]
 				if !ok {
-					// Device not found in inventory — allow (may not be tracked yet)
 					continue
 				}
-				if free < perGPU {
-					g.log.Warn("insufficient GPU VRAM",
+				effectiveFree := free - reservedPerGPU
+				if effectiveFree < perGPU {
+					g.log.Warn("insufficient GPU VRAM (accounting for reservations)",
 						zap.String("model", req.ModelName),
 						zap.Int("gpu", idx),
 						zap.Int64("needed_mb", perGPU),
 						zap.Int64("free_mb", free),
+						zap.Int64("reserved_mb", reservedPerGPU),
+						zap.Int64("effective_free_mb", effectiveFree),
 					)
-					return fmt.Errorf("%w: GPU %d has only %d MB VRAM free, need %d MB",
-						ErrInsufficientResources, idx, free, perGPU)
+					return fmt.Errorf("%w: GPU %d has only %d MB effective VRAM (raw free: %d, reserved: %d), need %d MB",
+						ErrInsufficientResources, idx, effectiveFree, free, reservedPerGPU, perGPU)
 				}
 			}
 		}

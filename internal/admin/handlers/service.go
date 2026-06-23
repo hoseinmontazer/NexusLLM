@@ -19,6 +19,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/services"
+	"github.com/nexusllm/nexusllm/internal/taskmanager"
 )
 
 // ServiceHandler manages AI Service Registry admin operations.
@@ -28,6 +29,7 @@ type ServiceHandler struct {
 	placement *placement.Engine
 	runtime   *runtime.Registry
 	ctrl      *controller.ModelController
+	taskMgr   *taskmanager.Manager // optional; nil = local Docker deployment only
 }
 
 // NewServiceHandler constructs a ServiceHandler.
@@ -45,6 +47,13 @@ func NewServiceHandler(
 		runtime:   runtimeRegistry,
 		ctrl:      ctrl,
 	}
+}
+
+// WithTaskManager wires in a task manager so DeployService can use the
+// node-agent pipeline (START_MODEL) instead of direct Docker calls.
+func (h *ServiceHandler) WithTaskManager(tm *taskmanager.Manager) *ServiceHandler {
+	h.taskMgr = tm
+	return h
 }
 
 // RegisterService handles POST /admin/v1/services
@@ -76,23 +85,23 @@ func (h *ServiceHandler) RegisterService(c *gin.Context) {
 // DeployService handles POST /admin/v1/services/deploy
 //
 // Full orchestration path for launching a new AI service:
-//   1. Placement engine chooses node/GPU/CPU/NUMA
-//   2. Service is registered in the AI Service Registry
-//   3. Container is started via ModelController (for GPU/CPU runtimes)
-//   4. Gateway registry is reloaded
+//  1. Placement engine chooses node/GPU/CPU/NUMA
+//  2. Service is registered in the AI Service Registry
+//  3. Container is started via ModelController (for GPU/CPU runtimes)
+//  4. Gateway registry is reloaded
 func (h *ServiceHandler) DeployService(c *gin.Context) {
 	var input struct {
 		services.RegisterRequest
 
 		// Container / deployment
-		Image        string   `json:"image"`
-		HFModelID    string   `json:"hf_model_id"`
-		HFToken      string   `json:"hf_token"`
-		GPUCount     int      `json:"gpu_count"`
-		ExtraArgs    []string `json:"extra_args"`
-		GPUMemUtil   float64  `json:"gpu_memory_util"`
-		TensorParallel int    `json:"tensor_parallel"`
-		StartNow     *bool    `json:"start_now"`
+		Image          string   `json:"image"`
+		HFModelID      string   `json:"hf_model_id"`
+		HFToken        string   `json:"hf_token"`
+		GPUCount       int      `json:"gpu_count"`
+		ExtraArgs      []string `json:"extra_args"`
+		GPUMemUtil     float64  `json:"gpu_memory_util"`
+		TensorParallel int      `json:"tensor_parallel"`
+		StartNow       *bool    `json:"start_now"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {

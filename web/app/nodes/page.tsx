@@ -171,6 +171,7 @@ function TelemetryPanel({ nodeId }: { nodeId: string }) {
 function NodeModal({ node, onDeleted }: { node: ClusterNode; onDeleted: () => void }) {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'gpus' | 'telemetry' | 'inventory' | 'events'>('gpus')
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   const { data: inv } = useQuery({
     queryKey: ['node-inventory', node.id],
@@ -200,7 +201,10 @@ function NodeModal({ node, onDeleted }: { node: ClusterNode; onDeleted: () => vo
       qc.invalidateQueries({ queryKey: ['nodes'] })
       onDeleted()
     },
-    onError: (e: any) => toast({ title: 'Delete failed', description: e.message, variant: 'destructive' }),
+    onError: (e: any) => {
+      setConfirmDelete(false)
+      toast({ title: 'Delete failed', description: e.message, variant: 'destructive' })
+    },
   })
 
   let labels: Record<string, string> = {}
@@ -222,15 +226,24 @@ function NodeModal({ node, onDeleted }: { node: ClusterNode; onDeleted: () => vo
                 {drainMut.isPending ? 'Draining…' : '⏸ Drain'}
               </Button>
             )}
-            <Button size="sm" variant="outline"
-              className="text-red-500 border-red-300 hover:bg-red-50"
-              onClick={() => {
-                if (confirm(`Delete node "${node.hostname}"? This cannot be undone.`)) deleteMut.mutate()
-              }}
-              disabled={deleteMut.isPending}>
-              <Trash2 className="w-3.5 h-3.5 mr-1" />
-              {deleteMut.isPending ? 'Deleting…' : 'Delete'}
-            </Button>
+            {confirmDelete ? (
+              <>
+                <Button size="sm" variant="destructive"
+                  disabled={deleteMut.isPending}
+                  onClick={() => deleteMut.mutate()}>
+                  {deleteMut.isPending ? 'Deleting…' : 'Yes, delete'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setConfirmDelete(false)}>
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <Button size="sm" variant="outline"
+                className="text-red-500 border-red-300 hover:bg-red-50"
+                onClick={() => setConfirmDelete(true)}>
+                <Trash2 className="w-3.5 h-3.5 mr-1" />Delete
+              </Button>
+            )}
           </div>
         </div>
       </DialogHeader>

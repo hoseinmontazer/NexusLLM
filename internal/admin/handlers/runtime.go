@@ -62,18 +62,18 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		Tags        []string `json:"tags"`
 
 		// Container / runtime
-		Image          string  `json:"image"           binding:"required"` // "vllm/vllm-openai:v0.4.3"
-		HFModelID      string  `json:"hf_model_id"`                        // "google/gemma-3-27b-it"
-		Host           string  `json:"host"`                               // "localhost" (default)
-		Port           int     `json:"port"            binding:"required"` // 8000
-		GPUDevices     []int   `json:"gpu_devices"`                        // [0,1]
-		TensorParallel int     `json:"tensor_parallel"`
-		GPUMemoryUtil  float64 `json:"gpu_memory_util"`
-		MaxModelLen    int     `json:"max_model_len"`
-		Dtype          string  `json:"dtype"`
-		Quantization   string  `json:"quantization"`
+		Image          string   `json:"image"           binding:"required"` // "vllm/vllm-openai:v0.4.3"
+		HFModelID      string   `json:"hf_model_id"`                        // "google/gemma-3-27b-it"
+		Host           string   `json:"host"`                               // "localhost" (default)
+		Port           int      `json:"port"            binding:"required"` // 8000
+		GPUDevices     []int    `json:"gpu_devices"`                        // [0,1]
+		TensorParallel int      `json:"tensor_parallel"`
+		GPUMemoryUtil  float64  `json:"gpu_memory_util"`
+		MaxModelLen    int      `json:"max_model_len"`
+		Dtype          string   `json:"dtype"`
+		Quantization   string   `json:"quantization"`
 		ExtraArgs      []string `json:"extra_args"`
-		HFToken        string  `json:"hf_token"`  // passed as HUGGING_FACE_HUB_TOKEN env var
+		HFToken        string   `json:"hf_token"` // passed as HUGGING_FACE_HUB_TOKEN env var
 
 		// Whether to actually start the container now (default: true)
 		// Set false to register only and start manually later.
@@ -81,10 +81,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 		// AutoPlace: if true, skip gpu_devices and let the placement engine
 		// choose GPU(s), CPU affinity, and NUMA node automatically.
-		AutoPlace  bool  `json:"auto_place"`
-		MinVRAMMB  int64 `json:"min_vram_mb"` // used when auto_place=true
-		MaxVRAMMB  int64 `json:"max_vram_mb"` // used when auto_place=true
-		Priority   string `json:"priority"`   // used when auto_place=true
+		AutoPlace bool   `json:"auto_place"`
+		MinVRAMMB int64  `json:"min_vram_mb"` // used when auto_place=true
+		MaxVRAMMB int64  `json:"max_vram_mb"` // used when auto_place=true
+		Priority  string `json:"priority"`    // used when auto_place=true
 
 		// NodeID: if set, deploy via DEPLOY_RUNTIME task to the specified node agent.
 		// The node agent executes the container start on that server.
@@ -109,6 +109,12 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// LlamaCppModelsVolume is the host path or named volume to mount as /models.
 		// Defaults to Docker named volume "llamacpp_models" when empty.
 		LlamaCppModelsVolume string `json:"llamacpp_models_volume"`
+
+		// ExecutionMode controls GPU vs CPU deployment for this model.
+		//   "cpu"  — CPU-only; no --gpus flag; n_gpu_layers forced to 0
+		//   "gpu"  — always use GPUs
+		//   "auto" — detect node capability at startup (default)
+		ExecutionMode string `json:"execution_mode"` // cpu | gpu | auto
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -193,15 +199,30 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
 		uuid.New().String(), mID)
 
-	// Runtime config
+	// Runtime config — save all fields including llamacpp source so lazy config modal can read them back
 	_, _ = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_runtime_configs
-		  (id, model_id, gpu_memory_util, tensor_parallel, dtype, quantization)
-		VALUES ($1,$2,$3,$4,$5,$6)`,
+		  (id, model_id, gpu_memory_util, tensor_parallel, dtype, quantization,
+		   gguf_path, hf_repo, hf_file, hf_token, ctx_size, n_gpu_layers,
+		   models_volume, execution_mode)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		uuid.New().String(), mID,
 		input.GPUMemoryUtil, input.TensorParallel,
 		orDefault(input.Dtype, "auto"),
 		nilableStr(input.Quantization),
+		nilableStr(input.LlamaCppModelPath),
+		nilableStr(input.LlamaCppHFRepo),
+		nilableStr(input.LlamaCppHFFile),
+		nilableStr(input.HFToken),
+		func() int {
+			if input.LlamaCppCtxSize > 0 {
+				return input.LlamaCppCtxSize
+			}
+			return 4096
+		}(),
+		input.LlamaCppNGPULayers,
+		nilableStr(input.LlamaCppModelsVolume),
+		orDefault(input.ExecutionMode, "auto"),
 	)
 
 	// ── 2. Insert endpoint row ─────────────────────────────────────────────
@@ -253,24 +274,53 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	}
 
 	// ── Path A: Deploy via Node Agent ──────────────────────────────────────
-	// When node_id is set, dispatch a DEPLOY_RUNTIME task to the agent on that
-	// node. The agent executes docker run locally and reports back.
+	// Dispatch a START_MODEL task — the single unified startup pipeline.
+	// The agent executes: VALIDATING → DOWNLOADING → STARTING → LOADING_MODEL.
+	// The control plane (registry) polls /health to complete → READY.
 	if shouldStart && input.NodeID != "" && h.taskMgr != nil {
-		// Create agent_runtime row
 		runtimeID := uuid.New().String()
 		containerName := "nexus-" + input.Name
-		_, _ = h.db.ExecContext(c.Request.Context(), `
+
+		gpuIDsJSON := "[]"
+		if len(input.GPUDevices) > 0 {
+			if b, jerr := json.Marshal(input.GPUDevices); jerr == nil {
+				gpuIDsJSON = string(b)
+			}
+		}
+
+		// Insert runtime row at state="pending" — the only value guaranteed
+		// to be in the agent_runtimes_state_check constraint on all DB versions.
+		// We check RowsAffected: if it's 0 the task enqueue must not proceed
+		// because runtimeID won't exist and the FK on agent_tasks.runtime_id
+		// will reject the insert.
+		rtRes, rtErr := h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO agent_runtimes
 			  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node)
-			VALUES ($1,$2,$3,$4,$5,$6,'pending','[]',$7,$8,'',-1)`,
+			VALUES ($1,$2,$3,$4,$5,$6,'pending',$7::jsonb,$8,$9,'',-1)`,
 			runtimeID, input.NodeID, epID, mID,
 			containerName, input.BackendType,
-			input.Host, input.Port,
+			gpuIDsJSON, bindHost, input.Port,
 		)
+		if rtErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "failed to create runtime record: " + rtErr.Error(),
+			})
+			return
+		}
+		if n, _ := rtRes.RowsAffected(); n == 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "runtime record not created (possible duplicate) — cannot dispatch task",
+			})
+			return
+		}
 
-		// Build task payload — control plane passes all decisions to the agent
-		payload := taskmanager.DeployRuntimePayload{
+		// Build the unified START_MODEL payload.
+		// All startup scenarios — initial deploy, cold start, re-deploy, recovery —
+		// use this exact payload structure via TaskStartModel.
+		payload := taskmanager.StartModelPayload{
 			RuntimeID:      runtimeID,
 			EndpointID:     epID,
 			ModelID:        mID,
@@ -279,7 +329,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			Image:          runtimeImage,
 			ModelName:      modelID,
 			ServedAs:       input.Name,
-			BindHost:       bindHost,  // node's real IP, not localhost
+			BindHost:       bindHost,
 			BindPort:       input.Port,
 			GPUDevices:     input.GPUDevices,
 			TensorParallel: input.TensorParallel,
@@ -288,17 +338,16 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			Dtype:          input.Dtype,
 			Quantization:   input.Quantization,
 			ExtraArgs:      input.ExtraArgs,
+			HFToken:        input.HFToken,
 			Env:            map[string]string{},
-			// llamacpp fields
-			LlamaCppModelPath:    input.LlamaCppModelPath,
-			LlamaCppHFRepo:       input.LlamaCppHFRepo,
-			LlamaCppHFFile:       input.LlamaCppHFFile,
-			LlamaCppCtxSize:      input.LlamaCppCtxSize,
-			LlamaCppNGPULayers:   input.LlamaCppNGPULayers,
-			LlamaCppModelsVolume: input.LlamaCppModelsVolume,
-		}
-		if input.HFToken != "" {
-			payload.HFToken = input.HFToken
+			// llamacpp model source
+			GGUFPath:      input.LlamaCppModelPath,
+			HFRepo:        input.LlamaCppHFRepo,
+			HFFile:        input.LlamaCppHFFile,
+			CtxSize:       input.LlamaCppCtxSize,
+			NGPULayers:    input.LlamaCppNGPULayers,
+			ModelsVolume:  input.LlamaCppModelsVolume,
+			ExecutionMode: orDefault(input.ExecutionMode, "auto"),
 		}
 
 		priority := 70
@@ -311,19 +360,18 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		taskID, taskErr := h.taskMgr.Enqueue(
 			c.Request.Context(),
 			input.NodeID,
-			taskmanager.TaskDeployRuntime,
+			taskmanager.TaskStartModel,
 			payload,
 			taskmanager.WithPriority(priority),
 			taskmanager.WithActor("admin-deploy"),
 			taskmanager.WithRuntimeID(runtimeID),
+			taskmanager.WithIdempotencyKey("start:"+input.NodeID+":"+runtimeID),
 		)
 
-		// Mark endpoint as pending (agent will transition it)
+		// Mark endpoint as starting; link to node.
 		_, _ = h.db.ExecContext(c.Request.Context(),
-			`UPDATE model_endpoints SET lifecycle_state='downloading', updated_at=NOW() WHERE id=$1`, epID)
-		// Link endpoint to node
-		_, _ = h.db.ExecContext(c.Request.Context(),
-			`UPDATE model_endpoints SET node_id=$1 WHERE id=$2`, input.NodeID, epID)
+			`UPDATE model_endpoints SET lifecycle_state='loading', node_id=$1, updated_at=NOW() WHERE id=$2`,
+			input.NodeID, epID)
 
 		_ = h.registry.Reload(c.Request.Context())
 
@@ -332,7 +380,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 				"model_id":    mID,
 				"endpoint_id": epID,
 				"runtime_id":  runtimeID,
-				"warning":     "model registered but task dispatch failed: " + taskErr.Error(),
+				"warning":     "model registered but START_MODEL task dispatch failed: " + taskErr.Error(),
 			})
 			return
 		}
@@ -344,8 +392,8 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			"runtime_id":  runtimeID,
 			"task_id":     taskID,
 			"node_id":     input.NodeID,
-			"status":      "pending",
-			"note":        "DEPLOY_RUNTIME task dispatched — agent will start container and report back",
+			"status":      "created",
+			"note":        "START_MODEL task dispatched — pipeline: VALIDATING → DOWNLOADING → STARTING → LOADING_MODEL → READY",
 		})
 		return
 	}
@@ -408,13 +456,19 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		"host":        input.Host,
 		"port":        input.Port,
 		"started":     shouldStart && containerID != "",
-		"status":      func() string {
-			if shouldStart && containerID != "" { return "loading" }
-			if input.BackendType == "ollama" || input.BackendType == "openai_compat" { return "active" }
+		"status": func() string {
+			if shouldStart && containerID != "" {
+				return "loading"
+			}
+			if input.BackendType == "ollama" || input.BackendType == "openai_compat" {
+				return "active"
+			}
 			return "registered"
 		}(),
 		"note": func() string {
-			if shouldStart && containerID != "" { return "" }
+			if shouldStart && containerID != "" {
+				return ""
+			}
 			if input.BackendType == "ollama" && !shouldStart {
 				return fmt.Sprintf("Ollama backend registered as external. Make sure Ollama is running on %s:%d", input.Host, input.Port)
 			}
@@ -768,14 +822,14 @@ func (h *RuntimeHandler) DeleteModel(c *gin.Context) {
 func (h *RuntimeHandler) GetDeployStatus(c *gin.Context) {
 	modelID := c.Param("id")
 	type statusRow struct {
-		EndpointID     string     `db:"id"              json:"endpoint_id"`
-		Host           string     `db:"host"            json:"host"`
-		Port           int        `db:"port"            json:"port"`
-		LifecycleState string     `db:"lifecycle_state" json:"lifecycle_state"`
-		HealthStatus   string     `db:"health_status"   json:"health_status"`
-		ContainerID    string     `db:"container_id"    json:"container_id"`
-		RuntimeImage   string     `db:"runtime_image"   json:"runtime_image"`
-		UpdatedAt      time.Time  `db:"updated_at"      json:"updated_at"`
+		EndpointID     string    `db:"id"              json:"endpoint_id"`
+		Host           string    `db:"host"            json:"host"`
+		Port           int       `db:"port"            json:"port"`
+		LifecycleState string    `db:"lifecycle_state" json:"lifecycle_state"`
+		HealthStatus   string    `db:"health_status"   json:"health_status"`
+		ContainerID    string    `db:"container_id"    json:"container_id"`
+		RuntimeImage   string    `db:"runtime_image"   json:"runtime_image"`
+		UpdatedAt      time.Time `db:"updated_at"      json:"updated_at"`
 	}
 	var rows []statusRow
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `

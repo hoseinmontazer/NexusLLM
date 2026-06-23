@@ -442,3 +442,100 @@ func (h *NodeHandler) GetNodeHealthEvents(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "node_id": nodeID})
 }
+
+// DeleteNode handles DELETE /admin/v1/nodes/:id
+// Removes the node and all associated data (runtimes, telemetry, tasks cascade via FK).
+// Refuses if the node has active runtimes — drain first.
+func (h *NodeHandler) DeleteNode(c *gin.Context) {
+	nodeID := c.Param("id")
+
+	// Verify node exists
+	var status string
+	if err := h.db.GetContext(c.Request.Context(), &status,
+		`SELECT status FROM nodes WHERE id = $1`, nodeID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+
+	// Refuse if node has active runtimes
+	var activeCount int
+	_ = h.db.GetContext(c.Request.Context(), &activeCount, `
+		SELECT COUNT(*) FROM agent_runtimes
+		WHERE node_id = $1 AND state IN ('active','warm','loading','starting','pulling')`, nodeID)
+	if activeCount > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":          "node has active runtimes — stop them or drain the node first",
+			"active_runtimes": activeCount,
+		})
+		return
+	}
+
+	// Mark runtimes as deleted first (avoids FK issues with running tasks)
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		UPDATE agent_runtimes SET state='deleted', updated_at=NOW() WHERE node_id=$1`, nodeID)
+
+	// Delete the node (cascades to node_tokens, node_capabilities, node_telemetry,
+	// node_health_events, agent_tasks, node_inventory_snapshots via ON DELETE CASCADE)
+	res, err := h.db.ExecContext(c.Request.Context(), `DELETE FROM nodes WHERE id=$1`, nodeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "node deleted", "node_id": nodeID})
+}
+
+// GetNodeGPUs handles GET /admin/v1/nodes/:id/gpus
+// Returns live GPU device state for a cluster node, including latest telemetry.
+func (h *NodeHandler) GetNodeGPUs(c *gin.Context) {
+	nodeID := c.Param("id")
+
+	type gpuRow struct {
+		ID             string     `db:"id"              json:"id"`
+		DeviceIndex    int        `db:"device_index"    json:"device_index"`
+		Name           string     `db:"name"            json:"name"`
+		VRAMMB         int        `db:"vram_mb"         json:"vram_mb"`
+		Status         string     `db:"status"          json:"status"`
+		PCIeBusID      string     `db:"pcie_bus_id"     json:"pcie_bus_id"`
+		NUMANode       int        `db:"numa_node"       json:"numa_node"`
+		UtilizationPct int        `db:"utilization_pct" json:"utilization_pct"`
+		MemUsedMB      int        `db:"mem_used_mb"     json:"mem_used_mb"`
+		TemperatureC   int        `db:"temperature_c"   json:"temperature_c"`
+		PowerDrawW     int        `db:"power_draw_w"    json:"power_draw_w"`
+		PowerLimitW    int        `db:"power_limit_w"   json:"power_limit_w"`
+		LastSeenAt     *time.Time `db:"last_seen_at"    json:"last_seen_at"`
+	}
+
+	var rows []gpuRow
+	if err := h.db.SelectContext(c.Request.Context(), &rows, `
+		SELECT d.id, d.device_index, d.name, d.vram_mb, d.status,
+		       COALESCE(d.pcie_bus_id,'') AS pcie_bus_id,
+		       COALESCE(d.numa_node,0) AS numa_node,
+		       COALESCE(d.utilization_pct,0) AS utilization_pct,
+		       COALESCE(
+		         (SELECT gt.memory_used_mb FROM gpu_telemetry gt
+		          WHERE gt.device_id = d.id ORDER BY gt.recorded_at DESC LIMIT 1), 0
+		       ) AS mem_used_mb,
+		       COALESCE(d.temperature_c,0) AS temperature_c,
+		       COALESCE(d.power_draw_w,0) AS power_draw_w,
+		       COALESCE(
+		         (SELECT gt.power_limit_w FROM gpu_telemetry gt
+		          WHERE gt.device_id = d.id ORDER BY gt.recorded_at DESC LIMIT 1), 0
+		       ) AS power_limit_w,
+		       d.last_seen_at
+		FROM gpu_devices d
+		JOIN gpu_nodes gn ON gn.id = d.node_id
+		WHERE gn.node_id = $1
+		ORDER BY d.device_index`, nodeID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if rows == nil {
+		rows = []gpuRow{}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "node_id": nodeID, "total": len(rows)})
+}

@@ -80,10 +80,14 @@ export interface GpuDevice {
   temperature_c: number; power_draw_w: number; numa_node: number
 }
 export interface UsageSummary {
-  team_id: string; model_name: string; day: string
-  request_count: number; error_count: number
-  prompt_tokens: number; completion_tokens: number
-  total_tokens: number; cost_usd: number
+  model_name: string
+  request_count: number
+  error_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost_usd: number
+  avg_latency_ms: number
 }
 
 export interface ServiceRecord {
@@ -369,6 +373,10 @@ export const api = {
       req<GpuNode>('POST', '/gpu/nodes', b),
     registerDevice: (nodeId: string, b: { device_index: number; name: string; vram_mb: number }) =>
       req<GpuDevice>('POST', `/gpu/nodes/${nodeId}/devices`, b),
+    deleteNode: (nodeId: string) =>
+      req<{ message: string }>('DELETE', `/gpu/nodes/${nodeId}`),
+    deleteDevice: (nodeId: string, deviceId: string) =>
+      req<{ message: string }>('DELETE', `/gpu/nodes/${nodeId}/devices/${deviceId}`),
   },
 
   usage: {

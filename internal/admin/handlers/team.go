@@ -113,12 +113,15 @@ func (h *TeamHandler) GetTeam(c *gin.Context) {
 }
 
 // DeactivateTeam handles DELETE /admin/v1/teams/:id
+// Performs a hard delete of the team and all its cascading data.
 func (h *TeamHandler) DeactivateTeam(c *gin.Context) {
 	id := c.Param("id")
+
+	// Hard delete — cascades to policies, api_keys, team_model_permissions via FK ON DELETE CASCADE
 	res, err := h.db.ExecContext(c.Request.Context(),
-		`UPDATE teams SET active = FALSE, updated_at = NOW() WHERE id = $1`, id)
+		`DELETE FROM teams WHERE id = $1`, id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error: " + err.Error()})
 		return
 	}
 	rows, _ := res.RowsAffected()
@@ -126,7 +129,84 @@ func (h *TeamHandler) DeactivateTeam(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "team deactivated"})
+	c.JSON(http.StatusOK, gin.H{"message": "team deleted", "id": id})
+}
+
+// UpdateTeam handles PUT /admin/v1/teams/:id
+func (h *TeamHandler) UpdateTeam(c *gin.Context) {
+	id := c.Param("id")
+
+	// Verify exists
+	var existing struct {
+		Name string `db:"name"`
+	}
+	if err := h.db.GetContext(c.Request.Context(), &existing,
+		`SELECT name FROM teams WHERE id = $1`, id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
+		return
+	}
+
+	var input struct {
+		Name     *string `json:"name"`
+		Slug     *string `json:"slug"`
+		Priority *int    `json:"priority"`
+		Active   *bool   `json:"active"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.Priority != nil && (*input.Priority < 1 || *input.Priority > 100) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "priority must be between 1 and 100"})
+		return
+	}
+
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE teams SET
+		  name     = COALESCE($2, name),
+		  slug     = COALESCE($3, slug),
+		  priority = COALESCE($4, priority),
+		  active   = COALESCE($5, active),
+		  updated_at = NOW()
+		WHERE id = $1`,
+		id, input.Name, input.Slug, input.Priority, input.Active,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "slug already taken"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "team updated", "id": id})
+}
+
+// ListTeamModels handles GET /admin/v1/teams/:id/models
+// Returns all models the team currently has permission to access.
+func (h *TeamHandler) ListTeamModels(c *gin.Context) {
+	teamID := c.Param("id")
+	type modelRow struct {
+		Name string `db:"name" json:"name"`
+	}
+	var rows []modelRow
+	if err := h.db.SelectContext(c.Request.Context(), &rows, `
+		SELECT m.name
+		FROM team_model_permissions tmp
+		JOIN models m ON m.id = tmp.model_id
+		WHERE tmp.team_id = $1
+		ORDER BY m.name`, teamID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if rows == nil {
+		rows = []modelRow{}
+	}
+	models := make([]string, len(rows))
+	for i, r := range rows {
+		models[i] = r.Name
+	}
+	c.JSON(http.StatusOK, gin.H{"models": models, "total": len(models)})
 }
 
 // GetTeamPolicy handles GET /admin/v1/teams/:id/policy
@@ -187,6 +267,34 @@ func (h *TeamHandler) UpdateTeamPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy"})
 		return
 	}
+
+	// Push updated limits to Redis so the gateway picks them up immediately
+	// without requiring a restart or waiting for the 60s reload cycle.
+	if h.rdb != nil {
+		ctx := c.Request.Context()
+		// Re-read the full policy from DB to push the current values
+		var p struct {
+			RPM              int `db:"rpm"`
+			TPD              int `db:"tpd"`
+			MaxConcurrent    int `db:"max_concurrent"`
+			MaxContextTokens int `db:"max_context_tokens"`
+		}
+		if err := h.db.GetContext(ctx, &p,
+			`SELECT rpm, tpd, max_concurrent, max_context_tokens FROM policies WHERE team_id=$1`, teamID,
+		); err == nil {
+			pipe := h.rdb.Pipeline()
+			policyKey := "nexus:policy:" + teamID
+			pipe.HSet(ctx, policyKey,
+				"rpm", p.RPM,
+				"tpd", p.TPD,
+				"max_concurrent", p.MaxConcurrent,
+				"max_context_tokens", p.MaxContextTokens,
+			)
+			pipe.Expire(ctx, policyKey, 48*60*60*1_000_000_000) // 48h TTL
+			_, _ = pipe.Exec(ctx)
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "policy updated"})
 }
 

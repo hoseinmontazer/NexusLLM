@@ -19,12 +19,13 @@ func NewUsageHandler(tracker *usage.Tracker) *UsageHandler {
 
 // GetTeamUsage handles GET /admin/v1/usage/teams/:id
 // Query params: from=2026-01-01 to=2026-01-31
+// Queries usage_events directly (real-time, no aggregation lag).
 func (h *UsageHandler) GetTeamUsage(c *gin.Context) {
 	teamID := c.Param("id")
 	from := c.DefaultQuery("from", "2026-01-01")
 	to := c.DefaultQuery("to", "2026-12-31")
 
-	rows, err := h.tracker.GetTeamDailyUsage(c.Request.Context(), teamID, from, to)
+	rows, err := h.tracker.GetTeamRealtimeUsage(c.Request.Context(), teamID, from+"T00:00:00Z", to+"T23:59:59Z")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

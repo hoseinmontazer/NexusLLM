@@ -23,6 +23,8 @@ import (
 	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
+	"github.com/nexusllm/nexusllm/internal/project"
+	"github.com/nexusllm/nexusllm/internal/preemption"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/services"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
@@ -109,13 +111,14 @@ func main() {
 	}()
 
 	// ── Node Agent (in-process for single-server deployment) ──────────────────
-	// Find the default node ID from the DB (seeded by migration 006).
-	var defaultNodeID string
-	_ = db.GetContext(ctx, &defaultNodeID, `SELECT id FROM nodes WHERE hostname = 'nexus-h200-01' LIMIT 1`)
-	if defaultNodeID != "" {
-		agent := nodeagent.NewAgent(db, defaultNodeID, 30*time.Second, log)
-		go agent.Start(usageCtx)
-		log.Info("node agent started", zap.String("node_id", defaultNodeID))
+	// The in-process agent runs only when NEXUS_AGENT_ENABLED=true is set.
+	// It self-registers using the real machine hostname (no hardcoded names).
+	// In production, run the standalone nexus-nodeagent binary on each node instead.
+	if os.Getenv("NEXUS_AGENT_ENABLED") == "true" {
+		agentNodeID := startInProcessAgent(ctx, db, log, usageCtx)
+		if agentNodeID != "" {
+			log.Info("in-process node agent started", zap.String("node_id", agentNodeID))
+		}
 	}
 
 	// ── Node Health Monitor ────────────────────────────────────────────────────
@@ -125,6 +128,18 @@ func main() {
 	nodeMonitor := nodehealth.NewMonitor(db, log)
 	go nodeMonitor.Start(usageCtx)
 	log.Info("node health monitor started")
+
+	// ── Preemption Engine ─────────────────────────────────────────────────────
+	// Watches node pressure every 30s, evicts lower-priority runtimes when
+	// VRAM/GPU/RAM thresholds are breached.
+	preemptEngine := preemption.NewEngine(db, taskMgr, log)
+	go preemptEngine.Start(usageCtx)
+	log.Info("preemption engine started")
+
+	// ── Project Metrics Collector ─────────────────────────────────────────────
+	projectMetrics := project.NewMetricsCollector(db, log)
+	go projectMetrics.Start(usageCtx)
+	log.Info("project metrics collector started")
 
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	orgH        := handlers.NewOrgHandler(db)
@@ -143,6 +158,7 @@ func main() {
 	taskH       := handlers.NewTaskHandler(taskMgr)
 	requireH    := handlers.NewRequirementsHandler(db)
 	lazyH       := handlers.NewLazyRuntimeHandler(db)
+	projectH    := handlers.NewProjectHandler(db)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -163,9 +179,11 @@ func main() {
 	a.POST("/teams",          teamH.CreateTeam)    // body: {org_id, name, slug, priority}
 	a.GET("/teams",           teamH.ListTeams)     // query: ?org_id=...
 	a.GET("/teams/:id",       teamH.GetTeam)
+	a.PUT("/teams/:id",       teamH.UpdateTeam)
 	a.DELETE("/teams/:id",    teamH.DeactivateTeam)
 	a.GET("/teams/:id/policy",           teamH.GetTeamPolicy)
 	a.PUT("/teams/:id/policy",           teamH.UpdateTeamPolicy)
+	a.GET("/teams/:id/models",           teamH.ListTeamModels)
 	a.POST("/teams/:id/models",          teamH.AddModelPermission)
 	a.DELETE("/teams/:id/models/:model", teamH.RemoveModelPermission)
 
@@ -203,8 +221,10 @@ func main() {
 	// ── GPU Inventory ─────────────────────────────────────────────────────────
 	a.POST("/gpu/nodes",                   gpuH.RegisterNode)
 	a.GET("/gpu/nodes",                    gpuH.ListNodes)
+	a.DELETE("/gpu/nodes/:id",             gpuH.DeleteGPUNode)
 	a.POST("/gpu/nodes/:id/devices",       gpuH.RegisterDevice)
 	a.GET("/gpu/nodes/:id/devices",        gpuH.ListDevices)
+	a.DELETE("/gpu/nodes/:id/devices/:device_id", gpuH.DeleteGPUDevice)
 	a.POST("/gpu/pack",                    gpuH.PackModels)
 
 	// ── Usage & Billing ───────────────────────────────────────────────────────
@@ -240,6 +260,8 @@ func main() {
 	a.GET("/nodes/:id/telemetry",        nodeH.GetTelemetry)
 	a.GET("/nodes/:id/inventory",        nodeH.GetInventory)
 	a.POST("/nodes/:id/drain",           nodeH.DrainNode)
+	a.DELETE("/nodes/:id",               nodeH.DeleteNode)
+	a.GET("/nodes/:id/gpus",             nodeH.GetNodeGPUs)
 	a.GET("/nodes/:id/health-events",    nodeH.GetNodeHealthEvents)
 
 	// ── Model Lifecycle (archive/restore) ────────────────────────────────────
@@ -258,6 +280,20 @@ func main() {
 	a.PUT("/models/:id/lazy-config",        lazyH.SetLazyConfig)
 	a.GET("/models/:id/lazy-config",        lazyH.GetLazyConfig)
 	a.GET("/models/:id/runtime-status",     lazyH.GetRuntimeStatus)
+
+	// ── Projects ──────────────────────────────────────────────────────────────
+	a.POST("/projects",                         projectH.CreateProject)
+	a.GET("/projects",                          projectH.ListProjects)
+	a.GET("/projects/:id",                      projectH.GetProject)
+	a.PUT("/projects/:id",                      projectH.UpdateProject)
+	a.DELETE("/projects/:id",                   projectH.DeleteProject)
+	a.POST("/projects/:id/reserve",             projectH.Reserve)
+	a.POST("/projects/:id/priority",            projectH.ChangePriority)
+	a.PUT("/projects/:id/protection",           projectH.SetProtection)
+	a.GET("/projects/:id/runtimes",             projectH.GetRuntimes)
+	a.GET("/projects/:id/usage",                projectH.GetUsage)
+	a.GET("/projects/:id/preemptions",          projectH.GetPreemptions)
+	a.GET("/projects/:id/queue",                projectH.GetQueue)
 
 	// ── Agent API (called by node agents, not human operators) ────────────────
 	// Registration does NOT require auth (bootstrapping)
@@ -328,4 +364,41 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 	_ = metricsSrv.Shutdown(shutCtx)
 	log.Info("nexus-admin stopped")
+}
+
+// startInProcessAgent self-registers the current machine as a cluster node
+// (using its real hostname) and starts the node agent loop.
+// Used only when NEXUS_AGENT_ENABLED=true — intended for single-server dev setups.
+func startInProcessAgent(ctx context.Context, db *sqlx.DB, log *zap.Logger, runCtx context.Context) string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		log.Warn("could not determine hostname for in-process agent", zap.Error(err))
+		return ""
+	}
+
+	// Find existing node by hostname
+	var nodeID string
+	err = db.GetContext(ctx, &nodeID, `SELECT id FROM nodes WHERE hostname = $1 LIMIT 1`, hostname)
+	if err != nil {
+		// Auto-register this machine as a new node
+		_, err2 := db.ExecContext(ctx, `
+			INSERT INTO nodes (hostname, display_name, status, created_at, updated_at)
+			VALUES ($1, $1, 'online', NOW(), NOW())
+			ON CONFLICT (hostname) DO UPDATE SET updated_at = NOW()`, hostname)
+		if err2 != nil {
+			log.Warn("in-process agent: could not register node",
+				zap.String("hostname", hostname), zap.Error(err2))
+			return ""
+		}
+		// Re-fetch the ID
+		if err3 := db.GetContext(ctx, &nodeID,
+			`SELECT id FROM nodes WHERE hostname = $1 LIMIT 1`, hostname); err3 != nil {
+			log.Warn("in-process agent: could not fetch registered node id", zap.Error(err3))
+			return ""
+		}
+	}
+
+	agent := nodeagent.NewAgent(db, nodeID, 30*time.Second, log)
+	go agent.Start(runCtx)
+	return nodeID
 }

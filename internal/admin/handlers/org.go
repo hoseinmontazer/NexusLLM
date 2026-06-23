@@ -81,12 +81,15 @@ func (h *OrgHandler) ListOrgs(c *gin.Context) {
 }
 
 // DeactivateOrg handles DELETE /admin/v1/orgs/:id
+// Performs a hard delete of the organization and all its cascading data.
 func (h *OrgHandler) DeactivateOrg(c *gin.Context) {
 	id := c.Param("id")
+
+	// Hard delete — cascades to teams, policies, team_model_permissions via FK ON DELETE CASCADE
 	res, err := h.db.ExecContext(c.Request.Context(),
-		`UPDATE organizations SET active = FALSE, updated_at = NOW() WHERE id = $1`, id)
+		`DELETE FROM organizations WHERE id = $1`, id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error: " + err.Error()})
 		return
 	}
 	rows, _ := res.RowsAffected()
@@ -94,5 +97,5 @@ func (h *OrgHandler) DeactivateOrg(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "organization deactivated"})
+	c.JSON(http.StatusOK, gin.H{"message": "organization deleted", "id": id})
 }

@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -51,6 +52,8 @@ func NewEngine(rdb *redis.Client) *Engine {
 
 // Evaluate runs all policy checks for the given request and team claims.
 // Policy checks run entirely in Redis — no DB calls on the hot path.
+// Limits are read from the Redis policy hash (nexus:policy:<teamID>) if present,
+// falling back to the in-memory TeamPolicy struct loaded at startup.
 func (e *Engine) Evaluate(ctx context.Context, req *InferenceRequest, priority int, policy *TeamPolicy) PolicyDecision {
 	// 1. Model ACL
 	allowed, err := e.rdb.SIsMember(ctx,
@@ -59,14 +62,17 @@ func (e *Engine) Evaluate(ctx context.Context, req *InferenceRequest, priority i
 		return PolicyDecision{Allowed: false, RejectReason: "model_not_allowed"}
 	}
 
+	// Load live limits from Redis (updated by admin on policy change)
+	live := e.loadLivePolicy(ctx, req.TeamID, policy)
+
 	// 2. Context length
-	if policy.MaxContextTokens > 0 && req.EstimatedInputTokens > policy.MaxContextTokens {
+	if live.MaxContextTokens > 0 && req.EstimatedInputTokens > live.MaxContextTokens {
 		return PolicyDecision{Allowed: false, RejectReason: "context_length_exceeded"}
 	}
 
-	// 3. Rate limit — Redis sliding window (tokens per 60s window)
+	// 3. Rate limit — Redis sliding window (requests per 60s window)
 	rpmKey := ratelimitPrefix + req.TeamID + ":rpm"
-	exceeded, err := e.checkSlidingWindow(ctx, rpmKey, policy.RPMLimit, 60*time.Second)
+	exceeded, err := e.checkSlidingWindow(ctx, rpmKey, live.RPMLimit, 60*time.Second)
 	if err == nil && exceeded {
 		return PolicyDecision{Allowed: false, RejectReason: "rate_limit_exceeded"}
 	}
@@ -74,14 +80,14 @@ func (e *Engine) Evaluate(ctx context.Context, req *InferenceRequest, priority i
 	// 4. Daily token quota — Redis counter reset at midnight
 	quotaKey := quotaPrefix + req.TeamID + ":daily:" + time.Now().UTC().Format("2006-01-02")
 	dailyUsed, err := e.rdb.Get(ctx, quotaKey).Int64()
-	if err == nil && policy.TPDLimit > 0 && int(dailyUsed) >= policy.TPDLimit {
+	if err == nil && live.TPDLimit > 0 && int(dailyUsed) >= live.TPDLimit {
 		return PolicyDecision{Allowed: false, RejectReason: "daily_quota_exceeded"}
 	}
 
 	// 5. Concurrency
 	inflightKey := inflightPrefix + req.TeamID
 	inflight, err := e.rdb.Get(ctx, inflightKey).Int64()
-	if err == nil && policy.MaxConcurrent > 0 && int(inflight) >= policy.MaxConcurrent {
+	if err == nil && live.MaxConcurrent > 0 && int(inflight) >= live.MaxConcurrent {
 		return PolicyDecision{
 			Allowed:       false,
 			QueueInstead:  true,
@@ -103,6 +109,43 @@ func (e *Engine) Evaluate(ctx context.Context, req *InferenceRequest, priority i
 	}
 
 	return PolicyDecision{Allowed: true}
+}
+
+// loadLivePolicy returns policy limits from Redis if the admin has pushed an update,
+// otherwise falls back to the in-memory struct loaded at gateway startup.
+func (e *Engine) loadLivePolicy(ctx context.Context, teamID string, fallback *TeamPolicy) *TeamPolicy {
+	policyKey := "nexus:policy:" + teamID
+	vals, err := e.rdb.HGetAll(ctx, policyKey).Result()
+	if err != nil || len(vals) == 0 {
+		return fallback
+	}
+	live := &TeamPolicy{
+		RPMLimit:         fallback.RPMLimit,
+		TPDLimit:         fallback.TPDLimit,
+		MaxConcurrent:    fallback.MaxConcurrent,
+		MaxContextTokens: fallback.MaxContextTokens,
+	}
+	if v, ok := vals["rpm"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			live.RPMLimit = n
+		}
+	}
+	if v, ok := vals["tpd"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			live.TPDLimit = n
+		}
+	}
+	if v, ok := vals["max_concurrent"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			live.MaxConcurrent = n
+		}
+	}
+	if v, ok := vals["max_context_tokens"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			live.MaxContextTokens = n
+		}
+	}
+	return live
 }
 
 // IncrementInflight atomically increments the in-flight request counter for a team.

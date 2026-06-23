@@ -283,3 +283,29 @@ func (inv *Inventory) selectDevices(ctx context.Context, req AllocationRequest) 
 	err := inv.db.SelectContext(ctx, &devices, baseQ, args...)
 	return devices, err
 }
+
+// DeleteNode removes a GPU node and all its devices.
+func (inv *Inventory) DeleteNode(ctx context.Context, nodeID string) error {
+	res, err := inv.db.ExecContext(ctx, `DELETE FROM gpu_nodes WHERE id = $1`, nodeID)
+	if err != nil {
+		return fmt.Errorf("delete gpu_node: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("gpu node not found")
+	}
+	return nil
+}
+
+// DeleteDevice removes a single GPU device.
+func (inv *Inventory) DeleteDevice(ctx context.Context, deviceID string) error {
+	res, err := inv.db.ExecContext(ctx, `DELETE FROM gpu_devices WHERE id = $1`, deviceID)
+	if err != nil {
+		return fmt.Errorf("delete gpu_device: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("gpu device not found")
+	}
+	return nil
+}

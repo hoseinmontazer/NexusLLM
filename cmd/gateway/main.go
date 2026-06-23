@@ -105,13 +105,42 @@ func main() {
 	}()
 
 	// ── Services ──────────────────────────────────────────────────────────────
-	authSvc      := auth.NewService(rdb, db, cfg.Auth.JWTSecret, cfg.Auth.APIKeyCacheTTL)
+	authSvc := auth.NewService(rdb, db, cfg.Auth.JWTSecret, cfg.Auth.APIKeyCacheTTL)
 	policyEngine := policy.NewEngine(rdb)
-	gwPolicyEng  := gatewaypolicy.NewEngine(db, rdb, log)
-	ppEngine     := promptpolicy.NewEngine(db, rdb, log)
-	aliasRes     := alias.NewResolver(db, rdb)
+	gwPolicyEng := gatewaypolicy.NewEngine(db, rdb, log)
+	ppEngine := promptpolicy.NewEngine(db, rdb, log)
+	aliasRes := alias.NewResolver(db, rdb)
 	usageTracker := usage.NewTracker(db, rdb, log)
 	teamPolicies := loadTeamPolicies(ctx, db, log)
+
+	// ── Policy live reload every 60s ──────────────────────────────────────────
+	// This ensures policy changes (RPM, TPD, max context) take effect without
+	// restarting the gateway. The map is swapped atomically using a sync.Map
+	// approach through the proxyHandler.
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-t.C:
+				fresh := loadTeamPolicies(watchCtx, db, log)
+				// Re-seed model permissions from DB in case they changed
+				seedModelPermissions(watchCtx, db, policyEngine, log)
+				// Replace the map entries in-place (same underlying map)
+				for k, v := range fresh {
+					teamPolicies[k] = v
+				}
+				// Remove teams that no longer exist
+				for k := range teamPolicies {
+					if _, ok := fresh[k]; !ok {
+						delete(teamPolicies, k)
+					}
+				}
+			}
+		}
+	}()
 
 	// Lifecycle manager — unload endpoints idle for >30 min
 	lifecycleMgr := lifecycle.NewManager(db, rdb, 30*time.Minute, nil, log)
@@ -121,14 +150,23 @@ func main() {
 	// Connects to the admin control plane's task manager via the DB.
 	// The gateway uses it to start models on demand instead of returning 503.
 	taskMgr := taskmanager.NewManager(db, log)
+
+	// ── DB schema validation — fail fast ─────────────────────────────────────
+	// Probes the live database constraint, not migration history.
+	// Catches: migration never ran, ran against wrong DB, partial failure.
+	if err := taskMgr.ValidateSchema(ctx); err != nil {
+		log.Fatal("database schema incompatible — run pending migrations before starting",
+			zap.Error(err),
+		)
+	}
 	rmCfg := runtimemgr.DefaultConfig()
-	rmCfg.DefaultIdleTimeout  = cfg.RuntimeMgr.DefaultIdleTimeout
-	rmCfg.ColdStartTimeout    = cfg.RuntimeMgr.ColdStartTimeout
+	rmCfg.DefaultIdleTimeout = cfg.RuntimeMgr.DefaultIdleTimeout
+	rmCfg.ColdStartTimeout = cfg.RuntimeMgr.ColdStartTimeout
 	rmCfg.DefaultModelsVolume = cfg.RuntimeMgr.DefaultModelsVolume
-	rmCfg.DefaultImage        = cfg.RuntimeMgr.DefaultImage
-	guard     := runtimemgr.NewResourceGuard(db, log)
+	rmCfg.DefaultImage = cfg.RuntimeMgr.DefaultImage
+	guard := runtimemgr.NewResourceGuard(db, log)
 	activator := runtimemgr.NewActivator(db, taskMgr, registry, guard, rmCfg, log)
-	idleMgr   := runtimemgr.NewIdleManager(db, taskMgr, rmCfg, log)
+	idleMgr := runtimemgr.NewIdleManager(db, taskMgr, rmCfg, log).WithActivator(activator)
 	go idleMgr.Start(watchCtx)
 
 	// Usage consumer
@@ -154,7 +192,7 @@ func main() {
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		lifecycleMgr, registry, usageTracker, teamPolicies, log,
-	).WithActivator(activator)
+	).WithActivator(activator).WithDB(db)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -174,15 +212,15 @@ func main() {
 
 	v1 := r.Group("/v1", middleware.AuthRequired(authSvc))
 	{
-		v1.POST("/chat/completions",       proxyHandler.ChatCompletions)
-		v1.POST("/embeddings",             proxyHandler.Embeddings)
-		v1.GET("/models",                  proxyHandler.Models)
+		v1.POST("/chat/completions", proxyHandler.ChatCompletions)
+		v1.POST("/embeddings", proxyHandler.Embeddings)
+		v1.GET("/models", proxyHandler.Models)
 
 		// Multi-service APIs (AI Platform)
-		v1.POST("/rerank",                       proxyHandler.Rerank)
-		v1.POST("/audio/transcriptions",          proxyHandler.Transcriptions)
-		v1.POST("/audio/speech",                  proxyHandler.Speech)
-		v1.POST("/ocr",                           proxyHandler.OCR)
+		v1.POST("/rerank", proxyHandler.Rerank)
+		v1.POST("/audio/transcriptions", proxyHandler.Transcriptions)
+		v1.POST("/audio/speech", proxyHandler.Speech)
+		v1.POST("/ocr", proxyHandler.OCR)
 	}
 
 	// ── Metrics server ────────────────────────────────────────────────────────

@@ -464,6 +464,28 @@ func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
 	// Mark running
 	_ = a.post(ctx, "/agent/v1/tasks/"+task.ID+"/running", map[string]interface{}{}, nil)
 
+	// Touch the runtime row immediately so the gateway knows work is in progress
+	// and doesn't treat it as a stale loading row.
+	var runtimeID string
+	if err := a.getAuth(ctx, "/agent/v1/tasks/"+task.ID+"/runtime-id", &struct {
+		RuntimeID string `json:"runtime_id"`
+	}{}); err == nil {
+		// best-effort — extract runtime_id from task payload instead
+	}
+	// Parse runtime_id from task payload directly
+	var payloadFields struct {
+		RuntimeID string `json:"runtime_id"`
+	}
+	if len(task.Payload) > 0 {
+		_ = json.Unmarshal(task.Payload, &payloadFields)
+		runtimeID = payloadFields.RuntimeID
+	}
+	if runtimeID != "" {
+		_ = a.put(ctx, "/agent/v1/runtimes/"+runtimeID, map[string]interface{}{
+			"state": "loading",
+		}, nil)
+	}
+
 	// Execute
 	result := a.executor.Execute(ctx, task)
 	elapsed := time.Since(start)
@@ -505,14 +527,20 @@ func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
 	} else {
 		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/fail",
 			map[string]interface{}{
-				"error":      result.Error,
-				"runtime_id": result.RuntimeID,
+				"error":         result.Error,
+				"runtime_id":    result.RuntimeID,
+				"runtime_state": result.RuntimeState,
 			}, nil); err != nil {
 			a.log.Warn("failed to report task failure", zap.Error(err))
 		}
 		if result.RuntimeID != "" {
 			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, map[string]interface{}{
-				"state": "failed",
+				"state": func() string {
+					if result.RuntimeState != "" {
+						return result.RuntimeState
+					}
+					return "failed"
+				}(),
 			}, nil)
 		}
 	}

@@ -2,7 +2,8 @@
 // The control plane creates tasks here; the node agent polls and executes them.
 //
 // Task lifecycle:
-//   pending → claimed → running → success | failed | timeout
+//
+//	pending → claimed → running → success | failed | timeout
 //
 // The control plane NEVER executes tasks — it only enqueues them.
 // The node agent NEVER makes placement decisions — it only executes tasks.
@@ -12,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,17 +28,42 @@ import (
 type TaskType string
 
 const (
-	TaskDeployRuntime   TaskType = "DEPLOY_RUNTIME"
-	TaskStopRuntime     TaskType = "STOP_RUNTIME"
-	TaskRestartRuntime  TaskType = "RESTART_RUNTIME"
-	TaskDeleteRuntime   TaskType = "DELETE_RUNTIME"
-	TaskWarmRuntime     TaskType = "WARM_RUNTIME"
-	TaskUnloadRuntime   TaskType = "UNLOAD_RUNTIME"
-	TaskPullModel       TaskType = "PULL_MODEL"
-	TaskDeleteModel     TaskType = "DELETE_MODEL"
-	TaskVerifyModel     TaskType = "VERIFY_MODEL"
+	// TaskStartModel is the single unified startup task type used for ALL model
+	// startup scenarios: initial deploy, cold start, lazy load, re-deploy, warm
+	// restart, and crash recovery. DEPLOY_RUNTIME, WARM_RUNTIME, and RESTART_RUNTIME
+	// are superseded — all callers must use START_MODEL exclusively.
+	TaskStartModel TaskType = "START_MODEL"
+
+	// TaskStopRuntime stops a running container (graceful drain).
+	TaskStopRuntime TaskType = "STOP_RUNTIME"
+
+	// TaskUnloadRuntime stops a container for idle eviction (same as STOP_RUNTIME
+	// but carries distinct semantics for audit/monitoring).
+	TaskUnloadRuntime TaskType = "UNLOAD_RUNTIME"
+
+	// TaskDeleteRuntime removes a container permanently.
+	TaskDeleteRuntime TaskType = "DELETE_RUNTIME"
+
+	// TaskPullModel downloads model weights to the shared cache volume.
+	TaskPullModel TaskType = "PULL_MODEL"
+
+	// TaskDeleteModel removes model weights from the shared cache volume.
+	TaskDeleteModel TaskType = "DELETE_MODEL"
+
+	// TaskVerifyModel verifies checksum and file integrity of cached model weights.
+	TaskVerifyModel TaskType = "VERIFY_MODEL"
+
+	// TaskCollectInventory triggers a hardware inventory snapshot from the agent.
 	TaskCollectInventory TaskType = "COLLECT_INVENTORY"
-	TaskHealthCheck     TaskType = "HEALTH_CHECK"
+
+	// TaskHealthCheck requests an explicit health check report from the agent.
+	TaskHealthCheck TaskType = "HEALTH_CHECK"
+
+	// Deprecated: use TaskStartModel. Kept for backward compatibility during
+	// in-flight task migration only — the executor routes both to startModel().
+	TaskDeployRuntime  TaskType = "DEPLOY_RUNTIME"
+	TaskWarmRuntime    TaskType = "WARM_RUNTIME"
+	TaskRestartRuntime TaskType = "RESTART_RUNTIME"
 )
 
 type TaskStatus string
@@ -55,57 +82,89 @@ const (
 // Task payloads — typed structs for each task type
 // ─────────────────────────────────────────────────────────────────────────────
 
-// DeployRuntimePayload is the payload for DEPLOY_RUNTIME.
-// All placement decisions have already been made by the control plane.
-// The agent just executes.
-type DeployRuntimePayload struct {
-	// Identity
+// StartModelPayload is the single unified payload for ALL model startup
+// scenarios: initial deploy, cold start, lazy load, re-deploy, warm restart,
+// and crash recovery.  Every caller — admin handler, activator, idle manager,
+// preemption engine, recovery watchdog — must use this struct with
+// TaskStartModel.  The node agent executes the complete startup pipeline from
+// this payload alone.
+//
+// Startup pipeline executed by the agent:
+//
+//	CREATED → VALIDATING → DOWNLOADING → STARTING →
+//	LOADING_MODEL → WAITING_READY → READY
+type StartModelPayload struct {
+	// ── Identity ──────────────────────────────────────────────────────────
 	RuntimeID   string `json:"runtime_id"`   // agent_runtimes.id
-	EndpointID  string `json:"endpoint_id"`
-	ModelID     string `json:"model_id"`
-	RuntimeName string `json:"runtime_name"` // Docker container name
+	EndpointID  string `json:"endpoint_id"`  // model_endpoints.id (for state sync)
+	ModelID     string `json:"model_id"`     // models.id UUID
+	RuntimeName string `json:"runtime_name"` // Docker container name, e.g. "nexus-gemma-2"
 
-	// What to run
-	Backend     string   `json:"backend"`      // vllm | ollama | tgi | cpu_native | llamacpp
-	Image       string   `json:"image"`
-	ModelName   string   `json:"model_name"`   // HF model ID
-	ServedAs    string   `json:"served_as"`    // short routing name
+	// ── Container ─────────────────────────────────────────────────────────
+	Backend   string `json:"backend"`             // llamacpp | vllm | ollama | tgi | cpu_native
+	Image     string `json:"image"`               // full Docker image reference
+	ModelName string `json:"model_name"`          // routing / served-as name
+	ServedAs  string `json:"served_as,omitempty"` // alternate served model name (vLLM)
 
-	// Network
+	// ── Network ───────────────────────────────────────────────────────────
 	BindHost string `json:"bind_host"`
 	BindPort int    `json:"bind_port"`
 
-	// Resources — assigned by control plane, NOT the agent
-	GPUDevices     []int  `json:"gpu_devices"`      // [0] or [0,1]
-	CPUSetCPUs     string `json:"cpuset_cpus"`      // "0-31"
-	NUMANode       int    `json:"numa_node"`        // -1 = no affinity
-	MemoryLimit    string `json:"memory_limit"`     // "64g"
-	CPULimit       string `json:"cpu_limit"`        // "4"
+	// ── Resources (assigned by control plane — agent must not override) ───
+	GPUDevices  []int  `json:"gpu_devices"`  // [] = CPU-only
+	CPUSetCPUs  string `json:"cpuset_cpus"`  // "0-31"
+	NUMANode    int    `json:"numa_node"`    // -1 = no affinity
+	MemoryLimit string `json:"memory_limit"` // docker --memory, e.g. "8g"
+	CPULimit    string `json:"cpu_limit"`    // --cpus value or thread count
 
-	// Backend-specific
-	TensorParallel int     `json:"tensor_parallel"`
-	GPUMemoryUtil  float64 `json:"gpu_memory_util"`
-	MaxModelLen    int     `json:"max_model_len"`
-	Dtype          string  `json:"dtype"`
-	Quantization   string  `json:"quantization"`
-	ExtraArgs      []string `json:"extra_args"`
-	Env            map[string]string `json:"env"`
-	HFToken        string  `json:"hf_token,omitempty"`
+	// ── Model source (llamacpp) ───────────────────────────────────────────
+	// Resolution priority: GGUFPath > HFRepo+HFFile > HFRepo alone.
+	// Legacy LlamaCpp* prefixed fields are aliases decoded by the executor.
+	GGUFPath     string `json:"gguf_path,omitempty"`     // "/models/gemma-2b-Q4_K_M.gguf"
+	HFRepo       string `json:"hf_repo,omitempty"`       // "bartowski/gemma-2-2b-it-GGUF"
+	HFFile       string `json:"hf_file,omitempty"`       // "gemma-2-2b-it-Q4_K_M.gguf"
+	HFToken      string `json:"hf_token,omitempty"`      // for gated repos
+	ModelsVolume string `json:"models_volume,omitempty"` // named vol or absolute host path
 
-	// ── llamacpp-specific ──────────────────────────────────────────────────
-	// LlamaCppModelPath: local GGUF path inside the container.
-	// Pre-populate the volume with PULL_MODEL before deploying.
-	LlamaCppModelPath string `json:"llamacpp_model_path,omitempty"`
-	// LlamaCppHFRepo + LlamaCppHFFile: download GGUF from HF at container startup.
-	LlamaCppHFRepo string `json:"llamacpp_hf_repo,omitempty"`
-	LlamaCppHFFile string `json:"llamacpp_hf_file,omitempty"`
-	// LlamaCppCtxSize overrides the default context window (default: 4096).
-	LlamaCppCtxSize int `json:"llamacpp_ctx_size,omitempty"`
-	// LlamaCppNGPULayers: 0 = CPU-only, -1 = all layers on GPU (default when GPUs assigned).
-	LlamaCppNGPULayers int `json:"llamacpp_n_gpu_layers,omitempty"`
-	// LlamaCppModelsVolume: host path or Docker volume name mounted as /models.
+	// ── llamacpp runtime flags ────────────────────────────────────────────
+	CtxSize    int `json:"ctx_size"`     // --ctx-size (default: 4096)
+	NGPULayers int `json:"n_gpu_layers"` // -1=all GPU, 0=CPU-only
+
+	// ── Execution mode ────────────────────────────────────────────────────
+	// ExecutionMode controls GPU vs CPU deployment.
+	//   "cpu"  — never request GPUs; n_gpu_layers is forced to 0
+	//   "gpu"  — always request GPUs; fail if unavailable
+	//   "auto" — agent detects node GPU capability and resolves at runtime
+	//            (prefers GPU, falls back to CPU)
+	// Empty string is treated as "auto" for backward compatibility.
+	ExecutionMode string `json:"execution_mode,omitempty"` // cpu | gpu | auto
+
+	// ── vLLM / TGI / generic backend args ────────────────────────────────
+	TensorParallel int               `json:"tensor_parallel,omitempty"`
+	GPUMemoryUtil  float64           `json:"gpu_memory_util,omitempty"`
+	MaxModelLen    int               `json:"max_model_len,omitempty"`
+	Dtype          string            `json:"dtype,omitempty"`
+	Quantization   string            `json:"quantization,omitempty"`
+	ExtraArgs      []string          `json:"extra_args,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+
+	// ── Legacy field aliases (DEPLOY_RUNTIME backward compat) ────────────
+	// The executor reads these as fallbacks when the canonical fields above
+	// are empty. New callers must use the canonical fields.
+	LlamaCppModelPath    string `json:"llamacpp_model_path,omitempty"`
+	LlamaCppHFRepo       string `json:"llamacpp_hf_repo,omitempty"`
+	LlamaCppHFFile       string `json:"llamacpp_hf_file,omitempty"`
+	LlamaCppCtxSize      int    `json:"llamacpp_ctx_size,omitempty"`
+	LlamaCppNGPULayers   int    `json:"llamacpp_n_gpu_layers,omitempty"`
 	LlamaCppModelsVolume string `json:"llamacpp_models_volume,omitempty"`
 }
+
+// DeployRuntimePayload is an alias kept for backward compatibility with any
+// in-flight DEPLOY_RUNTIME tasks already in the queue.  New code must use
+// StartModelPayload with TaskStartModel exclusively.
+//
+// Deprecated: use StartModelPayload.
+type DeployRuntimePayload = StartModelPayload
 
 // StopRuntimePayload is the payload for STOP_RUNTIME.
 type StopRuntimePayload struct {
@@ -114,14 +173,19 @@ type StopRuntimePayload struct {
 	DrainSecs   int    `json:"drain_secs"` // graceful drain window
 }
 
-// WarmRuntimePayload is the payload for WARM_RUNTIME.
-// The container already exists (was stopped); the agent runs `docker start`.
+// WarmRuntimePayload is deprecated. Use StartModelPayload with TaskStartModel.
+// Kept for backward compatibility with in-flight tasks only.
+//
+// Deprecated: use StartModelPayload.
 type WarmRuntimePayload struct {
 	RuntimeID   string `json:"runtime_id"`
 	ContainerID string `json:"container_id"`
 }
 
-// RestartRuntimePayload for RESTART_RUNTIME.
+// RestartRuntimePayload is deprecated. Use StartModelPayload with TaskStartModel.
+// Kept for backward compatibility with in-flight tasks only.
+//
+// Deprecated: use StartModelPayload.
 type RestartRuntimePayload struct {
 	RuntimeID   string `json:"runtime_id"`
 	ContainerID string `json:"container_id"`
@@ -137,7 +201,7 @@ type DeleteRuntimePayload struct {
 // PullModelPayload for PULL_MODEL.
 type PullModelPayload struct {
 	ModelID   string `json:"model_id"`
-	HFRepo    string `json:"hf_repo"`    // e.g. "Qwen/Qwen3-32B-Instruct"
+	HFRepo    string `json:"hf_repo"` // e.g. "Qwen/Qwen3-32B-Instruct"
 	HFToken   string `json:"hf_token,omitempty"`
 	LocalPath string `json:"local_path,omitempty"`
 	Backend   string `json:"backend"` // which backend manages this model's cache
@@ -154,24 +218,24 @@ type HealthCheckPayload struct {
 
 // Task is a unit of work the control plane dispatches to a node agent.
 type Task struct {
-	ID             string     `db:"id"              json:"id"`
-	NodeID         string     `db:"node_id"         json:"node_id"`
-	TaskType       TaskType   `db:"task_type"       json:"task_type"`
-	Payload        []byte     `db:"payload"         json:"-"`
-	PayloadRaw     json.RawMessage `json:"payload"`    // raw JSON — not a string
-	Status         TaskStatus `db:"status"          json:"status"`
-	Priority       int        `db:"priority"        json:"priority"`
-	CreatedBy      string     `db:"created_by"      json:"created_by"`
-	CreatedAt      time.Time  `db:"created_at"      json:"created_at"`
-	ClaimedAt      *time.Time `db:"claimed_at"      json:"claimed_at,omitempty"`
-	StartedAt      *time.Time `db:"started_at"      json:"started_at,omitempty"`
-	CompletedAt    *time.Time `db:"completed_at"    json:"completed_at,omitempty"`
-	TimeoutAt      *time.Time `db:"timeout_at"      json:"timeout_at,omitempty"`
-	Result         []byte     `db:"result"          json:"-"`
-	ResultJSON     string     `json:"result,omitempty"`
-	ErrorMsg       string     `db:"error_msg"       json:"error_msg,omitempty"`
-	RuntimeID      string     `db:"runtime_id"      json:"runtime_id,omitempty"`
-	IdempotencyKey string     `db:"idempotency_key" json:"idempotency_key,omitempty"`
+	ID             string          `db:"id"              json:"id"`
+	NodeID         string          `db:"node_id"         json:"node_id"`
+	TaskType       TaskType        `db:"task_type"       json:"task_type"`
+	Payload        []byte          `db:"payload"         json:"-"`
+	PayloadRaw     json.RawMessage `json:"payload"` // raw JSON — not a string
+	Status         TaskStatus      `db:"status"          json:"status"`
+	Priority       int             `db:"priority"        json:"priority"`
+	CreatedBy      string          `db:"created_by"      json:"created_by"`
+	CreatedAt      time.Time       `db:"created_at"      json:"created_at"`
+	ClaimedAt      *time.Time      `db:"claimed_at"      json:"claimed_at,omitempty"`
+	StartedAt      *time.Time      `db:"started_at"      json:"started_at,omitempty"`
+	CompletedAt    *time.Time      `db:"completed_at"    json:"completed_at,omitempty"`
+	TimeoutAt      *time.Time      `db:"timeout_at"      json:"timeout_at,omitempty"`
+	Result         []byte          `db:"result"          json:"-"`
+	ResultJSON     string          `json:"result,omitempty"`
+	ErrorMsg       string          `db:"error_msg"       json:"error_msg,omitempty"`
+	RuntimeID      string          `db:"runtime_id"      json:"runtime_id,omitempty"`
+	IdempotencyKey string          `db:"idempotency_key" json:"idempotency_key,omitempty"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +251,117 @@ type Manager struct {
 // NewManager constructs a task Manager.
 func NewManager(db *sqlx.DB, log *zap.Logger) *Manager {
 	return &Manager{db: db, log: log}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema validation — fail fast on startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+// requiredTaskTypes lists every task type the control plane may enqueue.
+// If any of these are missing from the live DB constraint, startup must abort.
+var requiredTaskTypes = []string{
+	"START_MODEL",
+	"DEPLOY_RUNTIME",
+	"STOP_RUNTIME",
+	"RESTART_RUNTIME",
+	"DELETE_RUNTIME",
+	"WARM_RUNTIME",
+	"UNLOAD_RUNTIME",
+	"PULL_MODEL",
+	"DELETE_MODEL",
+	"VERIFY_MODEL",
+	"COLLECT_INVENTORY",
+	"HEALTH_CHECK",
+}
+
+// SchemaValidationError is returned by ValidateSchema when the DB is incompatible.
+type SchemaValidationError struct {
+	MissingTypes  []string // task types absent from the live constraint
+	ConstraintDef string   // raw constraint definition from pg_get_constraintdef
+	ConnectedDB   string   // current_database() at the time of the check
+	SearchPath    string   // current search_path
+}
+
+func (e *SchemaValidationError) Error() string {
+	return fmt.Sprintf(
+		"database schema incompatible: task types %v missing from agent_tasks_task_type_check\n"+
+			"  connected_database : %s\n"+
+			"  search_path        : %s\n"+
+			"  constraint_def     : %s\n"+
+			"  fix               : apply migration 013_start_model_task_type.sql against this database",
+		e.MissingTypes, e.ConnectedDB, e.SearchPath, e.ConstraintDef,
+	)
+}
+
+// ValidateSchema probes the live database to confirm that the
+// agent_tasks_task_type_check constraint contains every required task type.
+//
+// It queries pg_constraint directly — not migration history files — so it
+// correctly detects the case where migrations ran against a different database
+// instance, partial migration failures, or constraint recreation bugs.
+//
+// Call this at startup before the service begins accepting traffic.
+// Returns *SchemaValidationError with full diagnostic context on failure.
+func (m *Manager) ValidateSchema(ctx context.Context) error {
+	// Gather diagnostic context first so the error message is always complete.
+	var connectedDB, searchPath string
+	_ = m.db.QueryRowContext(ctx, `SELECT current_database(), current_setting('search_path')`).
+		Scan(&connectedDB, &searchPath)
+
+	// Fetch the raw constraint definition from the catalog.
+	// pg_get_constraintdef returns the full CHECK(...) expression as text.
+	var constraintDef string
+	err := m.db.QueryRowContext(ctx, `
+		SELECT COALESCE(pg_get_constraintdef(c.oid), '')
+		FROM pg_constraint c
+		JOIN pg_class     t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE t.relname  = 'agent_tasks'
+		  AND c.conname  = 'agent_tasks_task_type_check'
+		  AND n.nspname  = current_schema()`).Scan(&constraintDef)
+	if err != nil || constraintDef == "" {
+		return &SchemaValidationError{
+			MissingTypes:  requiredTaskTypes,
+			ConstraintDef: "(constraint not found — migration 007 may not have run)",
+			ConnectedDB:   connectedDB,
+			SearchPath:    searchPath,
+		}
+	}
+
+	// Check each required type against the constraint text.
+	var missing []string
+	for _, t := range requiredTaskTypes {
+		// The constraint def looks like: CHECK (task_type = ANY (ARRAY['START_MODEL'::text, ...]))
+		// or:                            CHECK ((task_type)::text = ANY (ARRAY[...]))
+		// A simple substring match on the quoted name is reliable for both forms.
+		if !containsTaskType(constraintDef, t) {
+			missing = append(missing, t)
+		}
+	}
+
+	if len(missing) > 0 {
+		return &SchemaValidationError{
+			MissingTypes:  missing,
+			ConstraintDef: constraintDef,
+			ConnectedDB:   connectedDB,
+			SearchPath:    searchPath,
+		}
+	}
+
+	m.log.Info("schema validation passed",
+		zap.String("database", connectedDB),
+		zap.Int("required_task_types", len(requiredTaskTypes)),
+	)
+	return nil
+}
+
+// containsTaskType checks whether the raw constraint definition string
+// contains the given task type as a quoted literal (e.g. 'START_MODEL').
+func containsTaskType(constraintDef, taskType string) bool {
+	// Match both single-quoted form ('START_MODEL') used in CHECK IN(...)
+	// and double-colon cast form ('START_MODEL'::text) used in ANY(ARRAY[...]).
+	needle := "'" + taskType + "'"
+	return strings.Contains(constraintDef, needle)
 }
 
 // Enqueue creates a new task for a node. Returns the task ID.

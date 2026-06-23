@@ -1,25 +1,37 @@
+import Link from 'next/link'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { api } from '@/lib/api'
 import { Cpu, Users, Server, Box, Network, Activity } from 'lucide-react'
 
+const ADMIN = process.env.NEXUS_ADMIN_URL ?? 'http://localhost:8081/admin/v1'
+
+async function fetchJSON(path: string) {
+  try {
+    const res = await fetch(`${ADMIN}${path}`, { cache: 'no-store' })
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
+  }
+}
+
 async function getStats() {
-  const [orgs, teams, models, services, nodes, gpuNodes] = await Promise.allSettled([
-    api.orgs.list(),
-    api.teams.list(),
-    api.models.list(),
-    api.services.list(),
-    api.nodes.list(),
-    api.gpu.listNodes(),
+  const [orgs, teams, models, services, nodes, gpuNodes] = await Promise.all([
+    fetchJSON('/orgs'),
+    fetchJSON('/teams'),
+    fetchJSON('/models'),
+    fetchJSON('/services'),
+    fetchJSON('/nodes'),
+    fetchJSON('/gpu/nodes'),
   ])
   return {
-    orgs:      orgs.status     === 'fulfilled' ? orgs.value.total      : 0,
-    teams:     teams.status    === 'fulfilled' ? teams.value.total     : 0,
-    models:    models.status   === 'fulfilled' ? models.value.total    : 0,
-    services:  services.status === 'fulfilled' ? services.value.total  : 0,
-    nodes:     nodes.status    === 'fulfilled' ? nodes.value.total     : 0,
-    gpuNodes:  gpuNodes.status === 'fulfilled' ? gpuNodes.value.total  : 0,
-    modelList: models.status   === 'fulfilled' ? models.value.data     : [],
-    nodeList:  nodes.status    === 'fulfilled' ? nodes.value.data      : [],
+    orgs:      orgs?.total      ?? 0,
+    teams:     teams?.total     ?? 0,
+    models:    models?.total    ?? 0,
+    services:  services?.total  ?? 0,
+    nodes:     nodes?.total     ?? 0,
+    gpuNodes:  gpuNodes?.total  ?? 0,
+    modelList: models?.data     ?? [],
+    nodeList:  nodes?.data      ?? [],
   }
 }
 
@@ -128,7 +140,7 @@ export default async function DashboardPage() {
           <CardContent>
             {stats.nodeList.length === 0 ? (
               <div className="text-center py-6 text-muted-foreground">
-                <p className="text-sm">No nodes registered — run migrations 005+006 to seed the H200 node.</p>
+                <p className="text-sm">No nodes registered — start the node agent on your server or register one via <strong>Cluster Nodes</strong>.</p>
               </div>
             ) : (
               <table className="w-full text-sm">
