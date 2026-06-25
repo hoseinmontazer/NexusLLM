@@ -46,20 +46,20 @@ const (
 
 // ServiceRecord is the full view of a registered AI service.
 type ServiceRecord struct {
-	ID          string     `db:"id"           json:"id"`
-	Name        string     `db:"name"         json:"name"`
-	DisplayName string     `db:"display_name" json:"display_name"`
-	ServiceType string     `db:"service_type" json:"service_type"`
-	RuntimeType string     `db:"runtime_type" json:"runtime_type"`
-	BackendType string     `db:"backend_type" json:"backend_type"`
-	Provider    string     `db:"provider"     json:"provider"`
-	MaxContext  int        `db:"max_context"  json:"max_context"`
-	MaxOutput   int        `db:"max_output"   json:"max_output"`
-	Enabled     bool       `db:"enabled"      json:"enabled"`
-	Tags        []byte     `db:"tags"         json:"-"`
-	TagsJSON    string     `json:"tags"`
-	CreatedAt   time.Time  `db:"created_at"   json:"created_at"`
-	UpdatedAt   time.Time  `db:"updated_at"   json:"updated_at"`
+	ID          string    `db:"id"           json:"id"`
+	Name        string    `db:"name"         json:"name"`
+	DisplayName string    `db:"display_name" json:"display_name"`
+	ServiceType string    `db:"service_type" json:"service_type"`
+	RuntimeType string    `db:"runtime_type" json:"runtime_type"`
+	BackendType string    `db:"backend_type" json:"backend_type"`
+	Provider    string    `db:"provider"     json:"provider"`
+	MaxContext  int       `db:"max_context"  json:"max_context"`
+	MaxOutput   int       `db:"max_output"   json:"max_output"`
+	Enabled     bool      `db:"enabled"      json:"enabled"`
+	Tags        []byte    `db:"tags"         json:"-"`
+	TagsJSON    string    `json:"tags"`
+	CreatedAt   time.Time `db:"created_at"   json:"created_at"`
+	UpdatedAt   time.Time `db:"updated_at"   json:"updated_at"`
 
 	// Joined fields
 	EndpointCount int `db:"endpoint_cnt" json:"endpoint_count"`
@@ -81,12 +81,12 @@ type RegisterRequest struct {
 	Tags        []string `json:"tags"`
 
 	// Resource reservation
-	MinVRAMMB   int64  `json:"min_vram_mb"`
-	MaxVRAMMB   int64  `json:"max_vram_mb"`
-	CPUCores    int    `json:"cpu_cores"`
-	NUMANode    int    `json:"numa_node"`
-	RAMMBLimit  int64  `json:"ram_mb"`
-	Priority    string `json:"priority"`
+	MinVRAMMB      int64 `json:"min_vram_mb"`
+	MaxVRAMMB      int64 `json:"max_vram_mb"`
+	CPUCores       int   `json:"cpu_cores"`
+	NUMANode       int   `json:"numa_node"`
+	RAMMBLimit     int64 `json:"ram_mb"`
+	PriorityWeight int   `json:"priority_weight"` // 0–1000; default 500
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,8 +125,8 @@ func (r *Registry) Register(ctx context.Context, req RegisterRequest) (modelID, 
 	if req.MaxOutput == 0 {
 		req.MaxOutput = 4096
 	}
-	if req.Priority == "" {
-		req.Priority = "normal"
+	if req.PriorityWeight == 0 {
+		req.PriorityWeight = 500 // Standard
 	}
 	if req.NUMANode == 0 && req.CPUCores == 0 {
 		req.NUMANode = -1
@@ -175,23 +175,26 @@ func (r *Registry) Register(ctx context.Context, req RegisterRequest) (modelID, 
 
 	// ── 4. Resource reservation ────────────────────────────────────────────
 	if req.MinVRAMMB > 0 || req.CPUCores > 0 || req.RAMMBLimit > 0 {
+		// Convert numeric weight to legacy priority string for resource_reservations.priority
+		// (that column predates the weighted system; scheduling uses projects.priority_weight)
+		legacyPriority := weightToLegacyPriority(req.PriorityWeight)
 		_, _ = r.db.ExecContext(ctx, `
 			INSERT INTO resource_reservations
 			  (id, model_id, min_vram_mb, max_vram_mb, cpu_cores,
 			   numa_node_pref, ram_mb, priority, preferred_runtime)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			ON CONFLICT (model_id) DO UPDATE SET
-			  min_vram_mb = EXCLUDED.min_vram_mb,
-			  max_vram_mb = EXCLUDED.max_vram_mb,
-			  cpu_cores   = EXCLUDED.cpu_cores,
+			  min_vram_mb    = EXCLUDED.min_vram_mb,
+			  max_vram_mb    = EXCLUDED.max_vram_mb,
+			  cpu_cores      = EXCLUDED.cpu_cores,
 			  numa_node_pref = EXCLUDED.numa_node_pref,
-			  ram_mb      = EXCLUDED.ram_mb,
-			  priority    = EXCLUDED.priority,
-			  updated_at  = NOW()`,
+			  ram_mb         = EXCLUDED.ram_mb,
+			  priority       = EXCLUDED.priority,
+			  updated_at     = NOW()`,
 			uuid.New().String(), mID,
 			req.MinVRAMMB, req.MaxVRAMMB,
 			req.CPUCores, req.NUMANode,
-			req.RAMMBLimit, req.Priority, req.RuntimeType,
+			req.RAMMBLimit, legacyPriority, req.RuntimeType,
 		)
 	}
 
@@ -359,4 +362,23 @@ func tagsJSON(tags []string) string {
 		b += `"` + t + `"`
 	}
 	return b + "]"
+}
+
+// weightToLegacyPriority converts a numeric priority_weight [0–1000] to the
+// nearest legacy priority string used by resource_reservations.priority.
+// The resource_reservations table predates the weighted system and still stores
+// the old 5-tier enum. Scheduling decisions use projects.priority_weight directly.
+func weightToLegacyPriority(w int) string {
+	switch {
+	case w >= 900:
+		return "critical"
+	case w >= 700:
+		return "high"
+	case w >= 300:
+		return "normal"
+	case w >= 100:
+		return "low"
+	default:
+		return "best_effort"
+	}
 }

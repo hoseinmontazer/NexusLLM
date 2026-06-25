@@ -295,6 +295,17 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 				UPDATE agent_runtimes SET container_id=$1, updated_at=NOW() WHERE id=$2`,
 				containerID, runtimeID)
 		}
+		// If the agent resolved/downloaded a GGUF file, persist the path so the
+		// next container start uses the cached volume file instead of re-downloading.
+		if ggufPath, ok := result["gguf_path"].(string); ok && ggufPath != "" {
+			// Persist to model_runtime_configs for all future starts of this model.
+			_, _ = h.db.ExecContext(c.Request.Context(), `
+				UPDATE model_runtime_configs
+				SET gguf_path = $1, updated_at = NOW()
+				WHERE model_id = (SELECT model_id FROM agent_runtimes WHERE id = $2)
+				  AND (gguf_path IS NULL OR gguf_path = '')`,
+				ggufPath, runtimeID)
+		}
 	}
 
 	// For UNLOAD_RUNTIME tasks: transition runtime to stopped and re-enable

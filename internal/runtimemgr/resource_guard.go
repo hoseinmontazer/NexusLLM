@@ -84,16 +84,16 @@ func (g *ResourceGuard) CanStart(ctx context.Context, nodeID string, req Resourc
 			// We subtract this from the raw free VRAM so lower-priority callers cannot
 			// consume resources that belong to higher-priority projects.
 			var reservedForHigherPriority int64
-			if req.ProjectPriority != "" {
+			if req.ProjectPriorityWeight > 0 {
 				_ = g.db.GetContext(ctx, &reservedForHigherPriority, `
 					SELECT COALESCE(SUM(pr.reserved_vram_mb), 0)
 					FROM project_reservations pr
 					JOIN projects p ON p.id = pr.project_id
 					JOIN agent_runtimes ar ON ar.project_id = p.id AND ar.node_id = $1
-					WHERE project_priority_score(p.priority) >= project_priority_score($2::varchar)
+					WHERE p.priority_weight >= $2
 					  AND p.id::text != COALESCE($3, '')
 					  AND ar.state IN ('active','warm','idle','loading')`,
-					nodeID, req.ProjectPriority, req.ProjectID)
+					nodeID, req.ProjectPriorityWeight, req.ProjectID)
 			}
 
 			// Build a map of device_index → free VRAM (minus reserved headroom, proportioned)

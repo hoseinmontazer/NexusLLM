@@ -1,6 +1,7 @@
 // Package proxy handles OpenAI-compatible inference requests.
 // Request pipeline:
-//   Auth → Gateway Policy → Alias Resolution → Prompt Policy → Registry → Activator (on miss) → Backend
+//
+//	Auth → Gateway Policy → Alias Resolution → Prompt Policy → Registry → Activator (on miss) → Backend
 package proxy
 
 import (
@@ -243,9 +244,61 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: ep.URL}
 
 	if req.Stream {
-		h.streamChat(c, claims, req, chatReq, backend, ep, start)
+		// For streaming, try up to maxFailoverAttempts endpoints.
+		// If the first one is unreachable (connection refused), mark it down
+		// and retry with the next healthy endpoint.
+		for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
+			if attempt > 0 {
+				// Previous endpoint failed — re-resolve to get a different one.
+				ep2, b2, rerr := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
+				if rerr != nil {
+					break // no more healthy endpoints
+				}
+				ep = ep2
+				backend = b2
+				chatReq.EndpointURL = ep.URL
+			}
+			if !h.streamChat(c, claims, req, chatReq, backend, ep, start) {
+				// Connection-level error — mark endpoint down and try again.
+				h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, req.Model, runtime.EndpointHealth{
+					Status:    runtime.StatusDown,
+					CheckedAt: time.Now(),
+					Error:     "connection refused on inference request",
+				})
+				ep.SetStatus(runtime.StatusDown)
+				continue
+			}
+			return
+		}
+		// All attempts failed or already written — nothing more to do.
 	} else {
-		h.syncChat(c, claims, req, chatReq, backend, ep, start)
+		// Sync path: try up to maxFailoverAttempts endpoints.
+		for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
+			if attempt > 0 {
+				ep2, b2, rerr := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
+				if rerr != nil {
+					abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint",
+						"all endpoints unreachable after upstream failures")
+					return
+				}
+				ep = ep2
+				backend = b2
+				chatReq.EndpointURL = ep.URL
+			}
+			done := h.syncChat(c, claims, req, chatReq, backend, ep, start)
+			if done {
+				return
+			}
+			// Connection-level failure — mark this endpoint down and try next.
+			h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, req.Model, runtime.EndpointHealth{
+				Status:    runtime.StatusDown,
+				CheckedAt: time.Now(),
+				Error:     "connection refused on inference request",
+			})
+			ep.SetStatus(runtime.StatusDown)
+		}
+		abortErr(c, http.StatusBadGateway, "upstream_error",
+			"all available endpoints returned connection errors")
 	}
 }
 
@@ -342,17 +395,21 @@ func (h *Handler) syncChat(
 	backend runtime.Backend,
 	ep *runtime.Endpoint,
 	start time.Time,
-) {
+) (ok bool) {
 	resp, err := backend.Chat(c.Request.Context(), chatReq)
 	if err != nil {
+		// Distinguish connection-level failures (retry-able) from upstream errors.
+		if isConnectError(err) {
+			return false // caller will mark endpoint down and retry
+		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
-		return
+		return true // wrote response, do not retry
 	}
 
 	var chatResp models.ChatCompletionResponse
 	if err := json.Unmarshal(resp.Body, &chatResp); err != nil {
 		abortErr(c, http.StatusBadGateway, "parse_error", "Failed to parse upstream response")
-		return
+		return true
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
@@ -370,6 +427,7 @@ func (h *Handler) syncChat(
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 	})
 	c.JSON(resp.StatusCode, chatResp)
+	return true
 }
 
 func (h *Handler) streamChat(
@@ -380,15 +438,18 @@ func (h *Handler) streamChat(
 	backend runtime.Backend,
 	ep *runtime.Endpoint,
 	start time.Time,
-) {
+) (ok bool) {
 	resp, err := backend.Chat(c.Request.Context(), chatReq)
 	if err != nil {
+		if isConnectError(err) {
+			return false // caller will mark endpoint down and retry
+		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
-		return
+		return true
 	}
 	if resp.Stream == nil {
 		abortErr(c, http.StatusBadGateway, "no_stream", "Backend did not return a stream")
-		return
+		return true
 	}
 	defer resp.Stream.Close()
 
@@ -444,6 +505,24 @@ func (h *Handler) streamChat(
 		LatencyMs:        latencyMs, Status: "success",
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 	})
+	return true
+}
+
+// isConnectError returns true for connection-refused and similar network errors
+// that indicate the upstream server is not reachable (as opposed to returning
+// an HTTP error code). These errors are safe to retry on a different endpoint.
+func isConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "connect: connection refused") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded")
 }
 
 func (h *Handler) teamPolicy(teamID string) *policy.TeamPolicy {

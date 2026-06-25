@@ -161,17 +161,26 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 	}
 
 	// Step 2: Resource pre-flight (RAM / VRAM).
-	ramMB := a.estimateRAMMB(cfg)
-	if guardErr := a.guard.CanStart(ctx, cfg.NodeID, ResourceRequest{
-		ModelName:   modelName,
-		RAMMBNeeded: ramMB,
-		GPUDevices:  cfg.GPUDevices,
-	}); guardErr != nil {
-		return nil, guardErr
+	// Only check the configured node when it is actually online. If the original
+	// endpoint node is offline, skip the guard — a new HA replica may already be
+	// starting on a different node.
+	configuredNodeOnline := a.isNodeOnline(ctx, cfg.NodeID)
+	if cfg.NodeID != "" && configuredNodeOnline {
+		ramMB := a.estimateRAMMB(cfg)
+		if guardErr := a.guard.CanStart(ctx, cfg.NodeID, ResourceRequest{
+			ModelName:   modelName,
+			RAMMBNeeded: ramMB,
+			GPUDevices:  cfg.GPUDevices,
+		}); guardErr != nil {
+			return nil, guardErr
+		}
 	}
 
 	// Step 3: Inspect existing runtime row.
-	rt, _ := a.loadRuntime(ctx, cfg.ModelID, cfg.NodeID)
+	// Pass "" as nodeID so loadRuntime searches ALL online nodes — this finds
+	// HA-reconciler-created replicas that may be on a different node than the
+	// one recorded in model_endpoints.
+	rt, _ := a.loadRuntime(ctx, cfg.ModelID, "")
 	state := a.deriveState(rt)
 
 	a.log.Info("StartModel",
@@ -189,24 +198,39 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 		// Registry stale — fall through to wait.
 
 	case StateCreated, StateLoadingModel, StateStarting, StateValidating, StateDownloading, StateWaitingReady:
-		// A START_MODEL task is already in flight — check if the row is stale.
-		var updatedAt time.Time
-		dbErr := a.db.QueryRowContext(ctx,
-			`SELECT updated_at FROM agent_runtimes WHERE id = $1`, rt.ID,
-		).Scan(&updatedAt)
-		// Use ColdStartTimeout as the stale threshold, not an arbitrary 2 minutes.
-		// A model download + load can legitimately take many minutes.
-		staleThreshold := a.cfg.ColdStartTimeout
-		isStale := dbErr != nil || time.Since(updatedAt) > staleThreshold
+		// A START_MODEL task is already in flight.
+		// Stale detection: check how long ago the runtime entered its CURRENT state.
+		// We query state_updated_at (or fall back to updated_at) to avoid being fooled
+		// by heartbeat-driven updated_at refreshes that don't change state.
+		var stateEnteredAt time.Time
+		_ = a.db.QueryRowContext(ctx, `
+			SELECT COALESCE(started_at, updated_at, created_at)
+			FROM agent_runtimes WHERE id = $1`, rt.ID,
+		).Scan(&stateEnteredAt)
+		if stateEnteredAt.IsZero() {
+			stateEnteredAt = time.Now()
+		}
 
-		if isStale {
+		staleThreshold := a.cfg.ColdStartTimeout
+		// For loading_model specifically, use a tighter threshold — if it's been
+		// loading for longer than ColdStartTimeout/2, it's stuck.
+		if state == StateLoadingModel || state == StateWaitingReady {
+			staleThreshold = a.cfg.ColdStartTimeout / 2
+		}
+		isStale := time.Since(stateEnteredAt) > staleThreshold
+
+		// If the runtime is on a different (online) node than cfg, the HA reconciler
+		// started a replacement replica — never reset or re-enqueue, just wait.
+		onDifferentOnlineNode := rt.NodeID != "" && rt.NodeID != cfg.NodeID && a.isNodeOnline(ctx, rt.NodeID)
+
+		if isStale && !onDifferentOnlineNode {
 			a.log.Warn("startup stalled — resetting and re-enqueueing START_MODEL",
 				zap.String("model", modelName),
 				zap.String("state", string(state)),
-				zap.Duration("stale_for", time.Since(updatedAt)),
+				zap.Duration("stale_for", time.Since(stateEnteredAt)),
 			)
 			_, _ = a.db.ExecContext(ctx,
-				`UPDATE agent_runtimes SET state='stopped', container_id='', updated_at=NOW() WHERE id=$1`, rt.ID)
+				`UPDATE agent_runtimes SET state='failed', error_msg='startup stalled — gateway reset', container_id='', updated_at=NOW() WHERE id=$1`, rt.ID)
 			if err := a.enqueueStartModel(ctx, cfg); err != nil {
 				return nil, err
 			}
@@ -214,7 +238,10 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 			a.log.Info("START_MODEL already in flight — waiting",
 				zap.String("model", modelName),
 				zap.String("state", string(state)),
-				zap.Duration("in_flight_for", time.Since(updatedAt)),
+				zap.String("runtime_node", rt.NodeID),
+				zap.Bool("ha_replica_on_different_node", onDifferentOnlineNode),
+				zap.Duration("in_state_for", time.Since(stateEnteredAt)),
+				zap.Duration("stale_threshold", staleThreshold),
 			)
 			// Do NOT enqueue a new task — just wait for the existing one.
 		}
@@ -231,8 +258,9 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 	// Step 4: Poll until READY (all four conditions satisfied).
 	ep, waitErr := a.waitForReady(ctx, cfg, startTime)
 	if waitErr != nil {
-		// If the runtime transitioned to failed, retry once.
-		if rt2, loadErr := a.loadRuntime(ctx, cfg.ModelID, cfg.NodeID); loadErr == nil && rt2.State == "failed" {
+		// If the runtime transitioned to failed, retry once — but only if we can
+		// find a node to start it on.
+		if rt2, loadErr := a.loadRuntime(ctx, cfg.ModelID, ""); loadErr == nil && rt2.State == "failed" {
 			a.log.Warn("startup failed — retrying START_MODEL once",
 				zap.String("model", modelName),
 				zap.Error(waitErr),
@@ -348,14 +376,18 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	// rows (e.g. no matching model_endpoints row) we must detect that and fail
 	// with a clear error rather than silently orphaning runtimeID (which would
 	// cause an FK violation when the task references it).
+	workloadPolicy := cfg.WorkloadPolicy
+	if workloadPolicy == "" {
+		workloadPolicy = "lazy_load" // default for LLMs
+	}
 	res, err := a.db.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
-		   requested_mode, effective_mode)
+		   requested_mode, effective_mode, workload_policy)
 		SELECT $1, $2, me.id, $3, $4, $8, 'pending',
 		       $7::jsonb, me.host, me.port, $5, $6,
-		       $9, $10
+		       $9, $10, $11
 		FROM model_endpoints me
 		WHERE me.model_id = $3
 		  AND me.lifecycle_state NOT IN ('deleted')
@@ -370,6 +402,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		backend,
 		requestedMode,
 		effectiveMode,
+		workloadPolicy,
 	)
 	if err != nil {
 		return fmt.Errorf("insert agent_runtime: %w", err)
@@ -415,6 +448,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		Quantization:   cfg.Quantization,
 		ExtraArgs:      cfg.ExtraArgs,
 		ExecutionMode:  effectiveMode,
+		WorkloadPolicy: workloadPolicy,
 		Env:            map[string]string{},
 	}
 
@@ -465,15 +499,23 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 	ticker := time.NewTicker(a.cfg.HealthPollInterval)
 	defer ticker.Stop()
 
-	loadingModelStart := time.Now()
+	// loadingModelDeadline is set once the first time we see a loading_model state.
+	// It is NOT reset on subsequent ticks — we want a hard wall-clock timeout
+	// that covers the entire loading period across multiple waitForReady calls.
+	// We use ColdStartTimeout / 2 as the loading-specific budget.
 	staleLoadingThreshold := a.cfg.ColdStartTimeout / 2
+	loadingModelEnteredAt := time.Time{} // zero = not yet in loading_model
+
+	consecutiveHealthFails := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("%w after %s", ErrColdStartTimeout, time.Since(startTime))
 		case <-ticker.C:
-			rt, err := a.loadRuntime(ctx, cfg.ModelID, cfg.NodeID)
+			// Search ALL online nodes for this model's runtime — the HA reconciler
+			// may have started a replacement on a different node than cfg.NodeID.
+			rt, err := a.loadRuntime(ctx, cfg.ModelID, "")
 			if err != nil {
 				continue
 			}
@@ -490,13 +532,29 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 
 			case "created", "pending", "validating", "downloading", "starting":
 				// Early pipeline stages — the container hasn't started yet.
-				// Reset the loading clock; stale detection starts from loading_model.
-				loadingModelStart = time.Now()
+				// Reset the loading clock; stale detection only starts from loading_model.
+				loadingModelEnteredAt = time.Time{}
+				consecutiveHealthFails = 0
 				continue
 
 			case "loading_model", "waiting_ready", "active", "warm", "loading":
+				// Record when we first entered the loading stage.
+				if loadingModelEnteredAt.IsZero() {
+					// Try to use the DB row's updated_at as the entry time so we
+					// don't restart the clock each time waitForReady is called for
+					// the same stuck runtime.
+					var stateUpdatedAt time.Time
+					_ = a.db.QueryRowContext(ctx,
+						`SELECT updated_at FROM agent_runtimes WHERE id = $1`, rt.ID,
+					).Scan(&stateUpdatedAt)
+					if !stateUpdatedAt.IsZero() {
+						loadingModelEnteredAt = stateUpdatedAt
+					} else {
+						loadingModelEnteredAt = time.Now()
+					}
+				}
+
 				// Container is running; check the health endpoint.
-				// "loading" is the legacy state name from the old pipeline.
 				host := rt.BindHost
 				if host == "" {
 					host = cfg.BindHost
@@ -505,7 +563,12 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 					var nodeIP string
 					_ = a.db.QueryRowContext(ctx,
 						`SELECT COALESCE(ip_address, hostname, '') FROM nodes WHERE id = $1`,
-						cfg.NodeID).Scan(&nodeIP)
+						rt.NodeID).Scan(&nodeIP)
+					if nodeIP == "" {
+						_ = a.db.QueryRowContext(ctx,
+							`SELECT COALESCE(ip_address, hostname, '') FROM nodes WHERE id = $1`,
+							cfg.NodeID).Scan(&nodeIP)
+					}
 					host = nodeIP
 				}
 				port := rt.BindPort
@@ -516,12 +579,7 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 
 				healthy := a.httpHealthCheck(endpointURL)
 				if healthy {
-					// All four conditions:
-					// 1. Container running (state not "failed"/"stopped").
-					// 2. HTTP /health returned 200.
-					// 3. Runtime state is "active"/"warm"/"ready" — set it now.
-					// 4. Registry resolves — checked below.
-					loadingModelStart = time.Now() // reset; no longer relevant
+					consecutiveHealthFails = 0
 
 					_, _ = a.db.ExecContext(ctx, `
 						UPDATE agent_runtimes
@@ -551,20 +609,30 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 					}, nil
 				}
 
-				// Health check failed or connection refused.
-				// Only fail if we've been stuck in loading_model too long.
-				inLoadingModel := rt.State == "loading_model" || rt.State == "loading" ||
-					rt.State == "waiting_ready"
-				if inLoadingModel && time.Since(loadingModelStart) > staleLoadingThreshold {
-					a.log.Warn("model stuck in loading — marking failed",
+				// Health check failed (connection refused or non-200).
+				consecutiveHealthFails++
+
+				// Hard timeout: if we've been stuck in loading_model longer than the
+				// stale threshold, mark failed and let the caller retry.
+				loadingDuration := time.Since(loadingModelEnteredAt)
+				if loadingDuration > staleLoadingThreshold {
+					a.log.Warn("model stuck in loading — marking failed and clearing lock",
 						zap.String("model", cfg.ModelName),
-						zap.Duration("loading_for", time.Since(loadingModelStart)),
+						zap.String("runtime_id", rt.ID),
+						zap.Duration("loading_for", loadingDuration),
+						zap.Int("health_fails", consecutiveHealthFails),
 					)
 					_, _ = a.db.ExecContext(ctx,
-						`UPDATE agent_runtimes SET state='failed', error_msg='startup timeout: health check did not pass', updated_at=NOW() WHERE id=$1`, rt.ID)
-					return nil, fmt.Errorf("startup timeout: health check did not pass after %s", time.Since(loadingModelStart))
+						`UPDATE agent_runtimes
+						 SET state     = 'failed',
+						     error_msg = $2,
+						     updated_at = NOW()
+						 WHERE id = $1`,
+						rt.ID,
+						fmt.Sprintf("startup timeout: health check did not pass after %s", loadingDuration.Round(time.Second)))
+					return nil, fmt.Errorf("startup timeout: health check did not pass after %s", loadingDuration)
 				}
-				// Connection refused / not yet healthy — this is expected. Keep waiting.
+				// Not timed out yet — connection refused is expected while model loads.
 			}
 		}
 	}
@@ -634,6 +702,7 @@ func (a *RuntimeActivator) Status(ctx context.Context, modelName string) (*Model
 
 type agentRuntime struct {
 	ID          string `db:"id"`
+	NodeID      string `db:"node_id"`
 	State       string `db:"state"`
 	ContainerID string `db:"container_id"`
 	BindHost    string `db:"bind_host"`
@@ -643,18 +712,65 @@ type agentRuntime struct {
 
 func (a *RuntimeActivator) loadRuntime(ctx context.Context, modelID, nodeID string) (*agentRuntime, error) {
 	var rt agentRuntime
-	err := a.db.GetContext(ctx, &rt, `
-		SELECT id, state, COALESCE(container_id,'') AS container_id,
-		       COALESCE(bind_host,'') AS bind_host, bind_port,
-		       COALESCE(error_msg,'') AS error_msg
-		FROM agent_runtimes
-		WHERE model_id = $1 AND node_id = $2
-		  AND state NOT IN ('deleted')
-		ORDER BY updated_at DESC LIMIT 1`, modelID, nodeID)
-	if err != nil {
-		return nil, err
+	// First try the specific node if provided
+	if nodeID != "" {
+		err := a.db.GetContext(ctx, &rt, `
+			SELECT id, node_id::text AS node_id, state,
+			       COALESCE(container_id,'') AS container_id,
+			       COALESCE(bind_host,'') AS bind_host, bind_port,
+			       COALESCE(error_msg,'') AS error_msg
+			FROM agent_runtimes
+			WHERE model_id = $1 AND node_id = $2
+			  AND state NOT IN ('deleted')
+			ORDER BY updated_at DESC LIMIT 1`, modelID, nodeID)
+		if err == nil {
+			return &rt, nil
+		}
 	}
-	return &rt, nil
+	// Fallback: find the most recent healthy/active runtime for this model on ANY online node.
+	// This handles HA recovery — the reconciler may have started a replacement on a new node.
+	err := a.db.GetContext(ctx, &rt, `
+		SELECT ar.id, ar.node_id::text AS node_id, ar.state,
+		       COALESCE(ar.container_id,'') AS container_id,
+		       COALESCE(ar.bind_host,'') AS bind_host, ar.bind_port,
+		       COALESCE(ar.error_msg,'') AS error_msg
+		FROM agent_runtimes ar
+		JOIN nodes n ON n.id = ar.node_id
+		WHERE ar.model_id = $1
+		  AND ar.state NOT IN ('deleted')
+		  AND n.status IN ('online','degraded')
+		ORDER BY
+		  CASE ar.state
+		    WHEN 'ready'         THEN 1
+		    WHEN 'active'        THEN 1
+		    WHEN 'warm'          THEN 1
+		    WHEN 'idle'          THEN 2
+		    WHEN 'loading_model' THEN 3
+		    WHEN 'waiting_ready' THEN 3
+		    WHEN 'starting'      THEN 4
+		    WHEN 'pending'       THEN 5
+		    ELSE 9
+		  END ASC,
+		  ar.updated_at DESC
+		LIMIT 1`, modelID)
+	return &rt, err
+}
+
+// isNodeOnline returns true when the node with the given ID has status
+// 'online' or 'degraded'. Returns false for empty ID, offline nodes, or
+// nodes not found in the DB.
+func (a *RuntimeActivator) isNodeOnline(ctx context.Context, nodeID string) bool {
+	if nodeID == "" {
+		return false
+	}
+	var status string
+	err := a.db.QueryRowContext(ctx,
+		`SELECT status FROM nodes WHERE id = $1`, nodeID,
+	).Scan(&status)
+	if err != nil {
+		return false
+	}
+	return status == "online" || status == "degraded"
 }
 
 func (a *RuntimeActivator) loadConfig(ctx context.Context, modelName string) (*ModelConfig, error) {
@@ -751,6 +867,8 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		LEFT JOIN agent_runtimes ar
 		       ON ar.model_id = m.id
 		      AND ar.state NOT IN ('deleted')
+		      -- Only consider runtimes on online nodes for node_id fallback
+		      AND ar.node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))
 		WHERE m.name    = $1
 		  AND m.enabled = TRUE
 		ORDER BY
@@ -815,11 +933,17 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 }
 
 func (a *RuntimeActivator) enableEndpoint(ctx context.Context, modelID string) {
+	// Only enable endpoints whose node is currently online — never re-enable
+	// endpoints that belong to offline/dead nodes.
 	_, _ = a.db.ExecContext(ctx, `
 		UPDATE model_endpoints
 		SET is_enabled = TRUE, lifecycle_state = 'active',
 		    health_status = 'healthy', updated_at = NOW()
-		WHERE model_id = $1`, modelID)
+		WHERE model_id = $1
+		  AND (
+		      node_id IS NULL
+		      OR node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))
+		  )`, modelID)
 }
 
 // deriveState maps the DB agent_runtimes.state string to the internal State type.

@@ -349,6 +349,15 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		zap.String("image", p.Image),
 		zap.Ints("gpu_devices", p.GPUDevices),
 		zap.Int("port", p.BindPort),
+		zap.String("model_source", func() string {
+			if p.GGUFPath != "" {
+				return "local:" + p.GGUFPath
+			}
+			if p.HFRepo != "" {
+				return "hf:" + p.HFRepo + "/" + p.HFFile
+			}
+			return "unknown"
+		}()),
 	)
 
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
@@ -401,6 +410,9 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		Data: map[string]interface{}{
 			"container_id": containerID,
 			"bind_port":    p.BindPort,
+			// Report the resolved gguf_path so the control plane can persist it
+			// in model_runtime_configs — avoids re-download on next container start.
+			"gguf_path": p.GGUFPath,
 		},
 	}
 }
@@ -412,11 +424,12 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 // ensureModelCached verifies the model file is present in the shared cache
 // volume and downloads it if missing.
 //
-// Three cases:
+// Cases:
 //  1. GGUFPath set + file exists → reuse; skip download.
 //  2. GGUFPath set + file missing + HFRepo set → download then start.
-//  3. Only HFRepo+HFFile set (no local path) → llama-server downloads at
-//     startup via --hf-repo/--hf-file; nothing to pre-check.
+//  3. Only HFRepo+HFFile set, no GGUFPath → check if HFFile already cached in
+//     the volume. If yes: set GGUFPath to the local path (avoids HF startup
+//     download). If no: llama-server downloads at startup via --hf-repo/--hf-file.
 //  4. No model source at all → fail fast with a clear error.
 func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) TaskResult {
 	// Case 4: no usable source.
@@ -430,29 +443,61 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 		}
 	}
 
-	if p.GGUFPath == "" {
-		// Case 3: no local path — llama-server handles it at startup.
-		return TaskResult{Success: true}
-	}
-
-	// Resolve the host-side directory for the shared models volume.
+	// Resolve the host-side directory for the shared models volume so we can
+	// check whether the file already exists on disk.
 	hostVolumeRoot := firstNonEmpty(p.ModelsVolume, "llamacpp_models")
 	hostVolumeDir := hostVolumeRoot
 	if !strings.HasPrefix(hostVolumeRoot, "/") {
-		// Named Docker volume — resolve mountpoint.
 		volOut, volErr := exec.CommandContext(ctx, "docker", "volume", "inspect",
 			"--format", "{{.Mountpoint}}", hostVolumeRoot).Output()
-		if volErr != nil {
-			// Volume doesn't exist yet — Docker creates it on docker run.
-			// We can't pre-check, so proceed and let llama-server report the error.
-			e.log.Warn("models volume not found yet — skipping cache pre-check",
-				zap.String("volume", hostVolumeRoot),
-			)
-			return TaskResult{Success: true}
+		if volErr == nil {
+			hostVolumeDir = strings.TrimSpace(string(volOut))
 		}
-		hostVolumeDir = strings.TrimSpace(string(volOut))
+		// If the volume doesn't exist yet, hostVolumeDir stays as the volume name.
+		// We'll fall through and let docker run create it.
 	}
 
+	// Case 3: no explicit GGUFPath but HFRepo+HFFile provided.
+	// Check if the HFFile is already cached in the volume. If it is, reuse it
+	// as a local path — this avoids a slow in-container HF download and fixes
+	// the health check timeout issue (server doesn't open the port during download).
+	if p.GGUFPath == "" && p.HFRepo != "" && p.HFFile != "" {
+		// Try the flat file name first (e.g. gemma-2-2b-it-Q4_K_M.gguf at root of volume)
+		candidatePaths := []string{
+			hostVolumeDir + "/" + p.HFFile,
+			// Also try repo-named subdir: bartowski/gemma-2-2b-it-GGUF/file.gguf
+			hostVolumeDir + "/" + p.HFRepo + "/" + p.HFFile,
+		}
+		for _, candidate := range candidatePaths {
+			if _, statErr := exec.CommandContext(ctx, "test", "-f", candidate).CombinedOutput(); statErr == nil {
+				// File found locally — switch to local mode.
+				// Compute the container path relative to /models mount.
+				relToVolume := strings.TrimPrefix(candidate, hostVolumeDir+"/")
+				p.GGUFPath = "/models/" + relToVolume
+				e.log.Info("model file already cached — using local path instead of HF download",
+					zap.String("host_path", candidate),
+					zap.String("container_path", p.GGUFPath),
+				)
+				// Clear HF fields so buildDockerArgs uses -m, not --hf-repo.
+				p.HFRepo = ""
+				p.HFFile = ""
+				return TaskResult{Success: true}
+			}
+		}
+		// File not cached — fall through to let llama-server download at startup.
+		e.log.Info("model file not in cache — llama-server will download via HF",
+			zap.String("hf_repo", p.HFRepo),
+			zap.String("hf_file", p.HFFile),
+		)
+		return TaskResult{Success: true}
+	}
+
+	if p.GGUFPath == "" {
+		// HFRepo set but no HFFile (unusual) — let llama-server handle it.
+		return TaskResult{Success: true}
+	}
+
+	// Cases 1 & 2: GGUFPath explicitly set.
 	// Map container path → host path.
 	relPath := strings.TrimPrefix(p.GGUFPath, "/models/")
 	if relPath == p.GGUFPath {

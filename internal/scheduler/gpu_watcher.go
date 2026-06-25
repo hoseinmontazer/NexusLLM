@@ -13,12 +13,21 @@ import (
 	"go.uber.org/zap"
 )
 
+// PoolMetrics holds the latest cached pool metrics for a model.
+type PoolMetrics struct {
+	Model          string
+	ActiveRequests int
+	QueueSize      int
+	GPUUtilPct     float64
+	AtCapacity     bool
+}
+
 const (
-	poolActiveKey   = "nexus:pool:%s:active"
-	poolCapKey      = "nexus:pool:%s:at_capacity"
-	poolMetricsKey  = "nexus:pool:%s:metrics"
-	capacityTTL     = 30 * time.Second
-	maxActiveRatio  = 0.90 // mark at-capacity when 90% utilised
+	poolActiveKey  = "nexus:pool:%s:active"
+	poolCapKey     = "nexus:pool:%s:at_capacity"
+	poolMetricsKey = "nexus:pool:%s:metrics"
+	capacityTTL    = 30 * time.Second
+	maxActiveRatio = 0.90 // mark at-capacity when 90% utilised
 )
 
 // vLLMMetrics is a minimal struct to parse vLLM's /metrics JSON or Prometheus text.

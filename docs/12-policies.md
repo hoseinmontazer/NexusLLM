@@ -170,21 +170,66 @@ Teams are assigned a priority (1–100) when created. Higher-priority teams' que
 
 ---
 
-## Project-level priority (enterprise)
-
-Projects introduce a finer-grained SLA tier above team policies:
-
-| Priority | Score | Preemption rights |
-|---|---|---|
-| `CRITICAL` | 100 | Can preempt LOW, BEST_EFFORT |
-| `HIGH` | 75 | Can preempt BEST_EFFORT |
-| `NORMAL` | 50 | No preemption |
-| `LOW` | 25 | No preemption |
-| `BEST_EFFORT` | 10 | No preemption |
-
-When GPU resources are under pressure (>95% utilization), the Preemption Engine evicts lower-priority runtimes to free capacity for higher-priority projects. See [Project Priority & Preemption](../docs/) for full details.
-
 ---
+
+## Project-level priority (weighted)
+
+Projects introduce finer-grained SLA scheduling above team policies. Every project has a **`priority_weight`** in `[0, 1000]`. Scheduling uses the **effective_priority**, not the raw weight:
+
+```
+effective_priority = base_weight
+                   + waiting_bonus      (anti-starvation aging: +1/60s, cap +200)
+                   + reservation_bonus  (+50 when project has reserved quota)
+                   - resource_penalty   (-100 when consuming beyond max quota)
+```
+
+| Weight range | Label | Preemption |
+|---|---|---|
+| 900–1000 | Production Critical / Emergency | Preempts anything with gap ≥ 50 |
+| 700–800 | Core Internal | Preempts ≤ 650 |
+| 500 | Standard | Preempts ≤ 450 |
+| 300 | Batch | Limited |
+| 100 | Development | No effective preemption |
+| 0–50 | Playground / Best Effort | Never preempts |
+
+**Preemption rule:** requestor's `effective_priority` must exceed victim's `priority_weight` by ≥ 50 points. Projects marked `preemptible=false` or `protected=true` can never be evicted.
+
+```bash
+# Create a project with priority 900 and 80 GB reserved VRAM
+curl -X POST http://localhost:8081/admin/v1/projects \
+  -H 'Content-Type: application/json' \
+  -d '{"organization_id":"ORG","team_id":"TEAM",
+       "name":"Customer Chat","priority_weight":900}'
+
+# Set resource reservation + quota ceiling
+curl -X POST http://localhost:8081/admin/v1/projects/PROJECT_ID/reserve \
+  -H 'Content-Type: application/json' \
+  -d '{"reserved_vram_mb":81920,"max_gpu_vram_mb":163840}'
+
+# Change priority at runtime (takes effect within one scheduler cycle, ~60 s)
+curl -X POST http://localhost:8081/admin/v1/projects/PROJECT_ID/priority \
+  -H 'Content-Type: application/json' \
+  -d '{"priority_weight":950}'
+
+# Get effective priority breakdown for a project
+curl http://localhost:8081/admin/v1/projects/PROJECT_ID
+# Returns: priority_weight, effective_priority, waiting_bonus, reservation_bonus, resource_penalty
+
+# View global queue ordered by effective_priority DESC
+curl http://localhost:8081/admin/v1/scheduler/queue
+
+# View placement decisions with full trace
+curl http://localhost:8081/admin/v1/scheduler/decisions
+```
+
+See [docs/20-automatic-scheduler.md](docs/20-automatic-scheduler.md) and [docs/21-weighted-priority.md](docs/21-weighted-priority.md) for full details.
+
+In addition to team policies, org-level gateway policies control:
+- Temperature caps per org
+- Tool/function-call restrictions
+- Model blocklists
+
+Managed via `PUT /admin/v1/gateway-policies/:org_id` (API) or the Admin UI → Policies page.
 
 ## Gateway policy (org-level)
 

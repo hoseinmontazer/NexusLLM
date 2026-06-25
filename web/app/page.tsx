@@ -1,6 +1,9 @@
 import Link from 'next/link'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Cpu, Users, Server, Box, Network, Activity } from 'lucide-react'
+import {
+  Cpu, Users, Server, Network, Activity,
+  CheckCircle2, AlertTriangle, XCircle, Zap,
+} from 'lucide-react'
 
 const ADMIN = process.env.NEXUS_ADMIN_URL ?? 'http://localhost:8081/admin/v1'
 
@@ -15,112 +18,143 @@ async function fetchJSON(path: string) {
 }
 
 async function getStats() {
-  const [orgs, teams, models, services, nodes, gpuNodes] = await Promise.all([
-    fetchJSON('/orgs'),
-    fetchJSON('/teams'),
-    fetchJSON('/models'),
-    fetchJSON('/services'),
+  const [nodes, haStatus, models] = await Promise.all([
     fetchJSON('/nodes'),
-    fetchJSON('/gpu/nodes'),
+    fetchJSON('/ha/status'),
+    fetchJSON('/models'),
   ])
+
+  const nodeList: any[]  = nodes?.data      ?? []
+  const haModels: any[]  = haStatus?.models ?? []
+  const modelList: any[] = models?.data     ?? []
+
+  const onlineNodes   = nodeList.filter(n => n.status === 'online' || n.status === 'degraded').length
+  const offlineNodes  = nodeList.filter(n => n.status === 'offline').length
+
+  // Runtime counts from HA status
+  const activeReplicas   = haModels.reduce((s: number, m: any) => s + (m.active_replicas  ?? 0), 0)
+  const startingReplicas = haModels.reduce((s: number, m: any) => s + (m.starting_replicas ?? 0), 0)
+  const lostReplicas     = haModels.reduce((s: number, m: any) => s + (m.lost_replicas     ?? 0), 0)
+
+  const healthyModels    = haModels.filter((m: any) => m.ha_status === 'healthy').length
+  const degradedModels   = haModels.filter((m: any) => m.ha_status === 'degraded').length
+  const unavailModels    = haModels.filter((m: any) => m.ha_status === 'unavailable').length
+
   return {
-    orgs:      orgs?.total      ?? 0,
-    teams:     teams?.total     ?? 0,
-    models:    models?.total    ?? 0,
-    services:  services?.total  ?? 0,
-    nodes:     nodes?.total     ?? 0,
-    gpuNodes:  gpuNodes?.total  ?? 0,
-    modelList: models?.data     ?? [],
-    nodeList:  nodes?.data      ?? [],
+    nodeList,
+    onlineNodes,
+    offlineNodes,
+    totalNodes: nodeList.length,
+    activeReplicas,
+    startingReplicas,
+    lostReplicas,
+    totalModels:   modelList.length,
+    healthyModels,
+    degradedModels,
+    unavailModels,
+    haModels,
+    reconcilerLastSweep: haStatus?.reconciler_last_sweep ?? null,
+    recoveriesTriggered: haStatus?.recoveries_triggered  ?? 0,
   }
 }
 
-const SERVICE_TYPE_COLORS: Record<string, string> = {
-  CHAT:      'bg-blue-100 text-blue-700',
-  EMBEDDING: 'bg-purple-100 text-purple-700',
-  RERANK:    'bg-indigo-100 text-indigo-700',
-  STT:       'bg-teal-100 text-teal-700',
-  TTS:       'bg-cyan-100 text-cyan-700',
-  OCR:       'bg-orange-100 text-orange-700',
-  AGENT:     'bg-pink-100 text-pink-700',
-  MCP:       'bg-gray-100 text-gray-700',
+function StatCard({
+  title, value, sub, icon: Icon, color, href,
+}: {
+  title: string; value: string | number; sub?: string
+  icon: React.ElementType; color: string; href?: string
+}) {
+  const inner = (
+    <Card className="hover:shadow-md transition-shadow cursor-pointer">
+      <CardHeader className="flex flex-row items-center justify-between pb-1 pt-4 px-4">
+        <CardTitle className="text-xs font-medium text-muted-foreground">{title}</CardTitle>
+        <Icon className={`w-4 h-4 ${color}`} />
+      </CardHeader>
+      <CardContent className="px-4 pb-4">
+        <p className="text-3xl font-bold tabular-nums">{value}</p>
+        {sub && <p className="text-xs text-muted-foreground mt-0.5">{sub}</p>}
+      </CardContent>
+    </Card>
+  )
+  return href ? <Link href={href}>{inner}</Link> : inner
+}
+
+function HAStatusBadge({ status }: { status: string }) {
+  if (status === 'healthy')     return <span className="flex items-center gap-1 text-green-600 text-xs font-semibold"><CheckCircle2 className="w-3.5 h-3.5" />healthy</span>
+  if (status === 'degraded')    return <span className="flex items-center gap-1 text-yellow-600 text-xs font-semibold"><AlertTriangle className="w-3.5 h-3.5" />degraded</span>
+  if (status === 'unavailable') return <span className="flex items-center gap-1 text-red-500 text-xs font-semibold"><XCircle className="w-3.5 h-3.5" />unavailable</span>
+  return <span className="text-xs text-muted-foreground">{status}</span>
 }
 
 export default async function DashboardPage() {
-  const stats = await getStats()
-
-  const statCards = [
-    { title: 'Organizations', value: stats.orgs,     icon: Users,   color: 'text-blue-600' },
-    { title: 'Teams',         value: stats.teams,    icon: Users,   color: 'text-purple-600' },
-    { title: 'LLM Models',    value: stats.models,   icon: Cpu,     color: 'text-green-600' },
-    { title: 'AI Services',   value: stats.services, icon: Box,     color: 'text-pink-600' },
-    { title: 'Cluster Nodes', value: stats.nodes,    icon: Network, color: 'text-teal-600' },
-    { title: 'GPU Nodes',     value: stats.gpuNodes, icon: Server,  color: 'text-orange-600' },
-  ]
+  const s = await getStats()
 
   return (
     <div className="space-y-8">
+      {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold">Dashboard</h1>
-        <p className="text-muted-foreground mt-1">NexusLLM — AI Resource Orchestrator</p>
+        <h1 className="text-2xl font-bold">Cluster Overview</h1>
+        <p className="text-muted-foreground mt-1 text-sm">
+          NexusLLM — AI Infrastructure Platform
+          {s.reconcilerLastSweep && (
+            <span className="ml-3 text-xs text-muted-foreground">
+              reconciler: {new Date(s.reconcilerLastSweep).toLocaleTimeString()}
+            </span>
+          )}
+        </p>
       </div>
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
-        {statCards.map(s => (
-          <Card key={s.title}>
-            <CardHeader className="flex flex-row items-center justify-between pb-1 pt-4 px-4">
-              <CardTitle className="text-xs font-medium text-muted-foreground">{s.title}</CardTitle>
-              <s.icon className={`w-4 h-4 ${s.color}`} />
-            </CardHeader>
-            <CardContent className="px-4 pb-4">
-              <p className="text-3xl font-bold">{s.value}</p>
-            </CardContent>
-          </Card>
-        ))}
+      {/* Top-level stat cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4">
+        <StatCard title="Online Nodes"      value={s.onlineNodes}       sub={`${s.offlineNodes} offline`}                           icon={Network}       color="text-teal-600"   href="/cluster" />
+        <StatCard title="Active Runtimes"   value={s.activeReplicas}    sub={`${s.startingReplicas} starting`}                      icon={Activity}      color="text-green-600"  href="/runtimes" />
+        <StatCard title="Failed Runtimes"   value={s.lostReplicas}      sub={s.lostReplicas > 0 ? 'needs recovery' : 'all clear'}   icon={Cpu}           color={s.lostReplicas > 0 ? 'text-red-500' : 'text-gray-400'} href="/runtimes" />
+        <StatCard title="Healthy Models"    value={s.healthyModels}     sub={`${s.degradedModels} degraded`}                        icon={CheckCircle2}  color="text-green-600"  href="/models" />
+        <StatCard title="Degraded"          value={s.degradedModels}    sub={`${s.unavailModels} unavailable`}                      icon={AlertTriangle} color={s.degradedModels > 0 ? 'text-yellow-600' : 'text-gray-400'} href="/ha" />
+        <StatCard title="Auto Recoveries"   value={s.recoveriesTriggered} sub="total triggered"                                     icon={Zap}           color="text-blue-500"   href="/ha" />
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        {/* Model Health */}
+        {/* HA Model Status */}
         <Card>
           <CardHeader>
-            <div className="flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-muted-foreground" />
-              <CardTitle className="text-base">Model Status</CardTitle>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4 text-muted-foreground" />
+                <CardTitle className="text-base">Model Replica Health</CardTitle>
+              </div>
+              <Link href="/ha" className="text-xs text-blue-600 hover:underline">View HA →</Link>
             </div>
           </CardHeader>
           <CardContent>
-            {stats.modelList.length === 0 ? (
+            {s.haModels.length === 0 ? (
               <div className="text-center py-6 text-muted-foreground">
-                <p className="text-sm">No models yet — go to <strong>Models</strong> to import from Ollama or deploy vLLM.</p>
+                <p className="text-sm">No models with HA specs — go to <strong>Models</strong> to deploy.</p>
               </div>
             ) : (
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b text-xs text-muted-foreground">
                     <th className="text-left pb-2">Model</th>
-                    <th className="text-left pb-2">Type</th>
-                    <th className="text-left pb-2">Backend</th>
-                    <th className="text-left pb-2">Health</th>
+                    <th className="text-center pb-2">Active</th>
+                    <th className="text-center pb-2">Desired</th>
+                    <th className="text-left pb-2">HA Status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {stats.modelList.map(m => (
-                    <tr key={m.id} className="border-b last:border-0">
-                      <td className="py-2 font-medium max-w-[120px] truncate">{m.name}</td>
-                      <td className="py-2">
-                        <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
-                          SERVICE_TYPE_COLORS[m.service_type] ?? 'bg-gray-100 text-gray-600'
-                        }`}>{m.service_type ?? 'CHAT'}</span>
-                      </td>
-                      <td className="py-2 text-xs text-muted-foreground font-mono">{m.backend_type}</td>
-                      <td className="py-2">
-                        <span className={`text-xs font-semibold ${
-                          m.healthy_count > 0 ? 'text-green-600' : m.endpoint_count > 0 ? 'text-red-500' : 'text-gray-400'
-                        }`}>
-                          {m.healthy_count}/{m.endpoint_count}
+                  {s.haModels.slice(0, 12).map((m: any) => (
+                    <tr key={m.model_id} className="border-b last:border-0">
+                      <td className="py-1.5 font-medium max-w-[140px] truncate">{m.model_name}</td>
+                      <td className="py-1.5 text-center tabular-nums">
+                        <span className={m.active_replicas > 0 ? 'text-green-600 font-semibold' : 'text-red-500'}>
+                          {m.active_replicas}
                         </span>
+                        {m.starting_replicas > 0 && (
+                          <span className="text-blue-500 text-xs ml-1">+{m.starting_replicas}</span>
+                        )}
                       </td>
+                      <td className="py-1.5 text-center tabular-nums text-muted-foreground">{m.desired_replicas}</td>
+                      <td className="py-1.5"><HAStatusBadge status={m.ha_status} /></td>
                     </tr>
                   ))}
                 </tbody>
@@ -132,35 +166,38 @@ export default async function DashboardPage() {
         {/* Cluster Nodes */}
         <Card>
           <CardHeader>
-            <div className="flex items-center gap-2">
-              <Network className="w-4 h-4 text-muted-foreground" />
-              <CardTitle className="text-base">Cluster Nodes</CardTitle>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Network className="w-4 h-4 text-muted-foreground" />
+                <CardTitle className="text-base">Cluster Nodes</CardTitle>
+              </div>
+              <Link href="/cluster" className="text-xs text-blue-600 hover:underline">Manage →</Link>
             </div>
           </CardHeader>
           <CardContent>
-            {stats.nodeList.length === 0 ? (
+            {s.nodeList.length === 0 ? (
               <div className="text-center py-6 text-muted-foreground">
-                <p className="text-sm">No nodes registered — start the node agent on your server or register one via <strong>Cluster Nodes</strong>.</p>
+                <p className="text-sm">No nodes registered — start the node agent on your servers.</p>
               </div>
             ) : (
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b text-xs text-muted-foreground">
                     <th className="text-left pb-2">Host</th>
-                    <th className="text-left pb-2">CPUs</th>
+                    <th className="text-left pb-2">CPU</th>
                     <th className="text-left pb-2">RAM</th>
                     <th className="text-left pb-2">VRAM</th>
                     <th className="text-left pb-2">Status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {stats.nodeList.map(n => (
+                  {s.nodeList.map((n: any) => (
                     <tr key={n.id} className="border-b last:border-0">
-                      <td className="py-2 font-mono text-xs">{n.hostname}</td>
-                      <td className="py-2 text-xs">{n.total_cpu}</td>
-                      <td className="py-2 text-xs">{n.total_ram_mb ? `${Math.round(n.total_ram_mb / 1024)}GB` : '—'}</td>
-                      <td className="py-2 text-xs">{n.total_vram_mb ? `${Math.round(n.total_vram_mb / 1024)}GB` : '—'}</td>
-                      <td className="py-2">
+                      <td className="py-1.5 font-mono text-xs">{n.hostname}</td>
+                      <td className="py-1.5 text-xs">{n.total_cpu}</td>
+                      <td className="py-1.5 text-xs">{n.total_ram_mb ? `${Math.round(n.total_ram_mb / 1024)}GB` : '—'}</td>
+                      <td className="py-1.5 text-xs">{n.total_vram_mb ? `${Math.round(n.total_vram_mb / 1024)}GB` : '—'}</td>
+                      <td className="py-1.5">
                         <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
                           n.status === 'online'    ? 'bg-green-100 text-green-700' :
                           n.status === 'degraded'  ? 'bg-yellow-100 text-yellow-700' :
@@ -181,28 +218,28 @@ export default async function DashboardPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center gap-2">
-            <Activity className="w-4 h-4 text-muted-foreground" />
-            <CardTitle className="text-base">Quick Start</CardTitle>
+            <Zap className="w-4 h-4 text-muted-foreground" />
+            <CardTitle className="text-base">Quick Actions</CardTitle>
           </div>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
-            <a href="/models" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">🦙 Import Ollama Models</span>
-              <span className="text-xs text-muted-foreground">Register all local Ollama models in one click</span>
-            </a>
-            <a href="/services" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">📦 Deploy AI Service</span>
-              <span className="text-xs text-muted-foreground">Add embeddings, rerankers, STT, TTS, OCR</span>
-            </a>
-            <a href="/placement" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">📍 Simulate Placement</span>
-              <span className="text-xs text-muted-foreground">Dry-run resource placement before deploying</span>
-            </a>
-            <a href="/teams" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">👥 Create Team</span>
-              <span className="text-xs text-muted-foreground">Set up rate limits, quotas, and API keys</span>
-            </a>
+            <Link href="/models" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
+              <span className="font-medium">🦙 Deploy Model</span>
+              <span className="text-xs text-muted-foreground">Register or deploy an LLM with HA replicas</span>
+            </Link>
+            <Link href="/ha" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
+              <span className="font-medium">🔁 HA & Failover</span>
+              <span className="text-xs text-muted-foreground">Configure replicas, recovery policy, placement</span>
+            </Link>
+            <Link href="/runtimes" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
+              <span className="font-medium">⚡ Runtime Status</span>
+              <span className="text-xs text-muted-foreground">View all containers across every node</span>
+            </Link>
+            <Link href="/cluster" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
+              <span className="font-medium">🖥 Cluster Nodes</span>
+              <span className="text-xs text-muted-foreground">GPU inventory, placement, resource usage</span>
+            </Link>
           </div>
         </CardContent>
       </Card>

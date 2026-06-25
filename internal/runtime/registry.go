@@ -19,18 +19,18 @@ const (
 
 // RegistryEndpoint is the DB-backed representation of a model endpoint row.
 type RegistryEndpoint struct {
-	ID                 string       `db:"id"`
-	ModelID            string       `db:"model_id"`
-	ModelName          string       `db:"model_name"`
-	BackendType        BackendType  `db:"backend_type"`
-	Host               string       `db:"host"`
-	Port               int          `db:"port"`
-	BasePath           string       `db:"base_path"`
-	Weight             int          `db:"weight"`
-	Priority           int          `db:"priority"`
-	HealthStatus       HealthStatus `db:"health_status"`
-	IsEnabled          bool         `db:"is_enabled"`
-	ConsecutiveFailures int         `db:"consecutive_failures"`
+	ID                  string       `db:"id"`
+	ModelID             string       `db:"model_id"`
+	ModelName           string       `db:"model_name"`
+	BackendType         BackendType  `db:"backend_type"`
+	Host                string       `db:"host"`
+	Port                int          `db:"port"`
+	BasePath            string       `db:"base_path"`
+	Weight              int          `db:"weight"`
+	Priority            int          `db:"priority"`
+	HealthStatus        HealthStatus `db:"health_status"`
+	IsEnabled           bool         `db:"is_enabled"`
+	ConsecutiveFailures int          `db:"consecutive_failures"`
 }
 
 // URL builds the base URL from host and port (no base_path).
@@ -49,8 +49,8 @@ type Registry struct {
 	log     *zap.Logger
 
 	mu    sync.RWMutex
-	pools map[string]*Pool    // model name → pool
-	bends map[string]Backend  // backend type → backend instance (shared HTTP client)
+	pools map[string]*Pool   // model name → pool
+	bends map[string]Backend // backend type → backend instance (shared HTTP client)
 }
 
 // NewRegistry constructs and populates a Registry from the database.
@@ -209,7 +209,21 @@ func (r *Registry) UpdateEndpointHealth(ctx context.Context, epID, modelName str
 	_ = r.rdb.Set(ctx, key, string(h.Status), poolCacheTTL).Err()
 }
 
-// SetPoolStrategy changes the routing strategy for a model's pool at runtime.
+// RemoveEndpoint removes an endpoint from the pool by ID.
+// Called when the watcher permanently disables an endpoint in DB.
+func (r *Registry) RemoveEndpoint(modelName, epID string) {
+	r.mu.RLock()
+	pool, ok := r.pools[modelName]
+	r.mu.RUnlock()
+	if !ok {
+		return
+	}
+	pool.Remove(epID)
+	r.log.Info("endpoint removed from pool",
+		zap.String("model", modelName),
+		zap.String("endpoint_id", epID),
+	)
+}
 func (r *Registry) SetPoolStrategy(modelName string, strategy RoutingStrategy) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -236,30 +250,117 @@ func (r *Registry) ListModels() []string {
 
 func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error) {
 	var rows []RegistryEndpoint
+	// Load endpoints from both sources:
+	//   1. model_endpoints (the original/primary row — always included when enabled)
+	//   2. agent_runtimes (one row per active replica — may differ in host:port)
+	//
+	// Rule: if an agent_runtimes row has a non-empty bind_host and bind_port,
+	// it overrides the model_endpoints host:port for that specific runtime.
+	// This supports N replicas on different hosts/ports while keeping the
+	// same model_endpoints row for backward compat.
 	err := r.db.SelectContext(ctx, &rows, `
+		-- Primary endpoints from model_endpoints (backward-compat single-replica path)
 		SELECT
-			me.id,
-			me.model_id,
-			m.name          AS model_name,
-			m.backend_type,
-			me.host,
-			me.port,
-			me.base_path,
-			me.weight,
-			me.priority,
-			me.health_status,
-			me.is_enabled,
-			me.consecutive_failures
+		    me.id,
+		    me.model_id,
+		    m.name          AS model_name,
+		    m.backend_type,
+		    me.host,
+		    me.port,
+		    me.base_path,
+		    me.weight,
+		    me.priority,
+		    me.health_status,
+		    me.is_enabled,
+		    me.consecutive_failures
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
-		WHERE me.is_enabled = TRUE AND m.enabled = TRUE
-		ORDER BY m.name, me.priority, me.weight DESC
+		WHERE me.is_enabled = TRUE
+		  AND m.enabled = TRUE
+		  -- Only include if no active agent_runtime exists for this model (single-replica case)
+		  -- OR if the runtime row's endpoint_id matches (runtime registered its endpoint)
+		  AND (
+		      NOT EXISTS (
+		          SELECT 1 FROM agent_runtimes ar
+		          WHERE ar.model_id = me.model_id
+		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
+		            AND ar.bind_port > 0
+		      )
+		      OR me.id IN (
+		          SELECT ar.endpoint_id FROM agent_runtimes ar
+		          WHERE ar.model_id = me.model_id
+		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
+		            AND ar.endpoint_id IS NOT NULL
+		      )
+		  )
+
+		UNION ALL
+
+		-- Runtime-level endpoints: one per agent_runtime replica.
+		-- Includes both healthy (ready/active/warm/idle) and still-starting
+		-- (loading_model/waiting_ready) runtimes so the health watcher can
+		-- probe them and transition them to healthy as soon as they are ready.
+		-- This is the critical path for HA failover: reconciler-created runtimes
+		-- always have endpoint_id=NULL and only appear via this branch. They
+		-- must enter the pool while starting so the watcher can promote them
+		-- to healthy — without this they would be stuck in loading_model forever
+		-- because the watcher only checks endpoints already in the pool.
+		SELECT
+		    ar.id                                    AS id,
+		    ar.model_id,
+		    m.name                                   AS model_name,
+		    m.backend_type,
+		    ar.bind_host                             AS host,
+		    ar.bind_port                             AS port,
+		    '/v1'                                    AS base_path,
+		    100                                      AS weight,
+		    COALESCE(ar.replica_index, 0) + 1        AS priority,
+		    CASE ar.state
+		        WHEN 'ready'         THEN 'healthy'::text
+		        WHEN 'active'        THEN 'healthy'::text
+		        WHEN 'warm'          THEN 'healthy'::text
+		        WHEN 'idle'          THEN 'healthy'::text
+		        WHEN 'loading_model' THEN 'unknown'::text
+		        WHEN 'waiting_ready' THEN 'unknown'::text
+		        ELSE 'unknown'::text
+		    END                                      AS health_status,
+		    TRUE                                     AS is_enabled,
+		    0                                        AS consecutive_failures
+		FROM agent_runtimes ar
+		JOIN models m ON m.id = ar.model_id
+		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
+		  AND ar.bind_host != ''
+		  AND ar.bind_port > 0
+		  AND m.enabled = TRUE
+		  -- Exclude runtimes already covered by model_endpoints UNION above
+		  AND (ar.endpoint_id IS NULL OR NOT EXISTS (
+		      SELECT 1 FROM model_endpoints me2
+		      WHERE me2.id = ar.endpoint_id AND me2.is_enabled = TRUE
+		  ))
+
+		ORDER BY model_name, priority, weight DESC
 	`)
 	return rows, err
 }
 
-// BackendForEndpoint returns the Backend implementation for a given endpoint.
-// It uses the endpoint's BackendType field which is populated during Reload.
+// StartPeriodicReload starts a background goroutine that reloads the registry
+// every interval. This ensures HA replicas started by the reconciler are
+// picked up even without an explicit enableEndpoint() call from the activator.
+// Blocks until ctx is cancelled.
+func (r *Registry) StartPeriodicReload(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.Reload(ctx); err != nil {
+				r.log.Warn("periodic registry reload failed", zap.Error(err))
+			}
+		}
+	}
+}
 func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
 	r.mu.RLock()
 	b, ok := r.bends[string(ep.BackendType)]

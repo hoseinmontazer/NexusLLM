@@ -33,32 +33,14 @@ const (
 	RuntimeCPU RuntimeType = "CPU_RUNTIME"
 )
 
-// Priority controls placement preference relative to other services.
-type Priority string
+// PriorityWeight is the numeric scheduling weight for a placement request.
+// Range: [0, 1000]. Higher = higher scheduling priority.
+// Maps to project.PriorityWeight but is kept local to avoid an import cycle.
+type PriorityWeight int
 
-const (
-	PriorityCritical   Priority = "critical"
-	PriorityHigh       Priority = "high"
-	PriorityNormal     Priority = "normal"
-	PriorityLow        Priority = "low"
-	PriorityBestEffort Priority = "best_effort"
-)
-
-// priorityScore maps a Priority to an integer for comparisons.
-var priorityScore = map[Priority]int{
-	PriorityCritical:   100,
-	PriorityHigh:       75,
-	PriorityNormal:     50,
-	PriorityLow:        25,
-	PriorityBestEffort: 10,
-}
-
-// Score returns the numeric priority score.
-func (p Priority) Score() int {
-	if v, ok := priorityScore[p]; ok {
-		return v
-	}
-	return 50
+// IsValid returns true when the weight is within the allowed range.
+func (w PriorityWeight) IsValid() bool {
+	return w >= 0 && w <= 1000
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,27 +54,27 @@ type Request struct {
 	ModelName   string
 	ServiceType ServiceType
 	RuntimeType RuntimeType
-	Priority    Priority
+	Priority    PriorityWeight
 
 	// GPU requirements (only relevant for GPU_RUNTIME)
-	MinVRAMMB    int64 // minimum VRAM per GPU in MB
-	MaxVRAMMB    int64 // maximum VRAM to allocate (0 = no cap)
-	GPUCount     int   // number of GPUs needed (tensor parallel size)
+	MinVRAMMB int64 // minimum VRAM per GPU in MB
+	MaxVRAMMB int64 // maximum VRAM to allocate (0 = no cap)
+	GPUCount  int   // number of GPUs needed (tensor parallel size)
 
 	// CPU requirements (relevant for CPU_RUNTIME, optional hint for GPU_RUNTIME)
-	CPUCores    int // 0 = no affinity
-	NUMANode    int // -1 = no preference
-	RAMMBLimit  int64 // 0 = no limit
+	CPUCores   int   // 0 = no affinity
+	NUMANode   int   // -1 = no preference
+	RAMMBLimit int64 // 0 = no limit
 
 	// Node selection hints
-	PreferNodeID   string // prefer a specific node (empty = any)
-	RequireNodeID  string // must use this node (empty = any)
+	PreferNodeID  string // prefer a specific node (empty = any)
+	RequireNodeID string // must use this node (empty = any)
 }
 
 // Decision is the placement engine's output.
 type Decision struct {
-	NodeID     string
-	NodeHost   string
+	NodeID   string
+	NodeHost string
 
 	// GPU assignment (empty for CPU_RUNTIME)
 	GPUDeviceIndices []int
@@ -100,8 +82,8 @@ type Decision struct {
 	TotalVRAMMB      int64
 
 	// CPU assignment
-	CPUCores int
-	NUMANode int // -1 if no specific NUMA node assigned
+	CPUCores   int
+	NUMANode   int // -1 if no specific NUMA node assigned
 	RAMMBLimit int64
 
 	// Scoring

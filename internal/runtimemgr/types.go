@@ -245,6 +245,6 @@ type ResourceRequest struct {
 	CPUCores    int
 	// Project context — used by ResourceGuard to account for reservations.
 	// Both optional; if empty, reservation deduction is skipped.
-	ProjectPriority string // e.g. "CRITICAL"
-	ProjectID       string // UUID string of the requesting project
+	ProjectPriorityWeight int    // e.g. 900 for production-critical
+	ProjectID             string // UUID string of the requesting project
 }

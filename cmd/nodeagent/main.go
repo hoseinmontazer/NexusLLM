@@ -3,22 +3,24 @@
 // Architecture: Control Plane is the brain. Node Agent is the executor.
 //
 // The agent:
-//   1. Registers with the control plane (auto-discovers hardware)
-//   2. Receives a JWT token for authenticated communication
-//   3. Sends heartbeat + telemetry every 30s
-//   4. Long-polls for tasks — claims, executes, reports back
-//   5. NEVER makes placement or scheduling decisions
+//  1. Registers with the control plane (auto-discovers hardware)
+//  2. Receives a JWT token for authenticated communication
+//  3. Sends heartbeat + telemetry every 30s
+//  4. Long-polls for tasks — claims, executes, reports back
+//  5. NEVER makes placement or scheduling decisions
 //
 // Required:
-//   NEXUS_ADMIN_URL  — URL of the nexus-admin control plane
+//
+//	NEXUS_ADMIN_URL  — URL of the nexus-admin control plane
 //
 // Optional:
-//   NEXUS_NODE_ID            — skip re-registration, use stored/provided node ID
-//   NEXUS_AGENT_TOKEN        — use this token (skip re-registration)
-//   NEXUS_AGENT_INTERVAL     — telemetry push interval (default: 30s)
-//   NEXUS_HEARTBEAT_INTERVAL — heartbeat interval (default: 15s)
-//   NEXUS_TASK_WORKERS       — concurrent task executors (default: 4)
-//   NEXUS_LOG_LEVEL          — debug | info | warn (default: info)
+//
+//	NEXUS_NODE_ID            — skip re-registration, use stored/provided node ID
+//	NEXUS_AGENT_TOKEN        — use this token (skip re-registration)
+//	NEXUS_AGENT_INTERVAL     — telemetry push interval (default: 30s)
+//	NEXUS_HEARTBEAT_INTERVAL — heartbeat interval (default: 15s)
+//	NEXUS_TASK_WORKERS       — concurrent task executors (default: 4)
+//	NEXUS_LOG_LEVEL          — debug | info | warn (default: info)
 package main
 
 import (
@@ -80,6 +82,7 @@ func main() {
 		taskWorkers: taskWorkers,
 		log:         log,
 		executor:    nodeagent.NewExecutor(log),
+		reregister:  make(chan struct{}, 1),
 		client: &http.Client{
 			Timeout: 35 * time.Second, // longer than long-poll wait
 		},
@@ -153,6 +156,45 @@ func main() {
 	go agent.telemetryLoop(ctx)
 	go agent.taskPollLoop(ctx)
 
+	// ── 4. Auto re-register on 401 ────────────────────────────────────────────
+	// When any authenticated request receives HTTP 401, doRequest signals the
+	// reregister channel. This goroutine detects it, deletes the stale token
+	// file, re-registers, and updates the in-memory token — no restart needed.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-agent.reregister:
+				log.Warn("received 401 — token invalid, re-registering with control plane")
+				// Delete stale files so the next register call gets a fresh token.
+				_ = os.Remove(tokenFile)
+				_ = os.Remove(nodeIDFile)
+
+				for {
+					id, tok, regErr := agent.register(ctx)
+					if regErr == nil {
+						agent.nodeID = id
+						agent.token = tok
+						saveFile(nodeIDFile, id)
+						saveFile(tokenFile, tok)
+						log.Info("re-registration complete", zap.String("node_id", id))
+						break
+					}
+					log.Warn("re-registration failed, retrying",
+						zap.Error(regErr),
+						zap.Duration("retry_in", registerRetryDelay),
+					)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(registerRetryDelay):
+					}
+				}
+			}
+		}
+	}()
+
 	log.Info("nexus-nodeagent running — waiting for tasks")
 	<-quit
 	log.Info("nexus-nodeagent shutting down...")
@@ -177,6 +219,10 @@ type Agent struct {
 	executor    *nodeagent.Executor
 	metrics     *nodeagent.AgentMetrics
 	client      *http.Client
+	// reregister is signalled when a 401 Unauthorized is received, indicating
+	// the stored token is no longer valid. The main loop re-registers and updates
+	// the token without requiring a process restart.
+	reregister chan struct{}
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -434,7 +480,7 @@ func (a *Agent) pollTasks(ctx context.Context) ([]nodeagent.RemoteTask, error) {
 	url := fmt.Sprintf("/agent/v1/tasks/pending?wait=%d&limit=5", taskPollWait)
 	var result struct {
 		Tasks []nodeagent.RemoteTask `json:"tasks"`
-		Count int                   `json:"count"`
+		Count int                    `json:"count"`
 	}
 	if err := a.getAuth(ctx, url, &result); err != nil {
 		return nil, err
@@ -825,6 +871,14 @@ func (a *Agent) doRequest(ctx context.Context, method, path string, body interfa
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
+		// On 401, signal the main loop to re-register with fresh credentials.
+		// Non-blocking send: if the channel already has a pending signal, skip.
+		if resp.StatusCode == http.StatusUnauthorized && auth && a.reregister != nil {
+			select {
+			case a.reregister <- struct{}{}:
+			default:
+			}
+		}
 		return fmt.Errorf("%s %s → HTTP %d: %s", method, path, resp.StatusCode, string(b))
 	}
 	if out != nil {

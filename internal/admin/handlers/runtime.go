@@ -81,10 +81,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 		// AutoPlace: if true, skip gpu_devices and let the placement engine
 		// choose GPU(s), CPU affinity, and NUMA node automatically.
-		AutoPlace bool   `json:"auto_place"`
-		MinVRAMMB int64  `json:"min_vram_mb"` // used when auto_place=true
-		MaxVRAMMB int64  `json:"max_vram_mb"` // used when auto_place=true
-		Priority  string `json:"priority"`    // used when auto_place=true
+		AutoPlace      bool  `json:"auto_place"`
+		MinVRAMMB      int64 `json:"min_vram_mb"`     // used when auto_place=true
+		MaxVRAMMB      int64 `json:"max_vram_mb"`     // used when auto_place=true
+		PriorityWeight int   `json:"priority_weight"` // 0–1000; default 500
 
 		// NodeID: if set, deploy via DEPLOY_RUNTIME task to the specified node agent.
 		// The node agent executes the container start on that server.
@@ -261,10 +261,15 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			ModelName:   input.Name,
 			ServiceType: "CHAT",
 			RuntimeType: placement.RuntimeGPU,
-			Priority:    placement.Priority(orDefault(input.Priority, "normal")),
-			MinVRAMMB:   input.MinVRAMMB,
-			MaxVRAMMB:   input.MaxVRAMMB,
-			GPUCount:    gpuCount,
+			Priority: placement.PriorityWeight(func() int {
+				if input.PriorityWeight > 0 {
+					return input.PriorityWeight
+				}
+				return 500
+			}()),
+			MinVRAMMB: input.MinVRAMMB,
+			MaxVRAMMB: input.MaxVRAMMB,
+			GPUCount:  gpuCount,
 		}
 		if dec, placErr := h.placement.Decide(c.Request.Context(), pReq); placErr == nil {
 			input.GPUDevices = dec.GPUDeviceIndices
@@ -350,11 +355,16 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			ExecutionMode: orDefault(input.ExecutionMode, "auto"),
 		}
 
+		// Task priority — derived from project priority_weight (0–1000 → 50–95 task scale)
 		priority := 70
-		if input.Priority == "critical" {
-			priority = 90
-		} else if input.Priority == "high" {
-			priority = 80
+		if input.PriorityWeight >= 900 {
+			priority = 95
+		} else if input.PriorityWeight >= 700 {
+			priority = 85
+		} else if input.PriorityWeight >= 500 {
+			priority = 70
+		} else if input.PriorityWeight >= 300 {
+			priority = 55
 		}
 
 		taskID, taskErr := h.taskMgr.Enqueue(

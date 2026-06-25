@@ -195,9 +195,25 @@ export interface RegisterModelInput {
 }
 
 // ── Project types ─────────────────────────────────────────────────────────────
-export type ProjectPriority = 'CRITICAL' | 'HIGH' | 'NORMAL' | 'LOW' | 'BEST_EFFORT'
-export type ProjectStatus    = 'active' | 'inactive' | 'archived'
-export type AdmissionPolicy  = 'queue' | 'preempt_then_queue' | 'reject'
+export type ProjectStatus   = 'active' | 'inactive' | 'archived'
+export type AdmissionPolicy = 'queue' | 'preempt_then_queue' | 'reject'
+
+/** priority_weight is a continuous integer in [0, 1000]. Higher = scheduled sooner. */
+export type PriorityWeight = number
+
+export interface PriorityPreset {
+  weight: number
+  label: string
+  color: string
+}
+
+export interface EffectivePriority {
+  base_weight: number
+  waiting_bonus: number
+  reservation_bonus: number
+  resource_penalty: number
+  effective_priority: number
+}
 
 export interface Project {
   id: string
@@ -205,13 +221,21 @@ export interface Project {
   team_id: string
   name: string
   description: string
-  priority: ProjectPriority
-  priority_score: number
+  priority_weight: number
+  priority_label: string
+  effective_priority: number
+  waiting_bonus: number
+  reservation_bonus: number
+  resource_penalty: number
+  preemptible: boolean
   status: ProjectStatus
   runtime_count: number
   reserved_vram_mb: number
   reserved_cpu_cores: number
   reserved_memory_mb: number
+  max_gpu_vram_mb: number
+  max_cpu: number
+  max_memory_mb: number
   always_running: boolean
   protected: boolean
   minimum_replicas: number
@@ -266,23 +290,107 @@ export interface PreemptionEvent {
   node_id?: string
   preempted_runtime_id?: string
   preempted_project_id?: string
-  preempted_priority?: string
+  preempted_weight?: number
   requesting_runtime_id?: string
   requesting_project_id?: string
-  requesting_priority?: string
+  requesting_weight?: number
   trigger: string
   created_at: string
 }
 
 export interface DeploymentQueueEntry {
   id: string
-  priority_score: number
+  model_name: string
+  priority_weight: number
+  effective_priority: number
   admission_policy: string
   status: string
   attempts: number
+  waiting_since: string
   enqueued_at: string
   expires_at?: string
+  required_vram_mb: number
+  required_ram_mb: number
+  required_cpu: number
+  preemption_reason: string
   error_msg: string
+}
+
+export interface SchedulerDecision {
+  id: string
+  model_id: string
+  model_name: string
+  project_id?: string
+  node_id?: string
+  decision_type: 'placement' | 'preemption' | 'queue' | 'reject' | 'reschedule'
+  priority_weight: number
+  effective_priority: number
+  waiting_bonus: number
+  reservation_bonus: number
+  resource_penalty: number
+  node_score: number
+  reason: string
+  decision_trace: Record<string, unknown>
+  alternatives: unknown[]
+  outcome: 'pending' | 'success' | 'failed' | 'timeout' | 'cancelled'
+  error_msg: string
+  decided_at: string
+  completed_at?: string
+}
+
+// ── HA / Replica types ────────────────────────────────────────────────────────
+export type HAStatus = 'healthy' | 'degraded' | 'starting' | 'unavailable'
+export type PlacementPolicy = 'spread' | 'pack' | 'anti_affinity'
+
+export interface ReplicaStatus {
+  model_id: string
+  model_name: string
+  desired_replicas: number
+  min_available: number
+  placement_policy: PlacementPolicy
+  auto_recover: boolean
+  active_replicas: number
+  starting_replicas: number
+  idle_replicas: number
+  lost_replicas: number
+  node_count: number
+  ha_status: HAStatus
+}
+
+export interface ReplicaInstance {
+  runtime_id: string
+  node_id: string
+  node_hostname: string
+  state: string
+  bind_host: string
+  bind_port: number
+  updated_at: string
+}
+
+export interface RecoveryLogEntry {
+  id: string
+  model_id: string
+  model_name: string
+  lost_runtime_id?: string
+  lost_node_id?: string
+  new_runtime_id?: string
+  new_node_id?: string
+  replica_index?: number
+  trigger: string
+  status: string
+  reason: string
+  created_at: string
+  completed_at?: string
+}
+
+export interface ClusterHAStatus {
+  models: ReplicaStatus[]
+  total: number
+  healthy: number
+  degraded: number
+  unavailable: number
+  reconciler_last_sweep: string
+  recoveries_triggered: number
 }
 
 // ── Organisations ─────────────────────────────────────────────────────────────
@@ -438,22 +546,26 @@ export const api = {
   },
 
   projects: {
-    list: (params?: { org_id?: string; team_id?: string; priority?: string; status?: string }) => {
-      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v).map(([k,v]) => `${k}=${v}`).join('&') : ''
+    list: (params?: { org_id?: string; team_id?: string; min_weight?: number; max_weight?: number; status?: string }) => {
+      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => `${k}=${v}`).join('&') : ''
       return req<{ data: Project[]; total: number }>('GET', `/projects${qs}`)
     },
     get: (id: string) => req<Project>('GET', `/projects/${id}`),
     create: (b: {
       organization_id: string; team_id: string; name: string
-      description?: string; priority?: ProjectPriority; status?: ProjectStatus
-    }) => req<{ id: string; name: string; priority: string; status: string }>('POST', '/projects', b),
-    update: (id: string, b: { name?: string; description?: string; priority?: ProjectPriority; status?: ProjectStatus }) =>
+      description?: string; priority_weight?: number; preemptible?: boolean; status?: ProjectStatus
+    }) => req<{ id: string; name: string; priority_weight: number; priority_label: string; status: string }>('POST', '/projects', b),
+    update: (id: string, b: { name?: string; description?: string; priority_weight?: number; preemptible?: boolean; status?: ProjectStatus }) =>
       req<{ message: string }>('PUT', `/projects/${id}`, b),
     delete: (id: string) => req<{ message: string }>('DELETE', `/projects/${id}`),
-    reserve: (id: string, b: { reserved_vram_mb?: number; reserved_cpu_cores?: number; reserved_memory_mb?: number }) =>
-      req<{ message: string }>('POST', `/projects/${id}/reserve`, b),
-    setPriority: (id: string, priority: ProjectPriority) =>
-      req<{ message: string; old_priority: string; new_priority: string; changed: boolean }>('POST', `/projects/${id}/priority`, { priority }),
+    reserve: (id: string, b: {
+      reserved_vram_mb?: number; reserved_cpu_cores?: number; reserved_memory_mb?: number
+      max_gpu_vram_mb?: number; max_cpu?: number; max_memory_mb?: number
+    }) => req<{ message: string }>('POST', `/projects/${id}/reserve`, b),
+    setPriority: (id: string, priority_weight: number) =>
+      req<{ message: string; old_priority_weight: number; new_priority_weight: number; new_priority_label: string; changed: boolean }>(
+        'POST', `/projects/${id}/priority`, { priority_weight }
+      ),
     setProtection: (id: string, b: { always_running?: boolean; protected?: boolean; minimum_replicas?: number; admission_policy?: AdmissionPolicy }) =>
       req<{ message: string }>('PUT', `/projects/${id}/protection`, b),
     getRuntimes: (id: string) =>
@@ -466,5 +578,41 @@ export const api = {
       req<{ data: PreemptionEvent[]; total: number; limit: number; offset: number }>('GET', `/projects/${id}/preemptions?limit=${limit}&offset=${offset}`),
     getQueue: (id: string) =>
       req<{ data: DeploymentQueueEntry[]; total: number }>('GET', `/projects/${id}/queue`),
+  },
+
+  scheduler: {
+    getPriorityPresets: () =>
+      req<{ presets: PriorityPreset[] }>('GET', '/scheduler/priority-presets'),
+    getQueue: (params?: { limit?: number; offset?: number }) => {
+      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v !== undefined).map(([k,v]) => `${k}=${v}`).join('&') : ''
+      return req<{ data: DeploymentQueueEntry[]; total: number }>('GET', `/scheduler/queue${qs}`)
+    },
+    getDecisions: (params?: { model_id?: string; project_id?: string; limit?: number }) => {
+      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => `${k}=${v}`).join('&') : ''
+      return req<{ data: SchedulerDecision[]; total: number }>('GET', `/scheduler/decisions${qs}`)
+    },
+  },
+
+  ha: {
+    getClusterStatus: () =>
+      req<ClusterHAStatus>('GET', '/ha/status'),
+    getModelStatus: (modelId: string) =>
+      req<{ status: ReplicaStatus; replicas: ReplicaInstance[] }>('GET', `/ha/status/${modelId}`),
+    setReplicaSpec: (modelId: string, b: {
+      desired_replicas?: number
+      min_available?: number
+      placement_policy?: PlacementPolicy
+      auto_recover?: boolean
+      recovery_delay_s?: number
+      max_surge?: number
+    }) => req<{ message: string; model_id: string; model_name: string }>('PUT', `/ha/models/${modelId}/replicas`, b),
+    getRecoveryLog: (params?: { limit?: number }) => {
+      const qs = params?.limit ? `?limit=${params.limit}` : ''
+      return req<{ data: RecoveryLogEntry[]; total: number }>('GET', `/ha/recovery-log${qs}`)
+    },
+    getModelRecoveryLog: (modelId: string, params?: { limit?: number }) => {
+      const qs = params?.limit ? `?limit=${params.limit}` : ''
+      return req<{ data: RecoveryLogEntry[]; total: number; model_id: string }>('GET', `/ha/recovery-log/${modelId}${qs}`)
+    },
   },
 }

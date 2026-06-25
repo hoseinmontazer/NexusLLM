@@ -15,7 +15,7 @@ A self-hosted AI platform that orchestrates LLMs, embeddings, rerankers, speech 
 | **Service Types** | CHAT, EMBEDDING, RERANK, STT, TTS, OCR, AGENT, MCP |
 | **Runtime Types** | GPU_RUNTIME (vLLM, Ollama, TGI, llama.cpp), CPU_RUNTIME |
 | **Hierarchy** | Organization → Team → **Project** → Models → Runtimes |
-| **Project Priority** | CRITICAL / HIGH / NORMAL / LOW / BEST_EFFORT with preemption |
+| **Project Priority** | Weighted `priority_weight` [0–1000] with aging, reservations, preemption — no enum tiers |
 | **Resource Reservations** | Per-project VRAM / CPU / memory guarantees |
 | **Preemption Engine** | Auto-evicts lower-priority runtimes under GPU pressure |
 | **Placement Engine** | Auto GPU/CPU selection by VRAM, utilization, temperature, NUMA |
@@ -185,30 +185,58 @@ See [docs/12-policies.md](docs/12-policies.md) for full details on how each limi
 
 ---
 
-## Project Priority & Preemption
+## Project Priority & Scheduling (Weighted)
 
-Projects are first-class entities between Teams and Models. Each project has a priority tier:
+Projects introduce finer-grained SLA scheduling above team policies. Each project has a **priority_weight** in the range [0–1000]:
+
+| Weight | Label | Preemption rights |
+|---|---|---|
+| 1000 | Emergency | Can preempt anything (gap ≥ 50) |
+| 900–950 | Production Critical | Can preempt ≤ 850 |
+| 700–800 | Core Internal | Can preempt ≤ 650 |
+| 500 | Standard | Can preempt ≤ 450 |
+| 300 | Batch | Limited preemption |
+| 100 | Development | No effective preemption |
+| 0–50 | Best Effort / Playground | Never preempts |
+
+**Effective priority** accounts for starvation prevention (aging), resource reservations, and over-quota penalties:
 
 ```
-CRITICAL (100) → HIGH (75) → NORMAL (50) → LOW (25) → BEST_EFFORT (10)
+effective = base_weight
+          + waiting_bonus       (+1 per 60 s in queue, cap +200)
+          + reservation_bonus   (+50 if project has reserved quota)
+          - resource_penalty    (-100 if consuming beyond max quota)
 ```
 
-When GPU resources are under pressure:
-- The Preemption Engine automatically stops lower-priority runtimes
-- CRITICAL projects always get resources before HIGH, HIGH before NORMAL, etc.
-- Protected runtimes (`always_running: true`) are never evicted
+Scheduling decisions always use **effective_priority**, not the raw base weight.
 
 ```bash
-# Create a project with CRITICAL priority and 80GB VRAM reservation
+# Create a project with priority 900 and 80 GB VRAM reservation
 curl -X POST http://localhost:8081/admin/v1/projects \
   -H 'Content-Type: application/json' \
-  -d '{"organization_id":"ORG_ID","team_id":"TEAM_ID",
-       "name":"Fraud Detection","priority":"CRITICAL"}'
+  -d '{"organization_id":"ORG","team_id":"TEAM",
+       "name":"Fraud Detection","priority_weight":900}'
 
 curl -X POST http://localhost:8081/admin/v1/projects/PROJECT_ID/reserve \
   -H 'Content-Type: application/json' \
-  -d '{"reserved_vram_mb":81920}'
+  -d '{"reserved_vram_mb":81920,"max_gpu_vram_mb":163840}'
+
+# Change priority at runtime (takes effect within 60 s)
+curl -X POST http://localhost:8081/admin/v1/projects/PROJECT_ID/priority \
+  -H 'Content-Type: application/json' \
+  -d '{"priority_weight":950}'
+
+# View current effective priority breakdown
+curl http://localhost:8081/admin/v1/projects/PROJECT_ID
+
+# View scheduler queue (all projects, ordered by effective_priority DESC)
+curl http://localhost:8081/admin/v1/scheduler/queue
+
+# View recent placement decisions with full trace
+curl http://localhost:8081/admin/v1/scheduler/decisions
 ```
+
+
 
 ---
 
@@ -255,18 +283,22 @@ POST   /teams/:id/models              Grant model access
 POST   /teams/:id/api-keys            Create API key (shown once)
 
 # Projects
-POST   /projects                      {organization_id, team_id, name, priority}
-GET    /projects[?team_id=&priority=]
-GET    /projects/:id
-PUT    /projects/:id                  Update name/description/priority/status
+POST   /projects                      {organization_id, team_id, name, priority_weight}
+GET    /projects[?team_id=&min_weight=&max_weight=]
+GET    /projects/:id                  Full detail with effective_priority breakdown
+PUT    /projects/:id                  Update name/description/priority_weight/preemptible/status
 DELETE /projects/:id
-POST   /projects/:id/priority         Change priority (audited)
-POST   /projects/:id/reserve          {reserved_vram_mb, reserved_cpu_cores, reserved_memory_mb}
+POST   /projects/:id/priority         {priority_weight: 900}  (audited, instant effect)
+POST   /projects/:id/reserve          {reserved_vram_mb, reserved_cpu_cores, reserved_memory_mb, max_*}
 PUT    /projects/:id/protection       {always_running, protected, minimum_replicas, admission_policy}
 GET    /projects/:id/runtimes
 GET    /projects/:id/usage[?from=&to=&breakdown=model]
 GET    /projects/:id/preemptions
 GET    /projects/:id/queue
+# Scheduler
+GET    /scheduler/queue               Global queue ordered by effective_priority DESC
+GET    /scheduler/decisions           Recent placement decisions with priority trace
+GET    /scheduler/priority-presets    Standard priority preset labels
 
 # Models
 POST   /models/deploy                 Full deploy with optional auto_place
@@ -329,10 +361,14 @@ make dev-down           # stop all containers
 
 # Project management shortcuts
 make project-list
-make project-create ORG_ID=... TEAM_ID=... NAME="My Project" PRIORITY=CRITICAL
-make project-priority ID=... PRIORITY=HIGH
+make project-create ORG_ID=... TEAM_ID=... NAME="My Project" WEIGHT=900
+make project-priority ID=... WEIGHT=800
 make project-reserve ID=... VRAM_MB=81920
 make project-preemptions ID=...
+
+# Scheduler shortcuts
+make scheduler-queue
+make scheduler-decisions
 
 # AI Platform shortcuts
 make placement-simulate MODEL=llama3-8b VRAM=16384 GPUS=1
@@ -375,6 +411,13 @@ All migrations are idempotent (safe to re-run):
 | `009_resilience.sql` | runtime_requirements, node_health_events, model_lifecycle |
 | `010_lazy_runtime.sql` | lazy-load config columns, last_used_at |
 | `011_projects.sql` | projects, project_reservations, project_configurations, preemption_events, deployment_queue |
+| `012_unified_startup_states.sql` | unified container startup states |
+| `013_start_model_task_type.sql` | START_MODEL task type |
+| `014_execution_mode.sql` | execution_mode (cpu/gpu/auto) |
+| `015_catchup_schema.sql` | schema catch-up |
+| `016_workload_policy.sql` | workload_policy (lazy_load/always_on) |
+| `017_scheduler.sql` | scheduler_state, node_capabilities, model_requirements, scheduler_decisions |
+| `018_weighted_priority.sql` | **priority_weight [0–1000]** replaces enum; project_effective_priority; aging + bonuses; compute_effective_priority() function |
 
 ---
 
@@ -386,6 +429,9 @@ All migrations are idempotent (safe to re-run):
 - [ ] Firewall: ports 8081 (admin) and 3001 (web) internal-only
 - [ ] `NEXUS_SERVER_MODE=release` in production
 - [ ] Set `rpm` and `tpd` limits on every team before going live
-- [ ] Create CRITICAL projects for production workloads with VRAM reservations
+- [ ] Create projects with `priority_weight ≥ 900` for production workloads with VRAM reservations
+- [ ] Set `preemptible=false` on projects that must never be evicted
+- [ ] Apply migration 018 before starting the scheduler
 - [ ] Run `make test` before every deployment
 - [ ] Prometheus alert: `nexus_project_active_runtimes` drops to 0 for protected projects
+- [ ] Prometheus alert: `nexus_scheduler_queue_length` > 10 sustained for > 5 minutes

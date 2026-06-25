@@ -31,19 +31,26 @@ func NewPlacementHandler(db *sqlx.DB, engine *placement.Engine) *PlacementHandle
 // Useful for capacity planning and pre-flight checks.
 func (h *PlacementHandler) Simulate(c *gin.Context) {
 	var input struct {
-		ModelName   string `json:"model_name"   binding:"required"`
-		ServiceType string `json:"service_type" binding:"required"`
-		RuntimeType string `json:"runtime_type"`
-		Priority    string `json:"priority"`
-		MinVRAMMB   int64  `json:"min_vram_mb"`
-		MaxVRAMMB   int64  `json:"max_vram_mb"`
-		GPUCount    int    `json:"gpu_count"`
-		CPUCores    int    `json:"cpu_cores"`
-		NUMANode    int    `json:"numa_node"`
-		RAMMBLimit  int64  `json:"ram_mb"`
+		ModelName      string `json:"model_name"   binding:"required"`
+		ServiceType    string `json:"service_type" binding:"required"`
+		RuntimeType    string `json:"runtime_type"`
+		PriorityWeight int    `json:"priority"` // numeric [0–1000], defaults to 500
+		MinVRAMMB      int64  `json:"min_vram_mb"`
+		MaxVRAMMB      int64  `json:"max_vram_mb"`
+		GPUCount       int    `json:"gpu_count"`
+		CPUCores       int    `json:"cpu_cores"`
+		NUMANode       int    `json:"numa_node"`
+		RAMMBLimit     int64  `json:"ram_mb"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.PriorityWeight == 0 {
+		input.PriorityWeight = 500
+	}
+	if input.PriorityWeight < 0 || input.PriorityWeight > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "priority must be between 0 and 1000"})
 		return
 	}
 
@@ -61,7 +68,7 @@ func (h *PlacementHandler) Simulate(c *gin.Context) {
 		ModelName:   input.ModelName,
 		ServiceType: placement.ServiceType(input.ServiceType),
 		RuntimeType: rType,
-		Priority:    placement.Priority(orDefaultStr(input.Priority, "normal")),
+		Priority:    placement.PriorityWeight(input.PriorityWeight),
 		MinVRAMMB:   input.MinVRAMMB,
 		MaxVRAMMB:   input.MaxVRAMMB,
 		GPUCount:    orDefaultInt(input.GPUCount, 1),
@@ -103,18 +110,18 @@ func (h *PlacementHandler) Simulate(c *gin.Context) {
 // ListDecisions handles GET /admin/v1/placement/decisions
 func (h *PlacementHandler) ListDecisions(c *gin.Context) {
 	type decRow struct {
-		ID         string     `db:"id"          json:"id"`
-		ModelID    string     `db:"model_id"    json:"model_id"`
-		NodeID     *string    `db:"node_id"     json:"node_id"`
-		GPUDevices []byte     `db:"gpu_devices" json:"-"`
-		GPUStr     string     `json:"gpu_devices"`
-		CPUCores   int        `db:"cpu_cores"   json:"cpu_cores"`
-		NUMANode   int        `db:"numa_node"   json:"numa_node"`
-		Strategy   string     `db:"strategy"    json:"strategy"`
-		Score      float64    `db:"score"       json:"score"`
-		Reason     string     `db:"reason"      json:"reason"`
-		Applied    bool       `db:"applied"     json:"applied"`
-		CreatedAt  time.Time  `db:"created_at"  json:"created_at"`
+		ID         string    `db:"id"          json:"id"`
+		ModelID    string    `db:"model_id"    json:"model_id"`
+		NodeID     *string   `db:"node_id"     json:"node_id"`
+		GPUDevices []byte    `db:"gpu_devices" json:"-"`
+		GPUStr     string    `json:"gpu_devices"`
+		CPUCores   int       `db:"cpu_cores"   json:"cpu_cores"`
+		NUMANode   int       `db:"numa_node"   json:"numa_node"`
+		Strategy   string    `db:"strategy"    json:"strategy"`
+		Score      float64   `db:"score"       json:"score"`
+		Reason     string    `db:"reason"      json:"reason"`
+		Applied    bool      `db:"applied"     json:"applied"`
+		CreatedAt  time.Time `db:"created_at"  json:"created_at"`
 	}
 	var rows []decRow
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `

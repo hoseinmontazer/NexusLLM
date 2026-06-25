@@ -1,6 +1,6 @@
 # NexusLLM — AI Platform Roadmap
 
-## Current Status: v0.5 — AI Resource Orchestrator
+## Current Status: v0.7 — Weighted Priority Scheduler
 
 NexusLLM has been transformed from an LLM gateway into a full AI Resource
 Orchestrator. The sections below describe what is implemented and what comes next.
@@ -85,29 +85,43 @@ Admin API:
 
 All endpoints follow the same auth → policy → alias → failover pipeline.
 
-### Resource Reservation Engine (v0.5 — new)
-Services declare resource envelopes in `resource_reservations`:
+### Project Priority & Scheduling (v0.6 — weighted system)
+- **Weighted priority** — `priority_weight INTEGER [0–1000]` replaces the 5-tier enum
+  (`CRITICAL/HIGH/NORMAL/LOW/BEST_EFFORT`). Multiple projects at the same weight are
+  differentiated by effective priority (base + aging + reservation bonus − quota penalty).
+- **Effective priority** — computed per-scheduler-cycle by `compute_effective_priority()`;
+  stored in `project_effective_priority` for audit and display.
+- **Anti-starvation aging** — waiting jobs gain +1 per 60 s in queue, capped at +200.
+  A Best Effort job waiting 3+ hours can displace a Standard job.
+- **Reservation bonus** — projects with declared resource reservations receive +50 bonus.
+- **Quota penalty** — projects over their `max_gpu_vram_mb` / `max_cpu` ceiling get −100.
+- **Preemption gap rule** — `effective_priority(requester) − priority_weight(victim) ≥ 50`.
+  Prevents thrashing between near-equal projects.
+- **Preemptible flag** — `projects.preemptible=false` marks a project as safe from eviction
+  regardless of priority gap.
+- **Non-preemptible projects** — weight ≥ 900 projects are seeded `preemptible=false` on migration.
+- **Deployment queue** — ordered by `effective_priority DESC, waiting_since ASC`; exponential
+  backoff on retry (30s × 2^attempts, cap 30 min).
+- **Scheduler decisions table** — every placement decision logged with full priority trace,
+  node score, and alternatives.
+- **Scheduler API** — `GET /scheduler/queue`, `GET /scheduler/decisions`,
+  `GET /scheduler/priority-presets`.
+- **UI** — numeric priority input with preset picker, priority bar, `EffectivePriorityCard`
+  breakdown, queue panel, preemption history with numeric weights.
+- **Migration 018** — idempotent, back-fills existing projects from old enum values.
 
-```json
-{
-  "model_id": "...",
-  "min_vram_mb": 81920,
-  "max_vram_mb": 122880,
-  "priority": "critical",
-  "preferred_runtime": "GPU_RUNTIME"
-}
-```
+### Automatic Scheduler (v0.7 — new)
+- **Scheduler engine** (`internal/scheduler/`) — node loading, filtering, multi-factor scoring,
+  tie-breaking, decision building with full `DecisionTrace`.
+- **Node scoring** — capacity (VRAM/RAM/CPU free ratio, 0–400) + load (GPU util, runtime density,
+  health, 0–300) + locality (model cached on node, 0–200) + priority bonus (0–200).
+- **Cold start** — `RuntimeActivator.EnsureRunning` calls scheduler when `node_id` is empty.
+- **Queue processor** — background loop every 30 s retries queued deployments.
+- **Capacity management** — queue on exhaustion; preempt when admission_policy allows.
+- **Node capabilities** — `node_capabilities` table; scheduler filters by GPU availability.
+- **Model requirements** — `model_requirements` table caches computed VRAM/CPU/RAM needs.
 
-CPU-native services:
-```json
-{
-  "cpu_cores": 32,
-  "ram_mb": 65536,
-  "numa_node_pref": 0,
-  "priority": "normal",
-  "preferred_runtime": "CPU_RUNTIME"
-}
-```
+
 
 ### Cluster-Ready Multi-Server Architecture (v0.5 — new)
 - **`nodes` table** — hostname, total_cpu, total_ram_mb, total_vram_mb, status, labels
@@ -167,15 +181,15 @@ CPU Pool (384 vCPUs, 1 TB RAM)
 
 ### CPU Workload Placement
 
-| Service | Cores | RAM | NUMA | Priority |
+| Service | Cores | RAM | NUMA | Priority weight |
 |---|---|---|---|---|
-| Embedding (Infinity) | 32 | 64 GB | 0 | normal |
-| Reranker (TEI) | 16 | 32 GB | 0 | normal |
-| Whisper STT | 32 | 16 GB | 1 | normal |
-| Kokoro TTS | 16 | 8 GB | 1 | low |
-| OCR (EasyOCR) | 16 | 16 GB | 1 | low |
-| Agent Runtimes | 64 | 128 GB | 1 | high |
-| MCP Bridges | 8 | 8 GB | 0 | best_effort |
+| Embedding (Infinity) | 32 | 64 GB | 0 | 500 (Standard) |
+| Reranker (TEI) | 16 | 32 GB | 0 | 500 (Standard) |
+| Whisper STT | 32 | 16 GB | 1 | 500 (Standard) |
+| Kokoro TTS | 16 | 8 GB | 1 | 300 (Batch) |
+| OCR (EasyOCR) | 16 | 16 GB | 1 | 300 (Batch) |
+| Agent Runtimes | 64 | 128 GB | 1 | 700 (Core Internal) |
+| MCP Bridges | 8 | 8 GB | 0 | 0 (Best Effort) |
 
 ---
 

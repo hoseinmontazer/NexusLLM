@@ -1,17 +1,16 @@
 // Package preemption implements the Preemption Engine.
 //
-// The engine is responsible for:
-//  1. Detecting resource pressure on nodes (GPU util >95%, VRAM below reserved floor, RAM <5% free).
-//  2. Selecting candidate runtimes for eviction under resource pressure, in strict
-//     priority order (BEST_EFFORT first, CRITICAL last).
-//  3. Executing preemption: stop runtime → release resources → deploy higher-priority runtime.
-//  4. Recording every evaluation and execution in the preemption_events table.
-//
-// Polling interval: ≤30 seconds (consistent with nodehealth.CheckInterval).
+// Preemption rules (weighted priority model):
+//   - Requestor's effective_priority must exceed victim's priority_weight
+//     by at least project.PreemptionMinGap (50 points).
+//   - Protected runtimes (project_configurations.protected=TRUE) are never evicted.
+//   - Victim selection: lowest priority_weight first; ties broken by least-recently-used.
+//   - Every preemption decision is recorded in preemption_events with the numeric weights.
 package preemption
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -35,12 +34,9 @@ func NewEngine(db *sqlx.DB, taskMgr *taskmanager.Manager, log *zap.Logger) *Engi
 }
 
 // Start runs the pressure detection loop. Blocks until ctx is cancelled.
-// Polls every 30 seconds, consistent with nodehealth.CheckInterval.
 func (e *Engine) Start(ctx context.Context) {
 	e.log.Info("preemption engine started", zap.Duration("interval", 30*time.Second))
-	// Run immediately on start
 	e.sweep(ctx)
-
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -54,9 +50,7 @@ func (e *Engine) Start(ctx context.Context) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pressure detection sweep
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Pressure sweep ──────────────────────────────────────────────────────────
 
 type nodeRow struct {
 	ID       string `db:"id"`
@@ -65,8 +59,8 @@ type nodeRow struct {
 
 func (e *Engine) sweep(ctx context.Context) {
 	var nodes []nodeRow
-	if err := e.db.SelectContext(ctx, &nodes, `
-		SELECT id, hostname FROM nodes WHERE status IN ('online','degraded')`); err != nil {
+	if err := e.db.SelectContext(ctx, &nodes,
+		`SELECT id, hostname FROM nodes WHERE status IN ('online','degraded')`); err != nil {
 		e.log.Warn("preemption sweep: query nodes failed", zap.Error(err))
 		return
 	}
@@ -86,34 +80,28 @@ func (e *Engine) evaluateNode(ctx context.Context, nodeID, hostname string) {
 	if !pr.needEvict {
 		return
 	}
-
 	e.log.Info("resource pressure detected",
 		zap.String("node", hostname),
 		zap.String("trigger", pr.trigger),
 		zap.Float64("value", pr.pressureValue),
 	)
-
-	// Record the pressure evaluation event
 	e.recordEvaluation(ctx, nodeID, pr)
 
-	// Select the lowest-priority non-protected candidate to evict
 	candidate := e.selectEvictionCandidate(ctx, nodeID)
 	if candidate == nil {
 		e.log.Info("no eviction candidates found", zap.String("node", hostname))
 		return
 	}
-
 	e.log.Info("preempting runtime",
 		zap.String("node", hostname),
 		zap.String("runtime_id", candidate.RuntimeID),
-		zap.String("priority", candidate.Priority),
+		zap.Int("victim_weight", candidate.PriorityWeight),
 	)
-
 	e.executePreemption(ctx, candidate, nil, pr.trigger)
 }
 
 func (e *Engine) detectPressure(ctx context.Context, nodeID string) pressureResult {
-	// ── GPU utilisation check ────────────────────────────────────────────────
+	// GPU utilisation
 	var maxUtil int
 	_ = e.db.GetContext(ctx, &maxUtil, `
 		SELECT COALESCE(MAX(gt.utilization_pct), 0)
@@ -126,16 +114,11 @@ func (e *Engine) detectPressure(ctx context.Context, nodeID string) pressureResu
 		WHERE gn.node_id = $1`, nodeID)
 
 	if maxUtil > project.GPUPressureThresholdPct {
-		return pressureResult{
-			trigger:       project.TriggerGPUUtilization,
-			pressureValue: float64(maxUtil),
-			needEvict:     true,
-		}
+		return pressureResult{trigger: project.TriggerGPUUtilization, pressureValue: float64(maxUtil), needEvict: true}
 	}
 
-	// ── VRAM reservation check ────────────────────────────────────────────────
-	// Total free VRAM vs sum of CRITICAL+HIGH reservations for runtimes on this node
-	var freeVRAM int64
+	// VRAM reservation check: free VRAM vs sum of reservations for high-weight projects
+	var freeVRAM, reservedVRAM int64
 	_ = e.db.GetContext(ctx, &freeVRAM, `
 		SELECT COALESCE(SUM(d.vram_mb - COALESCE(gt.memory_used_mb, 0)), 0)
 		FROM gpu_devices d
@@ -146,91 +129,79 @@ func (e *Engine) detectPressure(ctx context.Context, nodeID string) pressureResu
 		) gt ON TRUE
 		WHERE gn.node_id = $1`, nodeID)
 
-	var reservedVRAM int64
+	// Reserved by projects with weight >= 700 (core internal and above)
 	_ = e.db.GetContext(ctx, &reservedVRAM, `
 		SELECT COALESCE(SUM(pr.reserved_vram_mb), 0)
 		FROM project_reservations pr
 		JOIN projects p ON p.id = pr.project_id
 		JOIN agent_runtimes ar ON ar.project_id = p.id AND ar.node_id = $1
-		WHERE p.priority IN ('CRITICAL','HIGH')
+		WHERE p.priority_weight >= 700
 		  AND ar.state IN ('ready','active','warm','idle','loading_model')`, nodeID)
 
 	if freeVRAM < reservedVRAM {
-		return pressureResult{
-			trigger:       project.TriggerVRAMExhaustion,
-			pressureValue: float64(freeVRAM),
-			needEvict:     true,
-		}
+		return pressureResult{trigger: project.TriggerVRAMExhaustion, pressureValue: float64(freeVRAM), needEvict: true}
 	}
 
-	// ── RAM pressure check ─────────────────────────────────────────────────────
+	// RAM pressure
 	var ramRow struct {
 		Total int64 `db:"ram_total_mb"`
 		Used  int64 `db:"ram_used_mb"`
 	}
-	err := e.db.GetContext(ctx, &ramRow, `
+	if err := e.db.GetContext(ctx, &ramRow, `
 		SELECT ram_total_mb, ram_used_mb FROM node_telemetry
-		WHERE node_id = $1 ORDER BY recorded_at DESC LIMIT 1`, nodeID)
-	if err == nil && ramRow.Total > 0 {
+		WHERE node_id = $1 ORDER BY recorded_at DESC LIMIT 1`, nodeID); err == nil && ramRow.Total > 0 {
 		freeRAM := ramRow.Total - ramRow.Used
-		thresholdMB := ramRow.Total * project.RAMPressureFreeThresholdPct / 100
-		if freeRAM < thresholdMB {
-			return pressureResult{
-				trigger:       project.TriggerMemExhaustion,
-				pressureValue: float64(freeRAM),
-				needEvict:     true,
-			}
+		threshold := ramRow.Total * project.RAMPressureFreeThresholdPct / 100
+		if freeRAM < threshold {
+			return pressureResult{trigger: project.TriggerMemExhaustion, pressureValue: float64(freeRAM), needEvict: true}
 		}
 	}
 
 	return pressureResult{needEvict: false}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Candidate selection
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Candidate selection ──────────────────────────────────────────────────────
 
 type candidateRuntime struct {
-	RuntimeID   string
-	ContainerID string
-	NodeID      string
-	ProjectID   *string
-	Priority    string
-	LastUsedAt  *time.Time
-	EndpointID  string
+	RuntimeID      string
+	ContainerID    string
+	NodeID         string
+	ProjectID      *string
+	PriorityWeight int // project.priority_weight
+	LastUsedAt     *time.Time
+	EndpointID     string
 }
 
-// selectEvictionCandidate picks the lowest-priority non-protected runtime
-// on the node. Within the same tier, picks the least-recently-used runtime.
-// NULL last_used_at is treated as oldest.
+// selectEvictionCandidate picks the lowest-weight non-protected runtime.
+// Within the same weight band, picks the least-recently-used runtime.
 func (e *Engine) selectEvictionCandidate(ctx context.Context, nodeID string) *candidateRuntime {
-	// Ordered by priority score ASC (lowest priority first), then least recently used.
-	// Excludes protected runtimes (always_running=TRUE or protected=TRUE).
 	type row struct {
-		RuntimeID   string     `db:"id"`
-		ContainerID string     `db:"container_id"`
-		NodeID      string     `db:"node_id"`
-		ProjectID   *string    `db:"project_id"`
-		Priority    string     `db:"priority"`
-		LastUsedAt  *time.Time `db:"last_used_at"`
-		EndpointID  string     `db:"endpoint_id"`
+		RuntimeID      string     `db:"id"`
+		ContainerID    string     `db:"container_id"`
+		NodeID         string     `db:"node_id"`
+		ProjectID      *string    `db:"project_id"`
+		PriorityWeight int        `db:"priority_weight"`
+		LastUsedAt     *time.Time `db:"last_used_at"`
+		EndpointID     string     `db:"endpoint_id"`
 	}
 	var candidates []row
 	if err := e.db.SelectContext(ctx, &candidates, `
-		SELECT ar.id, COALESCE(ar.container_id,'') AS container_id,
-		       ar.node_id, ar.project_id,
-		       COALESCE(p.priority,'NORMAL') AS priority,
+		SELECT ar.id,
+		       COALESCE(ar.container_id,'')          AS container_id,
+		       ar.node_id,
+		       ar.project_id,
+		       COALESCE(p.priority_weight, 500)       AS priority_weight,
 		       ar.last_used_at,
-		       COALESCE(ar.endpoint_id::text,'') AS endpoint_id
+		       COALESCE(ar.endpoint_id::text,'')      AS endpoint_id
 		FROM agent_runtimes ar
 		LEFT JOIN projects p ON p.id = ar.project_id
 		LEFT JOIN project_configurations pc ON pc.project_id = p.id
 		WHERE ar.node_id = $1
 		  AND ar.state IN ('ready','active','warm','idle')
-		  -- Exclude protected runtimes
 		  AND COALESCE(pc.always_running, FALSE) = FALSE
 		  AND COALESCE(pc.protected, FALSE) = FALSE
-		ORDER BY project_priority_score(COALESCE(p.priority,'NORMAL')) ASC,
+		  AND COALESCE(p.preemptible, TRUE) = TRUE
+		ORDER BY COALESCE(p.priority_weight, 500) ASC,
 		         COALESCE(ar.last_used_at, '1970-01-01'::timestamptz) ASC
 		LIMIT 5`, nodeID); err != nil {
 		e.log.Warn("selectEvictionCandidate query failed", zap.Error(err), zap.String("node_id", nodeID))
@@ -241,52 +212,51 @@ func (e *Engine) selectEvictionCandidate(ctx context.Context, nodeID string) *ca
 	}
 	c := candidates[0]
 	return &candidateRuntime{
-		RuntimeID:   c.RuntimeID,
-		ContainerID: c.ContainerID,
-		NodeID:      c.NodeID,
-		ProjectID:   c.ProjectID,
-		Priority:    c.Priority,
-		LastUsedAt:  c.LastUsedAt,
-		EndpointID:  c.EndpointID,
+		RuntimeID:      c.RuntimeID,
+		ContainerID:    c.ContainerID,
+		NodeID:         c.NodeID,
+		ProjectID:      c.ProjectID,
+		PriorityWeight: c.PriorityWeight,
+		LastUsedAt:     c.LastUsedAt,
+		EndpointID:     c.EndpointID,
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── PreemptForProject ────────────────────────────────────────────────────────
+
 // PreemptForProject executes preemption on behalf of a higher-priority project.
-// Called by the scheduler when a CRITICAL/HIGH deployment cannot be placed.
-// Returns true if preemption succeeded and resources were freed.
-// ─────────────────────────────────────────────────────────────────────────────
+// requestingEffective is the requester's computed effective_priority.
+// Returns true if preemption succeeded.
 func (e *Engine) PreemptForProject(
 	ctx context.Context,
 	nodeID string,
 	requestingRuntimeID string,
 	requestingProjectID string,
-	requestingPriority project.Priority,
+	requestingWeight project.PriorityWeight,
+	requestingEffective int,
 ) (bool, error) {
 	candidate := e.selectEvictionCandidate(ctx, nodeID)
 	if candidate == nil {
 		return false, fmt.Errorf("no eviction candidates available on node %s", nodeID)
 	}
 
-	// Verify the preemption rule: requestor must have strictly higher priority
-	candidatePriority := project.Priority(candidate.Priority)
-	if !requestingPriority.CanPreempt(candidatePriority) {
-		return false, fmt.Errorf("priority %s cannot preempt %s (same or lower tier)",
-			requestingPriority, candidatePriority)
-	}
+	victimWeight := project.PriorityWeight(candidate.PriorityWeight)
 
-	// CRITICAL runtimes can never be preempted
-	if candidatePriority == project.PriorityCritical {
-		return false, fmt.Errorf("cannot preempt CRITICAL runtime %s", candidate.RuntimeID)
+	// Use effective priority of requester vs base weight of victim
+	effectiveRequester := project.PriorityWeight(requestingEffective)
+	if !effectiveRequester.CanPreempt(victimWeight) {
+		return false, fmt.Errorf(
+			"%w: requester effective=%d victim weight=%d (need gap ≥ %d)",
+			ErrPreemptionNotAllowed, requestingEffective, candidate.PriorityWeight,
+			project.PreemptionMinGap,
+		)
 	}
 
 	err := e.executePreemption(ctx, candidate, &requestingRuntimeID, project.TriggerAdmission)
 	return err == nil, err
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Preemption execution
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Execution ────────────────────────────────────────────────────────────────
 
 func (e *Engine) executePreemption(
 	ctx context.Context,
@@ -296,23 +266,20 @@ func (e *Engine) executePreemption(
 ) error {
 	const stopTimeout = 60 * time.Second
 
-	// Step 1: set state = 'stopping'
-	_, err := e.db.ExecContext(ctx, `
-		UPDATE agent_runtimes SET state='stopping', updated_at=NOW()
-		WHERE id=$1 AND state IN ('active','warm','idle')`, candidate.RuntimeID)
+	_, err := e.db.ExecContext(ctx,
+		`UPDATE agent_runtimes SET state='stopping', updated_at=NOW()
+		 WHERE id=$1 AND state IN ('active','warm','idle')`, candidate.RuntimeID)
 	if err != nil {
 		return fmt.Errorf("mark stopping: %w", err)
 	}
 
-	// Step 2: disable the associated endpoint
 	if candidate.EndpointID != "" {
-		_, _ = e.db.ExecContext(ctx, `
-			UPDATE model_endpoints
-			SET is_enabled=FALSE, lifecycle_state='draining', health_status='draining', updated_at=NOW()
-			WHERE id=$1`, candidate.EndpointID)
+		_, _ = e.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET is_enabled=FALSE, lifecycle_state='draining', health_status='draining', updated_at=NOW()
+			 WHERE id=$1`, candidate.EndpointID)
 	}
 
-	// Step 3: dispatch STOP_RUNTIME task
 	payload := taskmanager.StopRuntimePayload{
 		RuntimeID:   candidate.RuntimeID,
 		ContainerID: candidate.ContainerID,
@@ -320,51 +287,43 @@ func (e *Engine) executePreemption(
 	}
 	taskID, err := e.taskMgr.Enqueue(ctx, candidate.NodeID,
 		taskmanager.TaskStopRuntime, payload,
-		taskmanager.WithPriority(95), // preemption is high-urgency
+		taskmanager.WithPriority(95),
 		taskmanager.WithActor("preemption-engine"),
 		taskmanager.WithRuntimeID(candidate.RuntimeID),
 		taskmanager.WithTimeout(stopTimeout+10*time.Second),
 		taskmanager.WithIdempotencyKey(fmt.Sprintf("preempt:%s", candidate.RuntimeID)),
 	)
 	if err != nil {
-		e.log.Error("preemption: enqueue STOP_RUNTIME failed",
-			zap.String("runtime_id", candidate.RuntimeID),
-			zap.Error(err),
-		)
-		// Rollback state
-		_, _ = e.db.ExecContext(ctx, `
-			UPDATE agent_runtimes SET state='active', updated_at=NOW() WHERE id=$1`, candidate.RuntimeID)
+		_, _ = e.db.ExecContext(ctx,
+			`UPDATE agent_runtimes SET state='active', updated_at=NOW() WHERE id=$1`, candidate.RuntimeID)
 		return fmt.Errorf("enqueue STOP_RUNTIME: %w", err)
 	}
 
 	e.log.Info("preemption STOP_RUNTIME dispatched",
 		zap.String("runtime_id", candidate.RuntimeID),
 		zap.String("task_id", taskID),
+		zap.Int("victim_weight", candidate.PriorityWeight),
 	)
 
-	// Step 4: wait for the task to reach success or failed (with timeout)
 	waitCtx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
 	if waitErr := e.waitForTask(waitCtx, taskID); waitErr != nil {
-		e.log.Warn("preemption STOP_RUNTIME did not complete successfully",
+		e.log.Warn("preemption STOP_RUNTIME did not complete",
 			zap.String("runtime_id", candidate.RuntimeID),
 			zap.Error(waitErr),
 		)
 		e.recordPreemptionEvent(ctx, candidate, requestingRuntimeID, trigger)
-		return fmt.Errorf("STOP_RUNTIME failed/timeout for runtime %s: %w", candidate.RuntimeID, waitErr)
+		return fmt.Errorf("STOP_RUNTIME failed for runtime %s: %w", candidate.RuntimeID, waitErr)
 	}
 
-	// Step 5: record the completed preemption
 	e.recordPreemptionEvent(ctx, candidate, requestingRuntimeID, trigger)
-
 	e.log.Info("preemption succeeded",
 		zap.String("runtime_id", candidate.RuntimeID),
-		zap.String("priority", candidate.Priority),
+		zap.Int("victim_weight", candidate.PriorityWeight),
 	)
 	return nil
 }
 
-// waitForTask polls agent_tasks until success or failed/timeout.
 func (e *Engine) waitForTask(ctx context.Context, taskID string) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -387,17 +346,17 @@ func (e *Engine) waitForTask(ctx context.Context, taskID string) error {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Audit recording
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+var ErrPreemptionNotAllowed = fmt.Errorf("preemption not allowed")
+
+// ─── Audit recording ──────────────────────────────────────────────────────────
 
 func (e *Engine) recordEvaluation(ctx context.Context, nodeID string, pr pressureResult) {
-	pv := pr.pressureValue
 	_, _ = e.db.ExecContext(ctx, `
-		INSERT INTO preemption_events
-		  (id, node_id, trigger, pressure_value, created_at)
+		INSERT INTO preemption_events (id, node_id, trigger, pressure_value, created_at)
 		VALUES ($1,$2,$3,$4,NOW())`,
-		uuid.New().String(), nodeID, pr.trigger, pv,
+		uuid.New().String(), nodeID, pr.trigger, pr.pressureValue,
 	)
 }
 
@@ -407,17 +366,23 @@ func (e *Engine) recordPreemptionEvent(
 	requestingRuntimeID *string,
 	trigger string,
 ) {
+	trace, _ := json.Marshal(map[string]interface{}{
+		"victim_weight":     candidate.PriorityWeight,
+		"victim_runtime_id": candidate.RuntimeID,
+		"trigger":           trigger,
+	})
 	_, _ = e.db.ExecContext(ctx, `
 		INSERT INTO preemption_events
-		  (id, node_id, preempted_runtime_id, preempted_project_id, preempted_priority,
-		   requesting_runtime_id, requesting_project_id, trigger, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,NOW())`,
+		  (id, node_id, preempted_runtime_id, preempted_project_id, preempted_weight,
+		   requesting_runtime_id, requesting_project_id, trigger, decision_trace, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,NOW())`,
 		uuid.New().String(),
 		candidate.NodeID,
 		candidate.RuntimeID,
 		candidate.ProjectID,
-		candidate.Priority,
+		candidate.PriorityWeight,
 		requestingRuntimeID,
 		trigger,
+		trace,
 	)
 }

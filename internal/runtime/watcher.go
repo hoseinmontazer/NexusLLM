@@ -154,6 +154,46 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	// ── Persist to PostgreSQL ──────────────────────────────────────────────
 	w.persistHealthResult(ctx, ep.ID, result)
 
+	// ── Promote loading_model/waiting_ready → ready on first successful health check ────
+	// HA reconciler creates agent_runtimes with endpoint_id=NULL. These enter the
+	// routing pool with health_status='unknown' while loading. The first passing
+	// health check here transitions them to 'ready' so requests start flowing.
+	// This is the mechanism that closes the HA failover loop end-to-end.
+	if result.Status == StatusHealthy {
+		_, _ = w.db.ExecContext(ctx, `
+			UPDATE agent_runtimes
+			SET state = 'ready', last_used_at = COALESCE(last_used_at, NOW()), updated_at = NOW()
+			WHERE id = $1
+			  AND state IN ('loading_model','waiting_ready','loading')
+			  AND endpoint_id IS NULL`,
+			ep.ID)
+	}
+
+	// ── Immediately disable and remove DOWN endpoints from routing ─────────
+	// When an endpoint is definitively down (circuit breaker fired), set
+	// is_enabled=FALSE in DB so the next registry.Reload() drops it entirely.
+	// This is faster than waiting for the node health monitor's 5-min timeout.
+	// Also mark the agent_runtime row as 'failed' so the stuck-runtime sweeper
+	// and the lazy-load activator know to restart the container.
+	if result.Status == StatusDown {
+		_, _ = w.db.ExecContext(ctx, `
+			UPDATE model_endpoints
+			SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
+			WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
+
+		// Mark the agent_runtime row failed so the sweeper/activator restarts it.
+		// ep.ID is either a model_endpoints.id (legacy path) or an agent_runtimes.id
+		// (HA replica path). Update both tables — the wrong one will match 0 rows.
+		_, _ = w.db.ExecContext(ctx, `
+			UPDATE agent_runtimes
+			SET state     = 'failed',
+			    error_msg = 'health check failed 3 consecutive times — container may be gone',
+			    updated_at = NOW()
+			WHERE (id = $1 OR endpoint_id = $1)
+			  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
+			ep.ID)
+	}
+
 	// ── Prometheus metrics ─────────────────────────────────────────────────
 	upVal := 0.0
 	if result.Status == StatusHealthy {
@@ -209,24 +249,32 @@ func (w *Watcher) persistHealthResult(ctx context.Context, epID string, h Endpoi
 		)
 	}
 
-	// Append to health log (kept for trending / alerting).
-	_, _ = w.db.ExecContext(ctx, `
-		INSERT INTO endpoint_health_log (endpoint_id, status, latency_ms, error_msg, checked_at)
-		VALUES ($1, $2, $3, $4, $5)`,
-		epID, string(h.Status), h.LatencyMs, h.Error, h.CheckedAt,
-	)
+	// Append to health log only for model_endpoints rows (not agent_runtimes HA replicas).
+	// endpoint_health_log.endpoint_id has a FK to model_endpoints(id); inserting
+	// an agent_runtimes UUID here would violate that constraint.
+	var isRealEndpoint bool
+	_ = w.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM model_endpoints WHERE id = $1)`, epID,
+	).Scan(&isRealEndpoint)
+	if isRealEndpoint {
+		_, _ = w.db.ExecContext(ctx, `
+			INSERT INTO endpoint_health_log (endpoint_id, status, latency_ms, error_msg, checked_at)
+			VALUES ($1, $2, $3, $4, $5)`,
+			epID, string(h.Status), h.LatencyMs, h.Error, h.CheckedAt,
+		)
 
-	// Prune old log entries (keep last 1000 per endpoint).
-	_, _ = w.db.ExecContext(ctx, `
-		DELETE FROM endpoint_health_log
-		WHERE endpoint_id = $1
-		  AND id NOT IN (
-		      SELECT id FROM endpoint_health_log
-		      WHERE endpoint_id = $1
-		      ORDER BY checked_at DESC
-		      LIMIT 1000
-		  )`, epID,
-	)
+		// Prune old log entries (keep last 1000 per endpoint).
+		_, _ = w.db.ExecContext(ctx, `
+			DELETE FROM endpoint_health_log
+			WHERE endpoint_id = $1
+			  AND id NOT IN (
+			      SELECT id FROM endpoint_health_log
+			      WHERE endpoint_id = $1
+			      ORDER BY checked_at DESC
+			      LIMIT 1000
+			  )`, epID,
+		)
+	}
 }
 
 func (w *Watcher) incrementFailures(ctx context.Context, epID string) int {

@@ -25,3 +25,6 @@
 17. [Configuration Reference](17-configuration.md)
 18. [Troubleshooting](18-troubleshooting.md)
 19. [Node Agent Architecture](19-node-agent-architecture.md)
+20. [Automatic Scheduler & Placement](20-automatic-scheduler.md)
+21. [Weighted Priority & Scheduling](21-weighted-priority.md)
+22. [High Availability & Self-Healing](22-high-availability.md)

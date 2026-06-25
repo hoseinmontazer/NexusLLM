@@ -88,21 +88,12 @@ func main() {
 	defer watchCancel()
 	go watcher.Start(watchCtx)
 
-	// ── Registry auto-reload every 60s ────────────────────────────────────────
-	go func() {
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-watchCtx.Done():
-				return
-			case <-t.C:
-				if err := registry.Reload(watchCtx); err != nil {
-					log.Warn("registry reload failed", zap.Error(err))
-				}
-			}
-		}
-	}()
+	// ── Registry auto-reload every 10s ───────────────────────────────────────
+	// Short interval ensures HA replicas and recovered runtimes are routable
+	// within 10 seconds of becoming healthy. The 60s reload was too slow for
+	// failover — a dead node can go offline in 5 min but we want < 30s
+	// routing recovery once the replacement runtime is ready.
+	go registry.StartPeriodicReload(watchCtx, 10*time.Second)
 
 	// ── Services ──────────────────────────────────────────────────────────────
 	authSvc := auth.NewService(rdb, db, cfg.Auth.JWTSecret, cfg.Auth.APIKeyCacheTTL)

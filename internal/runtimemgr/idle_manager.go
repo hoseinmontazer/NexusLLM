@@ -57,18 +57,19 @@ func (m *IdleManager) Start(ctx context.Context) {
 }
 
 type idleRow struct {
-	RuntimeID     string     `db:"id"`
-	NodeID        string     `db:"node_id"`
-	ModelID       string     `db:"model_id"`
-	ModelName     string     `db:"model_name"`
-	ContainerID   string     `db:"container_id"`
-	EndpointID    string     `db:"endpoint_id"`
-	LastUsedAt    *time.Time `db:"last_used_at"`
-	IdleTimeout   *int       `db:"idle_timeout_secs"`
-	ProjectID     *string    `db:"project_id"`
-	AlwaysRunning bool       `db:"always_running"`
-	Protected     bool       `db:"protected"`
-	MinReplicas   int        `db:"minimum_replicas"`
+	RuntimeID      string     `db:"id"`
+	NodeID         string     `db:"node_id"`
+	ModelID        string     `db:"model_id"`
+	ModelName      string     `db:"model_name"`
+	ContainerID    string     `db:"container_id"`
+	EndpointID     string     `db:"endpoint_id"`
+	LastUsedAt     *time.Time `db:"last_used_at"`
+	IdleTimeout    *int       `db:"idle_timeout_secs"`
+	ProjectID      *string    `db:"project_id"`
+	AlwaysRunning  bool       `db:"always_running"`
+	Protected      bool       `db:"protected"`
+	MinReplicas    int        `db:"minimum_replicas"`
+	WorkloadPolicy string     `db:"workload_policy"`
 }
 
 func (m *IdleManager) evict(ctx context.Context) {
@@ -83,7 +84,8 @@ func (m *IdleManager) evict(ctx context.Context) {
 		       ar.project_id,
 		       COALESCE(pc.always_running, FALSE)  AS always_running,
 		       COALESCE(pc.protected, FALSE)        AS protected,
-		       COALESCE(pc.minimum_replicas, 0)     AS minimum_replicas
+		       COALESCE(pc.minimum_replicas, 0)     AS minimum_replicas,
+		       COALESCE(ar.workload_policy, 'lazy_load') AS workload_policy
 		FROM agent_runtimes ar
 		JOIN models mo ON mo.id = ar.model_id
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
@@ -95,6 +97,11 @@ func (m *IdleManager) evict(ctx context.Context) {
 	}
 
 	for _, row := range rows {
+		// Workload policy protection: never evict always_on services
+		if row.WorkloadPolicy == "always_on" {
+			continue
+		}
+
 		// Project protection: skip always_running or protected runtimes
 		if row.AlwaysRunning || row.Protected {
 			continue

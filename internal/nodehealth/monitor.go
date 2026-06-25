@@ -2,10 +2,10 @@
 // It runs as a background goroutine inside nexus-admin and transitions
 // node status based on time since last heartbeat:
 //
-//   < 30s since heartbeat  → ONLINE
-//   30–90s since heartbeat → UNHEALTHY (missed 1–3 heartbeats)
-//   90s–5min               → UNHEALTHY (will become OFFLINE soon)
-//   > 5 minutes            → OFFLINE
+//	< 30s since heartbeat  → ONLINE
+//	30–90s since heartbeat → UNHEALTHY (missed 1–3 heartbeats)
+//	90s–5min               → UNHEALTHY (will become OFFLINE soon)
+//	> 5 minutes            → OFFLINE
 //
 // When a node goes OFFLINE:
 //   - All runtimes on that node become LOST
@@ -157,12 +157,14 @@ func (m *Monitor) transition(ctx context.Context, nodeID, hostname, from, to str
 // handleNodeOffline marks all runtimes on the node as LOST and removes
 // their endpoints from gateway routing.
 func (m *Monitor) handleNodeOffline(ctx context.Context, nodeID, hostname string) {
-	// 1. Mark all active runtimes as LOST
+	// 1. Mark ALL non-terminal runtimes as LOST — including 'stopped'.
+	// A stopped runtime on an offline node cannot be restarted on that node;
+	// the reconciler will schedule it on a healthy node.
 	res, _ := m.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
 		SET state = 'lost', updated_at = NOW()
 		WHERE node_id = $1
-		  AND state NOT IN ('stopped','unloaded','deleted','archived','lost')`,
+		  AND state NOT IN ('deleted','archived','lost')`,
 		nodeID)
 	if n, _ := res.RowsAffected(); n > 0 {
 		m.log.Info("runtimes marked LOST",
@@ -171,16 +173,18 @@ func (m *Monitor) handleNodeOffline(ctx context.Context, nodeID, hostname string
 		)
 	}
 
-	// 2. Mark all model_endpoints on this node as DOWN
-	// Gateway watcher reads health_status — setting it to 'down' removes
-	// the endpoint from routing on the next watcher tick (within 5s).
+	// 2. Disable all model_endpoints on this node:
+	//    - Set health_status = 'down' so the gateway watcher removes them from routing
+	//    - Set is_enabled = FALSE so the registry stops including them on Reload
+	//    - Set lifecycle_state = 'failed' to reflect the node is down
 	res2, _ := m.db.ExecContext(ctx, `
 		UPDATE model_endpoints
-		SET health_status = 'down',
-		    lifecycle_state = 'failed',
-		    updated_at = NOW()
+		SET health_status   = 'down',
+		    lifecycle_state  = 'failed',
+		    is_enabled       = FALSE,
+		    updated_at       = NOW()
 		WHERE node_id = $1
-		  AND health_status NOT IN ('down','draining')`,
+		  AND (health_status != 'down' OR is_enabled = TRUE)`,
 		nodeID)
 	if n, _ := res2.RowsAffected(); n > 0 {
 		m.log.Info("endpoints taken offline",

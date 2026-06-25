@@ -110,13 +110,18 @@ func (h *ServiceHandler) DeployService(c *gin.Context) {
 		ModelName:   input.Name,
 		ServiceType: placement.ServiceType(input.ServiceType),
 		RuntimeType: rType,
-		Priority:    placement.Priority(orDefaultStr(input.Priority, "normal")),
-		MinVRAMMB:   input.MinVRAMMB,
-		MaxVRAMMB:   input.MaxVRAMMB,
-		GPUCount:    orDefaultInt(input.GPUCount, 1),
-		CPUCores:    input.CPUCores,
-		NUMANode:    orDefaultInt(input.NUMANode, -1),
-		RAMMBLimit:  input.RAMMBLimit,
+		Priority: placement.PriorityWeight(func() int {
+			if input.PriorityWeight > 0 {
+				return input.PriorityWeight
+			}
+			return 500 // default Standard
+		}()),
+		MinVRAMMB:  input.MinVRAMMB,
+		MaxVRAMMB:  input.MaxVRAMMB,
+		GPUCount:   orDefaultInt(input.GPUCount, 1),
+		CPUCores:   input.CPUCores,
+		NUMANode:   orDefaultInt(input.NUMANode, -1),
+		RAMMBLimit: input.RAMMBLimit,
 	}
 	if rType == placement.RuntimeCPU {
 		pReq.GPUCount = 0
