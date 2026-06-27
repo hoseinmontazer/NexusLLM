@@ -45,8 +45,13 @@ export function Sidebar() {
     <aside className="w-56 bg-gray-900 text-white flex flex-col shrink-0">
       {/* Logo */}
       <div className="flex items-center gap-2 px-5 py-4 border-b border-gray-700/60">
-        <Zap className="w-5 h-5 text-blue-400" />
-        <span className="font-bold text-base tracking-tight">NexusLLM</span>
+        <div className="w-7 h-7 rounded-md bg-blue-600 flex items-center justify-center shrink-0">
+          <Zap className="w-4 h-4 text-white" />
+        </div>
+        <div className="flex flex-col leading-none">
+          <span className="font-bold text-base tracking-tight">NexusLLM</span>
+          <span className="text-[10px] text-gray-500">AI Infrastructure</span>
+        </div>
       </div>
 
       {/* Navigation */}
@@ -66,7 +71,7 @@ export function Sidebar() {
               key={href}
               href={href}
               className={cn(
-                'flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors',
+                'group flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors',
                 active
                   ? 'bg-blue-600 text-white'
                   : 'text-gray-400 hover:bg-gray-800 hover:text-white'
@@ -80,16 +85,18 @@ export function Sidebar() {
       </nav>
 
       {/* Footer */}
-      <div className="px-5 py-3 border-t border-gray-700/60">
+      <div className="px-3 py-3 border-t border-gray-700/60 space-y-1">
         <a
           href="http://localhost:9100"
           target="_blank"
           rel="noreferrer"
-          className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-300"
+          className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors"
         >
           <Gauge className="w-3.5 h-3.5" />
-          Prometheus →
+          Prometheus
+          <span className="ml-auto text-gray-600">→</span>
         </a>
+        <p className="px-2 pt-1 text-[10px] text-gray-600">v0.1.0 · admin panel</p>
       </div>
     </aside>
   )

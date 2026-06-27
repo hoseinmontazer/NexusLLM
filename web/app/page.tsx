@@ -224,20 +224,20 @@ export default async function DashboardPage() {
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
-            <Link href="/models" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">🦙 Deploy Model</span>
+            <Link href="/models" className="group flex flex-col gap-1 p-3 rounded-lg border hover:border-blue-300 hover:bg-blue-50/50 transition-colors">
+              <span className="font-medium flex items-center gap-1.5"><Cpu className="w-4 h-4 text-blue-600" />Deploy Model</span>
               <span className="text-xs text-muted-foreground">Register or deploy an LLM with HA replicas</span>
             </Link>
-            <Link href="/ha" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">🔁 HA & Failover</span>
+            <Link href="/ha" className="group flex flex-col gap-1 p-3 rounded-lg border hover:border-blue-300 hover:bg-blue-50/50 transition-colors">
+              <span className="font-medium flex items-center gap-1.5"><Zap className="w-4 h-4 text-amber-500" />HA &amp; Failover</span>
               <span className="text-xs text-muted-foreground">Configure replicas, recovery policy, placement</span>
             </Link>
-            <Link href="/runtimes" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">⚡ Runtime Status</span>
+            <Link href="/runtimes" className="group flex flex-col gap-1 p-3 rounded-lg border hover:border-blue-300 hover:bg-blue-50/50 transition-colors">
+              <span className="font-medium flex items-center gap-1.5"><Activity className="w-4 h-4 text-green-600" />Runtime Status</span>
               <span className="text-xs text-muted-foreground">View all containers across every node</span>
             </Link>
-            <Link href="/cluster" className="flex flex-col gap-1 p-3 rounded-lg border hover:bg-gray-50 transition-colors">
-              <span className="font-medium">🖥 Cluster Nodes</span>
+            <Link href="/cluster" className="group flex flex-col gap-1 p-3 rounded-lg border hover:border-blue-300 hover:bg-blue-50/50 transition-colors">
+              <span className="font-medium flex items-center gap-1.5"><Network className="w-4 h-4 text-teal-600" />Cluster Nodes</span>
               <span className="text-xs text-muted-foreground">GPU inventory, placement, resource usage</span>
             </Link>
           </div>
