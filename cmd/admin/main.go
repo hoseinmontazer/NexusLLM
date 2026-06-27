@@ -185,6 +185,7 @@ func main() {
 	lazyH := handlers.NewLazyRuntimeHandler(db)
 	projectH := handlers.NewProjectHandler(db)
 	haH := handlers.NewHAHandler(db)
+	ppH2 := handlers.NewProjectPolicyHandler(db, rdb, policyEngine, usageTracker)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -217,6 +218,7 @@ func main() {
 	a.POST("/teams/:id/api-keys", apikeyH.CreateAPIKey)
 	a.GET("/teams/:id/api-keys", apikeyH.ListAPIKeys)
 	a.DELETE("/api-keys/:id", apikeyH.RevokeAPIKey)
+	a.PUT("/api-keys/:id/project", apikeyH.SetKeyProject) // scope key to a project
 
 	// ── Models ────────────────────────────────────────────────────────────────
 	// POST /admin/v1/models/deploy  ← must come before /models/:id to avoid conflict
@@ -330,6 +332,12 @@ func main() {
 	a.GET("/projects/:id/usage", projectH.GetUsage)
 	a.GET("/projects/:id/preemptions", projectH.GetPreemptions)
 	a.GET("/projects/:id/queue", projectH.GetQueue)
+	// Project policy, quota and usage analytics (migration 023)
+	a.GET("/projects/:id/policy", ppH2.GetPolicy)
+	a.PUT("/projects/:id/policy", ppH2.UpdatePolicy)
+	a.GET("/projects/:id/quota", ppH2.GetQuotaStatus)
+	a.GET("/projects/:id/usage/daily", ppH2.GetDailyUsage)
+	a.GET("/projects/:id/usage/summary", ppH2.GetUsageSummary)
 
 	// ── Agent API (called by node agents, not human operators) ────────────────
 	// Registration does NOT require auth (bootstrapping)

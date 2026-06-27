@@ -338,6 +338,63 @@ export interface SchedulerDecision {
   completed_at?: string
 }
 
+// ── Project policy & quota types (migration 023) ─────────────────────────────
+export interface ProjectPolicy {
+  id?: string
+  project_id?: string
+  rpm: number
+  tpm: number
+  max_concurrent: number
+  max_context_tokens: number
+  daily_token_budget: number
+  monthly_token_budget: number
+  daily_cost_budget: number
+  monthly_cost_budget: number
+  updated_at?: string
+}
+
+export interface ProjectQuotaStatus {
+  project_id: string
+  rpm_limit: number
+  tpm_limit: number
+  max_concurrent_limit: number
+  daily_token_budget: number
+  monthly_token_budget: number
+  daily_cost_budget: number
+  monthly_cost_budget: number
+  // live counters
+  daily_tokens_used: number
+  tpm_current: number
+  inflight: number
+  daily_tokens_remaining: number | null
+}
+
+export interface ProjectDailySummary {
+  project_id: string
+  model_name: string
+  day: string
+  request_count: number
+  error_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost_usd: number
+  avg_latency_ms: number
+}
+
+export interface ProjectUsageSummary {
+  project_id: string
+  from: string
+  to: string
+  request_count: number
+  error_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost_usd: number
+  avg_latency_ms: number
+}
+
 // ── HA / Replica types ────────────────────────────────────────────────────────
 export type HAStatus = 'healthy' | 'degraded' | 'starting' | 'unavailable'
 export type PlacementPolicy = 'spread' | 'pack' | 'anti_affinity'
@@ -424,9 +481,14 @@ export const api = {
   apiKeys: {
     list: (teamId: string) =>
       req<{ data: ApiKey[]; total: number }>('GET', `/teams/${teamId}/api-keys`),
-    create: (teamId: string, name: string, expiresAt?: string) =>
-      req<ApiKey & { key: string }>('POST', `/teams/${teamId}/api-keys`, { name, expires_at: expiresAt }),
+    create: (teamId: string, name: string, expiresAt?: string, projectId?: string) =>
+      req<ApiKey & { key: string; project_name?: string; project_priority_weight?: number }>(
+        'POST', `/teams/${teamId}/api-keys`,
+        { name, expires_at: expiresAt, project_id: projectId || undefined }
+      ),
     revoke: (id: string) => req<void>('DELETE', `/api-keys/${id}`),
+    setProject: (id: string, projectId: string | null) =>
+      req<{ message: string }>('PUT', `/api-keys/${id}/project`, { project_id: projectId }),
   },
 
   models: {
@@ -613,6 +675,25 @@ export const api = {
     getModelRecoveryLog: (modelId: string, params?: { limit?: number }) => {
       const qs = params?.limit ? `?limit=${params.limit}` : ''
       return req<{ data: RecoveryLogEntry[]; total: number; model_id: string }>('GET', `/ha/recovery-log/${modelId}${qs}`)
+    },
+  },
+
+  // ── Project policy & quota (migration 023) ────────────────────────────────
+  projectPolicy: {
+    getPolicy: (projectId: string) =>
+      req<ProjectPolicy>('GET', `/projects/${projectId}/policy`),
+    updatePolicy: (projectId: string, b: Partial<ProjectPolicy>) =>
+      req<{ message: string; project_id: string }>('PUT', `/projects/${projectId}/policy`, b),
+    getQuota: (projectId: string) =>
+      req<ProjectQuotaStatus>('GET', `/projects/${projectId}/quota`),
+    getDailyUsage: (projectId: string, from?: string, to?: string) => {
+      const qs = [from && `from=${from}`, to && `to=${to}`].filter(Boolean).join('&')
+      return req<{ data: ProjectDailySummary[]; total: number; project_id: string; from: string; to: string }>(
+        'GET', `/projects/${projectId}/usage/daily${qs ? '?' + qs : ''}`)
+    },
+    getSummary: (projectId: string, from?: string, to?: string) => {
+      const qs = [from && `from=${from}`, to && `to=${to}`].filter(Boolean).join('&')
+      return req<ProjectUsageSummary>('GET', `/projects/${projectId}/usage/summary${qs ? '?' + qs : ''}`)
     },
   },
 }

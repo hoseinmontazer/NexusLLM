@@ -39,9 +39,10 @@ type Event struct {
 	GPUTimeMs        int       `json:"gpu_time_ms"       db:"gpu_time_ms"`
 	CreatedAt        time.Time `json:"created_at"        db:"created_at"`
 	// Project context — nullable for backward compatibility with pre-project events.
-	ProjectID       *string `json:"project_id,omitempty"       db:"project_id"`
-	ProjectName     *string `json:"project_name,omitempty"     db:"project_name"`
-	ProjectPriority *string `json:"project_priority,omitempty" db:"project_priority"`
+	ProjectID             *string `json:"project_id,omitempty"              db:"project_id"`
+	ProjectName           *string `json:"project_name,omitempty"            db:"project_name"`
+	ProjectPriority       *string `json:"project_priority,omitempty"        db:"project_priority"`
+	ProjectPriorityWeight *int    `json:"project_priority_weight,omitempty" db:"project_priority_weight"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,8 +72,8 @@ func NewTracker(db *sqlx.DB, rdb *redis.Client, log *zap.Logger) *Tracker {
 		db:              db,
 		rdb:             rdb,
 		log:             log,
-		inputCostPer1M:  0.50,  // $0.50 / 1M input tokens (example)
-		outputCostPer1M: 1.50,  // $1.50 / 1M output tokens
+		inputCostPer1M:  0.50, // $0.50 / 1M input tokens (example)
+		outputCostPer1M: 1.50, // $1.50 / 1M output tokens
 	}
 }
 
@@ -154,8 +155,8 @@ func (t *Tracker) processMessage(ctx context.Context, stream string, msg redis.X
 
 func (t *Tracker) persist(ctx context.Context, e Event) {
 	// Sanitise nullable UUID fields — empty string is not a valid UUID in Postgres
-	apiKeyID   := nilIfEmpty(e.APIKeyID)
-	modelID    := nilIfEmpty(e.ModelID)
+	apiKeyID := nilIfEmpty(e.APIKeyID)
+	modelID := nilIfEmpty(e.ModelID)
 	endpointID := nilIfEmpty(e.EndpointID)
 
 	_, err := t.db.ExecContext(ctx, `
@@ -163,12 +164,14 @@ func (t *Tracker) persist(ctx context.Context, e Event) {
 		  (id, org_id, team_id, api_key_id, model_id, model_name, endpoint_id,
 		   request_id, prompt_tokens, completion_tokens, total_tokens,
 		   latency_ms, ttft_ms, queue_wait_ms, status, error_code, cost_usd,
-		   gpu_time_ms, created_at, project_id, project_name, project_priority)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+		   gpu_time_ms, created_at, project_id, project_name, project_priority,
+		   project_priority_weight)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
 		e.ID, e.OrgID, e.TeamID, apiKeyID, modelID, e.ModelName, endpointID,
 		e.RequestID, e.PromptTokens, e.CompletionTokens, e.TotalTokens,
 		e.LatencyMs, e.TTFTMs, e.QueueWaitMs, e.Status, e.ErrorCode, e.CostUSD,
 		e.GPUTimeMs, e.CreatedAt, e.ProjectID, e.ProjectName, e.ProjectPriority,
+		e.ProjectPriorityWeight,
 	)
 	if err != nil {
 		t.log.Error("usage persist error", zap.Error(err), zap.String("event_id", e.ID))
@@ -188,6 +191,8 @@ func nilIfEmpty(s string) interface{} {
 func (t *Tracker) Aggregate(ctx context.Context) {
 	t.aggregateHourly(ctx)
 	t.aggregateDaily(ctx)
+	t.aggregateProjectDaily(ctx)
+	t.aggregateProjectMonthly(ctx)
 }
 
 func (t *Tracker) aggregateHourly(ctx context.Context) {
@@ -241,6 +246,126 @@ func (t *Tracker) aggregateDaily(ctx context.Context) {
 }
 
 // ─── Query API ────────────────────────────────────────────────────────────────
+
+func (t *Tracker) aggregateProjectDaily(ctx context.Context) {
+	_, _ = t.db.ExecContext(ctx, `
+		INSERT INTO project_usage_daily
+		  (project_id, model_name, day,
+		   request_count, error_count,
+		   prompt_tokens, completion_tokens, total_tokens, cost_usd, avg_latency_ms)
+		SELECT
+		  project_id,
+		  COALESCE(model_name,'') AS model_name,
+		  created_at::date        AS day,
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE status != 'success'),
+		  COALESCE(SUM(prompt_tokens),0),
+		  COALESCE(SUM(completion_tokens),0),
+		  COALESCE(SUM(total_tokens),0),
+		  COALESCE(SUM(cost_usd),0),
+		  COALESCE(AVG(latency_ms),0)
+		FROM usage_events
+		WHERE project_id IS NOT NULL
+		  AND created_at::date = CURRENT_DATE
+		GROUP BY project_id, COALESCE(model_name,''), created_at::date
+		ON CONFLICT (project_id, model_name, day) DO UPDATE SET
+		  request_count     = EXCLUDED.request_count,
+		  error_count       = EXCLUDED.error_count,
+		  prompt_tokens     = EXCLUDED.prompt_tokens,
+		  completion_tokens = EXCLUDED.completion_tokens,
+		  total_tokens      = EXCLUDED.total_tokens,
+		  cost_usd          = EXCLUDED.cost_usd,
+		  avg_latency_ms    = EXCLUDED.avg_latency_ms`)
+}
+
+func (t *Tracker) aggregateProjectMonthly(ctx context.Context) {
+	_, _ = t.db.ExecContext(ctx, `
+		INSERT INTO project_usage_monthly
+		  (project_id, model_name, month,
+		   request_count, error_count,
+		   prompt_tokens, completion_tokens, total_tokens, cost_usd, avg_latency_ms)
+		SELECT
+		  project_id,
+		  COALESCE(model_name,'') AS model_name,
+		  date_trunc('month', created_at)::date AS month,
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE status != 'success'),
+		  COALESCE(SUM(prompt_tokens),0),
+		  COALESCE(SUM(completion_tokens),0),
+		  COALESCE(SUM(total_tokens),0),
+		  COALESCE(SUM(cost_usd),0),
+		  COALESCE(AVG(latency_ms),0)
+		FROM usage_events
+		WHERE project_id IS NOT NULL
+		  AND date_trunc('month', created_at) = date_trunc('month', NOW())
+		GROUP BY project_id, COALESCE(model_name,''), date_trunc('month', created_at)::date
+		ON CONFLICT (project_id, model_name, month) DO UPDATE SET
+		  request_count     = EXCLUDED.request_count,
+		  error_count       = EXCLUDED.error_count,
+		  prompt_tokens     = EXCLUDED.prompt_tokens,
+		  completion_tokens = EXCLUDED.completion_tokens,
+		  total_tokens      = EXCLUDED.total_tokens,
+		  cost_usd          = EXCLUDED.cost_usd,
+		  avg_latency_ms    = EXCLUDED.avg_latency_ms`)
+}
+
+// ProjectDailySummary holds per-project per-day usage.
+type ProjectDailySummary struct {
+	ProjectID        string  `db:"project_id"        json:"project_id"`
+	ModelName        string  `db:"model_name"        json:"model_name"`
+	Day              string  `db:"day"               json:"day"`
+	RequestCount     int64   `db:"request_count"     json:"request_count"`
+	ErrorCount       int64   `db:"error_count"       json:"error_count"`
+	PromptTokens     int64   `db:"prompt_tokens"     json:"prompt_tokens"`
+	CompletionTokens int64   `db:"completion_tokens" json:"completion_tokens"`
+	TotalTokens      int64   `db:"total_tokens"      json:"total_tokens"`
+	CostUSD          float64 `db:"cost_usd"          json:"cost_usd"`
+	AvgLatencyMs     float64 `db:"avg_latency_ms"    json:"avg_latency_ms"`
+}
+
+// GetProjectDailyUsage queries usage_events directly for real-time project usage.
+// Returns per-day, per-model breakdown for the given date range.
+func (t *Tracker) GetProjectDailyUsage(ctx context.Context, projectID, from, to string) ([]ProjectDailySummary, error) {
+	rows := []ProjectDailySummary{}
+	err := t.db.SelectContext(ctx, &rows, `
+		SELECT project_id::text, COALESCE(model_name,'') AS model_name,
+		       created_at::date::text AS day,
+		       COUNT(*)                                              AS request_count,
+		       COUNT(*) FILTER (WHERE status != 'success')          AS error_count,
+		       COALESCE(SUM(prompt_tokens),0)                       AS prompt_tokens,
+		       COALESCE(SUM(completion_tokens),0)                   AS completion_tokens,
+		       COALESCE(SUM(total_tokens),0)                        AS total_tokens,
+		       COALESCE(SUM(cost_usd),0)                            AS cost_usd,
+		       COALESCE(AVG(latency_ms),0)                          AS avg_latency_ms
+		FROM usage_events
+		WHERE project_id = $1::uuid
+		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz
+		GROUP BY project_id, COALESCE(model_name,''), created_at::date
+		ORDER BY day DESC, model_name`,
+		projectID, from, to)
+	return rows, err
+}
+
+// GetProjectSummary returns aggregated totals for a project in a date range.
+func (t *Tracker) GetProjectSummary(ctx context.Context, projectID, from, to string) (*ProjectDailySummary, error) {
+	row := &ProjectDailySummary{}
+	err := t.db.GetContext(ctx, row, `
+		SELECT $1::text AS project_id,
+		       ''         AS model_name,
+		       ''         AS day,
+		       COUNT(*)                                              AS request_count,
+		       COUNT(*) FILTER (WHERE status != 'success')          AS error_count,
+		       COALESCE(SUM(prompt_tokens),0)                       AS prompt_tokens,
+		       COALESCE(SUM(completion_tokens),0)                   AS completion_tokens,
+		       COALESCE(SUM(total_tokens),0)                        AS total_tokens,
+		       COALESCE(SUM(cost_usd),0)                            AS cost_usd,
+		       COALESCE(AVG(latency_ms),0)                          AS avg_latency_ms
+		FROM usage_events
+		WHERE project_id = $1::uuid
+		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz`,
+		projectID, from, to)
+	return row, err
+}
 
 // TeamSummary holds aggregated usage for a team.
 type TeamSummary struct {

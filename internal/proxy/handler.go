@@ -94,27 +94,40 @@ func (h *Handler) WithDB(db *sqlx.DB) *Handler {
 	return h
 }
 
-// lookupProjectContext returns project_id, project_name, project_priority for a model name.
-// Returns nil values if project is not set (legacy models).
-func (h *Handler) lookupProjectContext(ctx context.Context, modelName string) (projectID, projectName, projectPriority *string) {
+// lookupProjectContext returns project_id, project_name, project_priority, project_priority_weight.
+// When claims already have project context (API key scoped to a project), returns that directly
+// without a DB round-trip. Falls back to querying by model name for legacy models.
+func (h *Handler) lookupProjectContext(ctx context.Context, modelName string, claims *auth.TeamClaims) (projectID, projectName, projectPriority *string, projectPriorityWeight *int) {
+	// Fast path: project context already in claims (API key scoped to project).
+	if claims != nil && claims.ProjectID != "" {
+		pid := claims.ProjectID
+		pname := claims.ProjectName
+		ppw := claims.ProjectPriorityWeight
+		return &pid, &pname, nil, &ppw
+	}
+	// Slow path: look up by model→project relationship.
 	if h.db == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var row struct {
-		ProjectID       *string `db:"project_id"`
-		ProjectName     *string `db:"project_name"`
-		ProjectPriority *string `db:"project_priority"`
+		ProjectID             *string `db:"project_id"`
+		ProjectName           *string `db:"project_name"`
+		ProjectPriority       *string `db:"project_priority"`
+		ProjectPriorityWeight *int    `db:"project_priority_weight"`
 	}
 	err := h.db.GetContext(ctx, &row, `
-		SELECT p.id::text AS project_id, p.name AS project_name, p.priority AS project_priority
+		SELECT p.id::text       AS project_id,
+		       p.name            AS project_name,
+		       p.priority        AS project_priority,
+		       p.priority_weight AS project_priority_weight
 		FROM models m
 		JOIN projects p ON p.id = m.project_id
 		WHERE m.name = $1 AND m.enabled = TRUE
 		LIMIT 1`, modelName)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
-	return row.ProjectID, row.ProjectName, row.ProjectPriority
+	return row.ProjectID, row.ProjectName, row.ProjectPriority, row.ProjectPriorityWeight
 }
 
 // ─── public handlers ──────────────────────────────────────────────────────────
@@ -145,6 +158,34 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	req.Model = realModel
 	c.Set("model", realModel)
 
+	// ── 1b. Project override via header or request body ────────────────────
+	// X-Nexus-Project: <project-name-or-id> allows callers to specify which
+	// project this request belongs to, overriding the API key's project scope.
+	// This is useful when a team key is shared across projects.
+	if projectHdr := c.GetHeader("X-Nexus-Project"); projectHdr != "" && h.db != nil {
+		var projRow struct {
+			ID             string `db:"id"`
+			Name           string `db:"name"`
+			PriorityWeight int    `db:"priority_weight"`
+		}
+		// Resolve by name (within team) or by UUID
+		lookupErr := h.db.GetContext(c.Request.Context(), &projRow, `
+			SELECT id::text, name, priority_weight
+			FROM projects
+			WHERE (name = $1 OR id::text = $1)
+			  AND team_id = $2
+			  AND status = 'active'
+			LIMIT 1`, projectHdr, claims.TeamID)
+		if lookupErr == nil {
+			// Shallow-copy claims with project override so we don't mutate shared state.
+			overriddenClaims := *claims
+			overriddenClaims.ProjectID = projRow.ID
+			overriddenClaims.ProjectName = projRow.Name
+			overriddenClaims.ProjectPriorityWeight = projRow.PriorityWeight
+			claims = &overriddenClaims
+		}
+	}
+
 	// ── 2. Gateway policy (temperature cap, tool restrictions, etc.) ───────
 	inputEst := estimateTokens(req.Messages)
 	if v := h.gwPolicy.Enforce(c.Request.Context(), claims.OrgID, claims.TeamID, "", &req, inputEst); v != nil {
@@ -153,12 +194,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	// ── 3. Infrastructure policy (rate limit, quota, ACL) ─────────────────
+	// Use project priority weight when available; fall back to team priority.
+	// This ensures high-priority projects are served before low-priority ones
+	// when the concurrency limit is reached.
+	effectivePriority := claims.TeamPriority
+	if claims.ProjectPriorityWeight > 0 {
+		effectivePriority = claims.ProjectPriorityWeight
+	}
 	tp := h.teamPolicy(claims.TeamID)
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
 		Model:                req.Model,
 		EstimatedInputTokens: inputEst,
 		TeamID:               claims.TeamID,
-	}, claims.TeamPriority, tp)
+		ProjectID:            claims.ProjectID, // project-level limits when scoped
+	}, effectivePriority, tp)
 
 	if !decision.Allowed {
 		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
@@ -223,6 +272,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	// ── 6. Track inflight ─────────────────────────────────────────────────
 	_ = h.policy.IncrementInflight(c.Request.Context(), claims.TeamID)
+	_ = h.policy.IncrementProjectInflight(c.Request.Context(), claims.ProjectID)
 	middleware.ActiveRequests.WithLabelValues(claims.TeamName, req.Model).Inc()
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
@@ -232,6 +282,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	start := time.Now()
 	defer func() {
 		_ = h.policy.DecrementInflight(context.Background(), claims.TeamID)
+		_ = h.policy.DecrementProjectInflight(context.Background(), claims.ProjectID)
 		middleware.ActiveRequests.WithLabelValues(claims.TeamName, req.Model).Dec()
 		atomic.AddInt64(&ep.ActiveConns, -1)
 	}()
@@ -415,9 +466,11 @@ func (h *Handler) syncChat(
 	latencyMs := int(time.Since(start).Milliseconds())
 	_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID,
+		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 	middleware.RecordTokens(claims.TeamName, req.Model,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
-	projID, projName, projPriority := h.lookupProjectContext(context.Background(), req.Model)
+	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
@@ -425,6 +478,7 @@ func (h *Handler) syncChat(
 		TotalTokens:      chatResp.Usage.TotalTokens,
 		LatencyMs:        latencyMs, Status: "success",
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
+		ProjectPriorityWeight: projPriorityWeight,
 	})
 	c.JSON(resp.StatusCode, chatResp)
 	return true
@@ -494,9 +548,10 @@ func (h *Handler) streamChat(
 	latencyMs := int(time.Since(start).Milliseconds())
 	if promptTokens+completionTokens > 0 {
 		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, promptTokens, completionTokens)
+		_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID, promptTokens, completionTokens)
 		middleware.RecordTokens(claims.TeamName, req.Model, promptTokens, completionTokens)
 	}
-	projID, projName, projPriority := h.lookupProjectContext(context.Background(), req.Model)
+	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: promptTokens,
@@ -504,6 +559,7 @@ func (h *Handler) streamChat(
 		TotalTokens:      promptTokens + completionTokens,
 		LatencyMs:        latencyMs, Status: "success",
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
+		ProjectPriorityWeight: projPriorityWeight,
 	})
 	return true
 }

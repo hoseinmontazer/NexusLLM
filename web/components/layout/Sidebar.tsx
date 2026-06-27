@@ -66,6 +66,7 @@ export function Sidebar() {
           }
           const { href, label, icon: Icon } = item
           const active = path === href || (href !== '/' && path.startsWith(href))
+          const IconComponent = Icon as React.ElementType
           return (
             <Link
               key={href}
@@ -77,7 +78,7 @@ export function Sidebar() {
                   : 'text-gray-400 hover:bg-gray-800 hover:text-white'
               )}
             >
-              {Icon && <Icon className="w-4 h-4 shrink-0" />}
+              {IconComponent && <IconComponent className="w-4 h-4 shrink-0" />}
               {label}
             </Link>
           )

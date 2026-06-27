@@ -28,6 +28,12 @@ type TeamClaims struct {
 	TeamName     string   `json:"team_name"`
 	TeamPriority int      `json:"team_priority"`
 	Permissions  []string `json:"permissions"`
+	// Project context — populated when the API key is scoped to a project,
+	// or when the client sends X-Nexus-Project header / project_id in request body.
+	// Falls back to team-level priority when empty.
+	ProjectID             string `json:"project_id,omitempty"`
+	ProjectName           string `json:"project_name,omitempty"`
+	ProjectPriorityWeight int    `json:"project_priority_weight,omitempty"`
 }
 
 // jwtClaims wraps TeamClaims for use inside a JWT.
@@ -97,7 +103,10 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 			o.id          AS org_id,
 			t.id          AS team_id,
 			t.name        AS team_name,
-			t.priority    AS team_priority
+			t.priority    AS team_priority,
+			COALESCE(ak.project_id::text, '')              AS project_id,
+			COALESCE(ak.project_name,     '')              AS project_name,
+			COALESCE(ak.project_priority_weight, t.priority) AS project_priority_weight
 		FROM api_keys ak
 		JOIN teams   t ON t.id = ak.team_id
 		JOIN organizations o ON o.id = t.org_id
@@ -109,14 +118,24 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 	`
 
 	type row struct {
-		OrgID        string `db:"org_id"`
-		TeamID       string `db:"team_id"`
-		TeamName     string `db:"team_name"`
-		TeamPriority int    `db:"team_priority"`
+		OrgID                 string `db:"org_id"`
+		TeamID                string `db:"team_id"`
+		TeamName              string `db:"team_name"`
+		TeamPriority          int    `db:"team_priority"`
+		ProjectID             string `db:"project_id"`
+		ProjectName           string `db:"project_name"`
+		ProjectPriorityWeight int    `db:"project_priority_weight"`
 	}
 
 	var r row
 	if err := s.db.GetContext(ctx, &r, query, hash); err != nil {
+		// Migration 022 may not have been applied yet — fall back to team-only query.
+		if strings.Contains(err.Error(), "project_id") ||
+			strings.Contains(err.Error(), "project_name") ||
+			strings.Contains(err.Error(), "project_priority_weight") ||
+			strings.Contains(err.Error(), "42703") {
+			return s.validateAPIKeyLegacy(ctx, hash)
+		}
 		return nil, fmt.Errorf("api key not found or inactive: %w", err)
 	}
 
@@ -126,12 +145,23 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 		return nil, fmt.Errorf("load permissions: %w", err)
 	}
 
+	// If the project_priority_weight column doesn't exist yet (migration 022 not applied),
+	// fall back to team priority. The COALESCE in the query handles the missing column case
+	// only if it returns a value; if the query itself fails we catch it here.
+	ppw := r.ProjectPriorityWeight
+	if ppw == 0 {
+		ppw = r.TeamPriority
+	}
+
 	claims := &TeamClaims{
-		OrgID:        r.OrgID,
-		TeamID:       r.TeamID,
-		TeamName:     r.TeamName,
-		TeamPriority: r.TeamPriority,
-		Permissions:  perms,
+		OrgID:                 r.OrgID,
+		TeamID:                r.TeamID,
+		TeamName:              r.TeamName,
+		TeamPriority:          r.TeamPriority,
+		Permissions:           perms,
+		ProjectID:             r.ProjectID,
+		ProjectName:           r.ProjectName,
+		ProjectPriorityWeight: ppw,
 	}
 
 	// Update last-used timestamp (best-effort, non-blocking)
@@ -202,4 +232,42 @@ func (s *Service) loadPermissions(ctx context.Context, teamID string) ([]string,
 		return nil, err
 	}
 	return models, nil
+}
+
+// validateAPIKeyLegacy is the pre-migration-022 fallback that doesn't join project columns.
+func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*TeamClaims, error) {
+	type row struct {
+		OrgID        string `db:"org_id"`
+		TeamID       string `db:"team_id"`
+		TeamName     string `db:"team_name"`
+		TeamPriority int    `db:"team_priority"`
+	}
+	var r row
+	if err := s.db.GetContext(ctx, &r, `
+		SELECT o.id AS org_id, t.id AS team_id, t.name AS team_name, t.priority AS team_priority
+		FROM api_keys ak
+		JOIN teams t ON t.id = ak.team_id
+		JOIN organizations o ON o.id = t.org_id
+		WHERE ak.key_hash = $1
+		  AND ak.active = TRUE AND t.active = TRUE AND o.active = TRUE
+		  AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`, hash); err != nil {
+		return nil, fmt.Errorf("api key not found or inactive: %w", err)
+	}
+	perms, err := s.loadPermissions(ctx, r.TeamID)
+	if err != nil {
+		return nil, fmt.Errorf("load permissions: %w", err)
+	}
+	claims := &TeamClaims{
+		OrgID:                 r.OrgID,
+		TeamID:                r.TeamID,
+		TeamName:              r.TeamName,
+		TeamPriority:          r.TeamPriority,
+		Permissions:           perms,
+		ProjectPriorityWeight: r.TeamPriority, // fall back to team priority
+	}
+	cacheKey := apiKeyCachePrefix + hash
+	if data, err := json.Marshal(claims); err == nil {
+		_ = s.rdb.Set(ctx, cacheKey, data, s.cacheTTL).Err()
+	}
+	return claims, nil
 }

@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AdmissionPolicy, type PriorityPreset } from '@/lib/api'
+import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy } from '@/lib/api'
 import { PriorityBadge, PriorityBar, EffectivePriorityCard, weightLabel } from '@/components/projects/PriorityBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -12,8 +12,237 @@ import { Label } from '@/components/ui/label'
 import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, Shield, Zap, Activity, AlertTriangle,
-  Server, BarChart2, Clock, DollarSign, Layers, Gauge
+  Server, BarChart2, Clock, DollarSign, Layers, Gauge,
+  Settings2, TrendingUp, Percent,
 } from 'lucide-react'
+
+// ── Policy & Quota panel ──────────────────────────────────────────────────────
+function PolicyPanel({ projectId }: { projectId: string }) {
+  const qc = useQueryClient()
+
+  const { data: policy, isLoading } = useQuery({
+    queryKey: ['project-policy', projectId],
+    queryFn: () => api.projectPolicy.getPolicy(projectId),
+  })
+  const { data: quota } = useQuery({
+    queryKey: ['project-quota', projectId],
+    queryFn: () => api.projectPolicy.getQuota(projectId),
+    refetchInterval: 15_000,
+  })
+
+  const [form, setForm] = useState<Partial<ProjectPolicy>>({})
+  const set = (k: keyof ProjectPolicy) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm(p => ({ ...p, [k]: e.target.value === '' ? undefined : Number(e.target.value) }))
+
+  const mut = useMutation({
+    mutationFn: () => api.projectPolicy.updatePolicy(projectId, form),
+    onSuccess: () => {
+      toast({ title: 'Policy updated — takes effect immediately' })
+      qc.invalidateQueries({ queryKey: ['project-policy', projectId] })
+      qc.invalidateQueries({ queryKey: ['project-quota', projectId] })
+      setForm({})
+    },
+    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
+  })
+
+  if (isLoading || !policy) return <p className="text-sm text-muted-foreground">Loading policy…</p>
+
+  const fmtTokens = (n: number) => n === 0 ? 'Unlimited' : n.toLocaleString()
+  const pct = (used: number, budget: number) => budget > 0 ? Math.min(100, Math.round(used / budget * 100)) : 0
+
+  return (
+    <div className="space-y-6">
+      {/* Live quota status */}
+      {quota && (
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2">
+            <Activity className="w-4 h-4" />Live Quota Status
+          </CardTitle></CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-3 gap-4 text-sm">
+              <div>
+                <p className="text-xs text-muted-foreground mb-1">Requests in-flight</p>
+                <p className="text-2xl font-bold tabular-nums">{quota.inflight}</p>
+                <p className="text-xs text-muted-foreground">/ {quota.max_concurrent_limit || '∞'} max</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground mb-1">Tokens/min (current)</p>
+                <p className="text-2xl font-bold tabular-nums">{quota.tpm_current.toLocaleString()}</p>
+                <p className="text-xs text-muted-foreground">/ {fmtTokens(quota.tpm_limit)} limit</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground mb-1">Tokens today</p>
+                <p className="text-2xl font-bold tabular-nums">{quota.daily_tokens_used.toLocaleString()}</p>
+                {quota.daily_token_budget > 0 ? (
+                  <>
+                    <div className="mt-1 h-1.5 bg-gray-100 rounded-full overflow-hidden w-full">
+                      <div className={`h-full rounded-full ${pct(quota.daily_tokens_used, quota.daily_token_budget) > 80 ? 'bg-red-500' : 'bg-blue-500'}`}
+                        style={{ width: `${pct(quota.daily_tokens_used, quota.daily_token_budget)}%` }} />
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {quota.daily_tokens_remaining?.toLocaleString() ?? '—'} remaining
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Unlimited</p>
+                )}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Policy editor */}
+      <Card>
+        <CardHeader><CardTitle className="text-base flex items-center gap-2">
+          <Settings2 className="w-4 h-4" />Rate Limits &amp; Budgets
+        </CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            {([
+              { key: 'rpm',                  label: 'RPM Limit',              desc: 'Requests per minute (0 = unlimited)', cur: policy.rpm },
+              { key: 'tpm',                  label: 'TPM Limit',              desc: 'Tokens per minute (0 = unlimited)',   cur: policy.tpm },
+              { key: 'max_concurrent',       label: 'Max Concurrent',         desc: 'Parallel requests (0 = unlimited)',   cur: policy.max_concurrent },
+              { key: 'max_context_tokens',   label: 'Max Context Tokens',     desc: 'Per-request token limit (0 = unlimited)', cur: policy.max_context_tokens },
+              { key: 'daily_token_budget',   label: 'Daily Token Budget',     desc: 'Total tokens/day (0 = unlimited)',    cur: policy.daily_token_budget },
+              { key: 'monthly_token_budget', label: 'Monthly Token Budget',   desc: 'Total tokens/month (0 = unlimited)', cur: policy.monthly_token_budget },
+              { key: 'daily_cost_budget',    label: 'Daily Cost Budget ($)',  desc: 'USD/day (0 = unlimited)',             cur: policy.daily_cost_budget },
+              { key: 'monthly_cost_budget',  label: 'Monthly Cost Budget ($)',desc: 'USD/month (0 = unlimited)',           cur: policy.monthly_cost_budget },
+            ] as const).map(({ key, label, desc, cur }) => (
+              <div key={key}>
+                <Label className="text-xs">{label}</Label>
+                <Input
+                  type="number" min={0} step={key.includes('cost') ? '0.01' : '1'}
+                  placeholder={String(cur)}
+                  value={form[key as keyof ProjectPolicy] ?? ''}
+                  onChange={set(key as keyof ProjectPolicy)}
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-0.5">Current: {fmtTokens(cur as number)} · {desc}</p>
+              </div>
+            ))}
+          </div>
+          <Button size="sm" onClick={() => mut.mutate()} disabled={mut.isPending || Object.keys(form).length === 0}>
+            {mut.isPending ? 'Saving…' : 'Update Policy'}
+          </Button>
+          <p className="text-xs text-muted-foreground">Leave blank to keep current value. Changes push to gateway Redis immediately.</p>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+// ── Usage analytics panel ─────────────────────────────────────────────────────
+function UsageAnalyticsPanel({ projectId }: { projectId: string }) {
+  const [range, setRange] = useState<'24h' | '7d' | '30d'>('7d')
+
+  const rangeParams = () => {
+    const to = new Date().toISOString()
+    const days = range === '24h' ? 1 : range === '7d' ? 7 : 30
+    const from = new Date(Date.now() - days * 86400 * 1000).toISOString()
+    return { from, to }
+  }
+
+  const { from, to } = rangeParams()
+
+  const { data: summary } = useQuery({
+    queryKey: ['project-summary', projectId, range],
+    queryFn: () => api.projectPolicy.getSummary(projectId, from, to),
+    refetchInterval: 60_000,
+  })
+  const { data: dailyData } = useQuery({
+    queryKey: ['project-daily', projectId, range],
+    queryFn: () => api.projectPolicy.getDailyUsage(projectId, from, to),
+    refetchInterval: 60_000,
+  })
+
+  const rows = dailyData?.data ?? []
+
+  const fmt = (n: number) => n >= 1_000_000 ? (n/1_000_000).toFixed(2)+'M' :
+                              n >= 1_000     ? (n/1_000).toFixed(1)+'K'    : String(n)
+
+  return (
+    <div className="space-y-5">
+      {/* Range selector */}
+      <div className="flex gap-1">
+        {(['24h', '7d', '30d'] as const).map(r => (
+          <button key={r} onClick={() => setRange(r)}
+            className={`px-3 py-1.5 text-xs font-medium rounded transition-colors ${
+              range === r ? 'bg-gray-900 text-white' : 'bg-white border text-muted-foreground hover:bg-gray-50'
+            }`}>
+            {r}
+          </button>
+        ))}
+      </div>
+
+      {/* Summary cards */}
+      {summary && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[
+            { label: 'Requests',      value: summary.request_count.toLocaleString(),     icon: Activity },
+            { label: 'Total Tokens',  value: fmt(summary.total_tokens),                  icon: Layers },
+            { label: 'Cost (USD)',    value: '$'+summary.cost_usd.toFixed(4),            icon: DollarSign },
+            { label: 'Avg Latency',  value: summary.avg_latency_ms.toFixed(0)+'ms',      icon: Clock },
+            { label: 'Prompt Tokens',value: fmt(summary.prompt_tokens),                  icon: TrendingUp },
+            { label: 'Completion',   value: fmt(summary.completion_tokens),              icon: TrendingUp },
+            { label: 'Errors',       value: summary.error_count.toLocaleString(),        icon: AlertTriangle },
+            { label: 'Error Rate',   value: summary.request_count > 0 ? (summary.error_count/summary.request_count*100).toFixed(1)+'%' : '0%', icon: Percent },
+          ].map(s => (
+            <div key={s.label} className="flex items-center gap-3 p-3 rounded-lg border bg-white">
+              <s.icon className="w-4 h-4 text-muted-foreground shrink-0" />
+              <div>
+                <div className="text-xs text-muted-foreground">{s.label}</div>
+                <div className="font-semibold text-sm tabular-nums">{s.value}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Daily breakdown table */}
+      {rows.length > 0 && (
+        <Card>
+          <CardHeader><CardTitle className="text-sm">Daily Breakdown</CardTitle></CardHeader>
+          <CardContent className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b text-muted-foreground">
+                  <th className="text-left pb-2 font-medium">Date</th>
+                  <th className="text-left pb-2 font-medium">Model</th>
+                  <th className="text-right pb-2 font-medium">Requests</th>
+                  <th className="text-right pb-2 font-medium">Tokens</th>
+                  <th className="text-right pb-2 font-medium">Cost</th>
+                  <th className="text-right pb-2 font-medium">Latency</th>
+                  <th className="text-right pb-2 font-medium">Errors</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i} className="border-b last:border-0 hover:bg-gray-50">
+                    <td className="py-1.5">{r.day}</td>
+                    <td className="py-1.5 font-mono">{r.model_name || '—'}</td>
+                    <td className="py-1.5 text-right tabular-nums">{r.request_count.toLocaleString()}</td>
+                    <td className="py-1.5 text-right tabular-nums">{fmt(r.total_tokens)}</td>
+                    <td className="py-1.5 text-right tabular-nums font-mono">${r.cost_usd.toFixed(4)}</td>
+                    <td className="py-1.5 text-right tabular-nums">{r.avg_latency_ms.toFixed(0)}ms</td>
+                    <td className="py-1.5 text-right tabular-nums">
+                      {r.error_count > 0
+                        ? <span className="text-red-500">{r.error_count}</span>
+                        : <span className="text-green-600">0</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardContent>
+        </Card>
+      )}
+      {rows.length === 0 && !summary && (
+        <p className="text-sm text-muted-foreground text-center py-6">No usage data for this period.</p>
+      )}
+    </div>
+  )
+}
 
 // ── Priority panel ─────────────────────────────────────────────────────────────
 function PriorityPanel({ projectId, current, presets }: {
@@ -383,6 +612,7 @@ export default function ProjectDetailPage() {
   const params  = useParams<{ id: string }>()
   const router  = useRouter()
   const id      = params.id
+  const [activeTab, setActiveTab] = useState<'usage' | 'policy' | 'config' | 'runtimes'>('usage')
 
   // ── All hooks must be declared before any conditional returns ──────────────
   const { data: project, isLoading, error } = useQuery({
@@ -488,67 +718,93 @@ export default function ProjectDetailPage() {
         </Card>
       )}
 
-      {/* Controls */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <PriorityPanel projectId={id} current={{
-          priority_weight: project.priority_weight,
-          effective_priority: project.effective_priority,
-          waiting_bonus: project.waiting_bonus,
-          reservation_bonus: project.reservation_bonus,
-          resource_penalty: project.resource_penalty,
-        }} presets={presets} />
-        <ReservationPanel projectId={id} current={{
-          reserved_vram_mb: project.reserved_vram_mb,
-          reserved_cpu_cores: project.reserved_cpu_cores,
-          reserved_memory_mb: project.reserved_memory_mb,
-          max_gpu_vram_mb: project.max_gpu_vram_mb,
-          max_cpu: project.max_cpu,
-          max_memory_mb: project.max_memory_mb,
-        }} />
+      {/* Tabbed navigation — Usage | Policy | Config | Runtimes */}
+      <div>
+        <div className="flex gap-0 border-b mb-5">
+          {([
+            { key: 'usage',    label: 'Usage Analytics' },
+            { key: 'policy',   label: 'Policy & Quotas' },
+            { key: 'config',   label: 'Configuration' },
+            { key: 'runtimes', label: 'Runtimes & Queue' },
+          ] as const).map(t => (
+            <button key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+                activeTab === t.key
+                  ? 'border-blue-600 text-blue-600'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === 'usage' && <UsageAnalyticsPanel projectId={id} />}
+
+        {activeTab === 'policy' && <PolicyPanel projectId={id} />}
+
+        {activeTab === 'config' && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <PriorityPanel projectId={id} current={{
+                priority_weight: project.priority_weight,
+                effective_priority: project.effective_priority,
+                waiting_bonus: project.waiting_bonus,
+                reservation_bonus: project.reservation_bonus,
+                resource_penalty: project.resource_penalty,
+              }} presets={presets} />
+              <ReservationPanel projectId={id} current={{
+                reserved_vram_mb: project.reserved_vram_mb,
+                reserved_cpu_cores: project.reserved_cpu_cores,
+                reserved_memory_mb: project.reserved_memory_mb,
+                max_gpu_vram_mb: project.max_gpu_vram_mb,
+                max_cpu: project.max_cpu,
+                max_memory_mb: project.max_memory_mb,
+              }} />
+            </div>
+            <ProtectionPanel projectId={id} current={{
+              always_running: project.always_running, protected: project.protected,
+              minimum_replicas: project.minimum_replicas, admission_policy: project.admission_policy,
+              preemptible: project.preemptible,
+            }} />
+            <Card>
+              <CardHeader><CardTitle className="text-base">Metadata</CardTitle></CardHeader>
+              <CardContent className="text-sm grid grid-cols-2 gap-2 text-muted-foreground">
+                <div><span className="font-medium text-foreground">ID:</span> <span className="font-mono text-xs">{project.id}</span></div>
+                <div><span className="font-medium text-foreground">Team:</span> {project.team_id}</div>
+                <div><span className="font-medium text-foreground">Org:</span> {project.organization_id}</div>
+                <div><span className="font-medium text-foreground">Admission:</span> {project.admission_policy}</div>
+                <div><span className="font-medium text-foreground">Created:</span> {new Date(project.created_at).toLocaleString()}</div>
+                <div><span className="font-medium text-foreground">Updated:</span> {new Date(project.updated_at).toLocaleString()}</div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'runtimes' && (
+          <div className="space-y-4">
+            <Card>
+              <CardHeader><CardTitle className="text-base flex items-center gap-2">
+                <Server className="w-4 h-4" />Active Runtimes
+              </CardTitle></CardHeader>
+              <CardContent><RuntimesTable projectId={id} /></CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle className="text-base flex items-center gap-2">
+                <Clock className="w-4 h-4" />Deployment Queue
+              </CardTitle></CardHeader>
+              <CardContent><QueuePanel projectId={id} /></CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle className="text-base flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4" />Preemption History
+              </CardTitle></CardHeader>
+              <CardContent><PreemptionHistory projectId={id} /></CardContent>
+            </Card>
+          </div>
+        )}
       </div>
-
-      <ProtectionPanel projectId={id} current={{
-        always_running: project.always_running, protected: project.protected,
-        minimum_replicas: project.minimum_replicas, admission_policy: project.admission_policy,
-        preemptible: project.preemptible,
-      }} />
-
-      {/* Queue */}
-      <Card>
-        <CardHeader><CardTitle className="text-base flex items-center gap-2">
-          <Clock className="w-4 h-4" />Deployment Queue
-        </CardTitle></CardHeader>
-        <CardContent><QueuePanel projectId={id} /></CardContent>
-      </Card>
-
-      {/* Runtimes */}
-      <Card>
-        <CardHeader><CardTitle className="text-base flex items-center gap-2">
-          <Server className="w-4 h-4" />Active Runtimes
-        </CardTitle></CardHeader>
-        <CardContent><RuntimesTable projectId={id} /></CardContent>
-      </Card>
-
-      {/* Preemption history */}
-      <Card>
-        <CardHeader><CardTitle className="text-base flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4" />Preemption History
-        </CardTitle></CardHeader>
-        <CardContent><PreemptionHistory projectId={id} /></CardContent>
-      </Card>
-
-      {/* Metadata */}
-      <Card>
-        <CardHeader><CardTitle className="text-base">Metadata</CardTitle></CardHeader>
-        <CardContent className="text-sm grid grid-cols-2 gap-2 text-muted-foreground">
-          <div><span className="font-medium text-foreground">ID:</span> <span className="font-mono">{project.id}</span></div>
-          <div><span className="font-medium text-foreground">Team:</span> {project.team_id}</div>
-          <div><span className="font-medium text-foreground">Org:</span> {project.organization_id}</div>
-          <div><span className="font-medium text-foreground">Admission:</span> {project.admission_policy}</div>
-          <div><span className="font-medium text-foreground">Created:</span> {new Date(project.created_at).toLocaleString()}</div>
-          <div><span className="font-medium text-foreground">Updated:</span> {new Date(project.updated_at).toLocaleString()}</div>
-        </CardContent>
-      </Card>
     </div>
   )
 }

@@ -216,7 +216,7 @@ export default function ProjectsPage() {
         {projects.map((p: Project) => (
           <Link key={p.id} href={`/projects/${p.id}`}>
             <Card className="hover:shadow-md transition-shadow cursor-pointer">
-              <CardContent className="py-4">
+              <CardContent className="py-3">
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex items-center gap-3 min-w-0 flex-1">
                     <FolderKanban className="w-5 h-5 text-gray-400 shrink-0" />
@@ -226,9 +226,7 @@ export default function ProjectsPage() {
                         <PriorityBadge weight={p.priority_weight} label={p.priority_label} showWeight />
                         <StatusBadge status={p.status} />
                         {!p.preemptible && (
-                          <span className="text-xs text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200">
-                            non-preemptible
-                          </span>
+                          <span className="text-xs text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200">non-preemptible</span>
                         )}
                         {p.protected && (
                           <span className="flex items-center gap-1 text-xs text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200">
@@ -241,12 +239,8 @@ export default function ProjectsPage() {
                           </span>
                         )}
                       </div>
-                      {p.description && (
-                        <p className="text-xs text-muted-foreground truncate mt-0.5">{p.description}</p>
-                      )}
-                      {/* Priority bar */}
-                      <div className="flex items-center gap-2 mt-1.5">
-                        <PriorityBar weight={p.priority_weight} className="w-24" />
+                      <div className="flex items-center gap-2 mt-1">
+                        <PriorityBar weight={p.priority_weight} className="w-20" />
                         {p.effective_priority !== p.priority_weight && (
                           <span className="text-xs text-muted-foreground">
                             effective: <span className="font-semibold text-foreground">{p.effective_priority}</span>
@@ -255,19 +249,28 @@ export default function ProjectsPage() {
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-6 shrink-0 text-sm">
+
+                  {/* Metrics */}
+                  <div className="hidden md:flex items-center gap-5 shrink-0 text-sm">
                     <div className="text-right">
-                      <div className="font-medium">{p.runtime_count}</div>
-                      <div className="text-xs text-muted-foreground">active runtimes</div>
+                      <div className="font-medium tabular-nums">{p.runtime_count}</div>
+                      <div className="text-xs text-muted-foreground">runtimes</div>
                     </div>
-                    {p.reserved_vram_mb > 0 && (
+                    {(p as any).tokens_24h != null && (
                       <div className="text-right">
-                        <div className="font-medium">{(p.reserved_vram_mb / 1024).toFixed(0)} GB</div>
-                        <div className="text-xs text-muted-foreground">reserved VRAM</div>
+                        <div className="font-medium tabular-nums">{((p as any).tokens_24h as number).toLocaleString()}</div>
+                        <div className="text-xs text-muted-foreground">tokens 24h</div>
+                      </div>
+                    )}
+                    {(p as any).cost_usd_24h != null && (p as any).cost_usd_24h > 0 && (
+                      <div className="text-right">
+                        <div className="font-medium tabular-nums">${((p as any).cost_usd_24h as number).toFixed(3)}</div>
+                        <div className="text-xs text-muted-foreground">cost 24h</div>
                       </div>
                     )}
                     <ChevronRight className="w-4 h-4 text-gray-400" />
                   </div>
+                  <ChevronRight className="w-4 h-4 text-gray-400 md:hidden" />
                 </div>
               </CardContent>
             </Card>
