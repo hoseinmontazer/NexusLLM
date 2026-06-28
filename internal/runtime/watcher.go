@@ -175,21 +175,24 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	// This is faster than waiting for the node health monitor's 5-min timeout.
 	// Also mark the agent_runtime row as 'failed' so the stuck-runtime sweeper
 	// and the lazy-load activator know to restart the container.
+	//
+	// IMPORTANT: only update agent_runtimes rows that EXPLICITLY reference this
+	// endpoint_id. Never use model_id to fan-out. HA replicas have endpoint_id=NULL
+	// and their liveness is determined by container health, not by endpoint rows.
 	if result.Status == StatusDown {
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE model_endpoints
 			SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
 			WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
 
-		// Mark the agent_runtime row failed so the sweeper/activator restarts it.
-		// ep.ID is either a model_endpoints.id (legacy path) or an agent_runtimes.id
-		// (HA replica path). Update both tables — the wrong one will match 0 rows.
+		// Only mark runtimes explicitly linked to this endpoint via endpoint_id.
+		// HA replicas (endpoint_id IS NULL) are intentionally excluded here.
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE agent_runtimes
 			SET state     = 'failed',
 			    error_msg = 'health check failed 3 consecutive times — container may be gone',
 			    updated_at = NOW()
-			WHERE (id = $1 OR endpoint_id = $1)
+			WHERE endpoint_id = $1
 			  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
 			ep.ID)
 	}

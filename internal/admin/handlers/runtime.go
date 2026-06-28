@@ -53,68 +53,64 @@ func (h *RuntimeHandler) WithTaskManager(tm *taskmanager.Manager) *RuntimeHandle
 func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	var input struct {
 		// Model identity
-		Name        string   `json:"name"         binding:"required"` // "gemma-3-27b"
-		DisplayName string   `json:"display_name" binding:"required"` // "Gemma 3 27B"
-		Provider    string   `json:"provider"`                        // "google"
-		BackendType string   `json:"backend_type"`                    // vllm | ollama | tgi
+		Name        string   `json:"name"         binding:"required"`
+		DisplayName string   `json:"display_name" binding:"required"`
+		Provider    string   `json:"provider"`
+		BackendType string   `json:"backend_type"`
 		MaxContext  int      `json:"max_context"`
 		MaxOutput   int      `json:"max_output"`
 		Tags        []string `json:"tags"`
 
 		// Container / runtime
-		Image          string   `json:"image"           binding:"required"` // "vllm/vllm-openai:v0.4.3"
-		HFModelID      string   `json:"hf_model_id"`                        // "google/gemma-3-27b-it"
-		Host           string   `json:"host"`                               // "localhost" (default)
-		Port           int      `json:"port"            binding:"required"` // 8000
-		GPUDevices     []int    `json:"gpu_devices"`                        // [0,1]
+		Image          string   `json:"image"` // optional — agent can default
+		HFModelID      string   `json:"hf_model_id"`
+		Host           string   `json:"host"`
+		Port           int      `json:"port"` // 0 = agent allocates
+		GPUDevices     []int    `json:"gpu_devices"`
 		TensorParallel int      `json:"tensor_parallel"`
 		GPUMemoryUtil  float64  `json:"gpu_memory_util"`
 		MaxModelLen    int      `json:"max_model_len"`
 		Dtype          string   `json:"dtype"`
 		Quantization   string   `json:"quantization"`
 		ExtraArgs      []string `json:"extra_args"`
-		HFToken        string   `json:"hf_token"` // passed as HUGGING_FACE_HUB_TOKEN env var
+		HFToken        string   `json:"hf_token"`
 
-		// Whether to actually start the container now (default: true)
-		// Set false to register only and start manually later.
 		StartNow *bool `json:"start_now"`
 
-		// AutoPlace: if true, skip gpu_devices and let the placement engine
-		// choose GPU(s), CPU affinity, and NUMA node automatically.
+		// Legacy auto-place fields (kept for backward compat)
 		AutoPlace      bool  `json:"auto_place"`
-		MinVRAMMB      int64 `json:"min_vram_mb"`     // used when auto_place=true
-		MaxVRAMMB      int64 `json:"max_vram_mb"`     // used when auto_place=true
-		PriorityWeight int   `json:"priority_weight"` // 0–1000; default 500
+		MinVRAMMB      int64 `json:"min_vram_mb"`
+		MaxVRAMMB      int64 `json:"max_vram_mb"`
+		PriorityWeight int   `json:"priority_weight"`
 
-		// NodeID: if set, deploy via DEPLOY_RUNTIME task to the specified node agent.
-		// The node agent executes the container start on that server.
-		// If empty, the control plane starts the container directly (legacy behaviour).
+		// NodeID — legacy direct pin (still accepted)
 		NodeID string `json:"node_id"`
 
-		// ── llamacpp-specific ─────────────────────────────────────────────────
-		// LlamaCppModelPath: local GGUF path inside the container, e.g.
-		//   "/models/7B/ggml-model-q4_0.gguf"
-		// Pre-download the model with PULL_MODEL (TaskPullModel) first.
-		LlamaCppModelPath string `json:"llamacpp_model_path"`
-		// LlamaCppHFRepo + LlamaCppHFFile: download GGUF directly from HuggingFace
-		// at container startup via llama-server's built-in --hf-repo / --hf-file.
-		// No separate PULL_MODEL step needed, but startup is slower on first run.
-		LlamaCppHFRepo string `json:"llamacpp_hf_repo"`
-		LlamaCppHFFile string `json:"llamacpp_hf_file"`
-		// LlamaCppCtxSize overrides the default context window (default: 4096).
-		LlamaCppCtxSize int `json:"llamacpp_ctx_size"`
-		// LlamaCppNGPULayers controls how many transformer layers to offload to GPU.
-		// 0 = CPU-only, -1 = all layers on GPU (default when gpu_devices is non-empty).
-		LlamaCppNGPULayers int `json:"llamacpp_n_gpu_layers"`
-		// LlamaCppModelsVolume is the host path or named volume to mount as /models.
-		// Defaults to Docker named volume "llamacpp_models" when empty.
-		LlamaCppModelsVolume string `json:"llamacpp_models_volume"`
+		// ── Placement v2 ─────────────────────────────────────────────────────
+		// PlacementMode: auto | specific_node | node_group | label_selector
+		PlacementMode string `json:"placement_mode"`
+		// SpecificNodeID for PlacementMode == "specific_node"
+		SpecificNodeID string `json:"specific_node_id"`
+		// NodeGroupID for PlacementMode == "node_group"
+		NodeGroupID string `json:"node_group_id"`
+		// NodeSelector: label key→value map for PlacementMode == "label_selector"
+		// Example: {"accelerator":"h200","storage":"nvme"}
+		NodeSelector map[string]string `json:"node_selector"`
+		// PlacementStrategy for tie-breaking within matched nodes: spread | packed | auto
+		PlacementStrategy string `json:"placement_strategy"`
+		// AcceleratorType requirement: any | gpu | cpu
+		AcceleratorType string `json:"accelerator_type"`
+		// ReplicaDistribution for HA: spread | anti_affinity | pack
+		ReplicaDistribution string `json:"replica_distribution"`
 
-		// ExecutionMode controls GPU vs CPU deployment for this model.
-		//   "cpu"  — CPU-only; no --gpus flag; n_gpu_layers forced to 0
-		//   "gpu"  — always use GPUs
-		//   "auto" — detect node capability at startup (default)
-		ExecutionMode string `json:"execution_mode"` // cpu | gpu | auto
+		// ── llamacpp-specific ─────────────────────────────────────────────────
+		LlamaCppModelPath    string `json:"llamacpp_model_path"`
+		LlamaCppHFRepo       string `json:"llamacpp_hf_repo"`
+		LlamaCppHFFile       string `json:"llamacpp_hf_file"`
+		LlamaCppCtxSize      int    `json:"llamacpp_ctx_size"`
+		LlamaCppNGPULayers   int    `json:"llamacpp_n_gpu_layers"`
+		LlamaCppModelsVolume string `json:"llamacpp_models_volume"`
+		ExecutionMode        string `json:"execution_mode"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -247,6 +243,15 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		input.BackendType == "tgi" || input.BackendType == "llamacpp" || input.BackendType == "cpu_native"
 	shouldStart := startNow && canDeploy && input.Image != ""
 
+	// ── Resolve effective NodeID from placement mode ───────────────────────
+	// For specific_node: use SpecificNodeID directly (already validated by scheduler).
+	// For legacy node_id field: honour it as-is.
+	// For node_group / label_selector: the scheduler picks the node; NodeID stays empty
+	// here and the caller should use the scheduler path instead.
+	if input.PlacementMode == "specific_node" && input.SpecificNodeID != "" && input.NodeID == "" {
+		input.NodeID = input.SpecificNodeID
+	}
+
 	// ── Auto-placement (placement engine picks GPU/NUMA) ──────────────────
 	if (input.AutoPlace || input.NodeID != "") && h.placement != nil && input.NodeID == "" {
 		gpuCount := len(input.GPUDevices)
@@ -277,7 +282,6 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			_ = h.placement.Apply(c.Request.Context(), dec, pReq, epID)
 		}
 	}
-
 	// ── Path A: Deploy via Node Agent ──────────────────────────────────────
 	// Dispatch a START_MODEL task — the single unified startup pipeline.
 	// The agent executes: VALIDATING → DOWNLOADING → STARTING → LOADING_MODEL.

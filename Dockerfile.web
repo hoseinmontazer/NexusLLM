@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NexusLLM Admin Web UI
+# Multi-stage build: node deps + build → slim runtime image
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: install dependencies ────────────────────────────────────────────
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --legacy-peer-deps
+
+# ── Stage 2: build the Next.js app ───────────────────────────────────────────
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY web/ .
+
+ARG NEXUS_ADMIN_URL=http://localhost:8081/admin/v1
+ENV NEXUS_ADMIN_URL=$NEXUS_ADMIN_URL
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN npm run build
+
+# ── Stage 3: minimal runtime image ───────────────────────────────────────────
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser  --system --uid 1001 nextjs
+
+# Copy Next.js standalone output
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static     ./.next/static
+
+# public/ is optional — copy only if it exists and has files
+RUN mkdir -p ./public
+COPY --from=builder /app/public ./public
+
+RUN chown -R nextjs:nodejs /app
+USER nextjs
+
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+CMD ["node", "server.js"]

@@ -84,24 +84,28 @@ func (h *NodeHandler) RegisterNode(c *gin.Context) {
 // ListNodes handles GET /admin/v1/nodes
 func (h *NodeHandler) ListNodes(c *gin.Context) {
 	type nodeRow struct {
-		ID               string     `db:"id"               json:"id"`
-		Hostname         string     `db:"hostname"         json:"hostname"`
-		DisplayName      string     `db:"display_name"     json:"display_name"`
-		IPAddress        string     `db:"ip_address"       json:"ip_address"`
-		TotalCPU         int        `db:"total_cpu"        json:"total_cpu"`
-		TotalRAMMB       int64      `db:"total_ram_mb"     json:"total_ram_mb"`
-		TotalVRAMMB      int64      `db:"total_vram_mb"    json:"total_vram_mb"`
-		Status           string     `db:"status"           json:"status"`
-		AgentVersion     string     `db:"agent_version"    json:"agent_version"`
-		LastHeartbeatAt  *time.Time `db:"last_heartbeat_at" json:"last_heartbeat_at"`
-		Labels           []byte     `db:"labels"           json:"-"`
-		LabelsStr        string     `json:"labels"`
-		CreatedAt        time.Time  `db:"created_at"       json:"created_at"`
+		ID              string     `db:"id"               json:"id"`
+		Hostname        string     `db:"hostname"         json:"hostname"`
+		DisplayName     string     `db:"display_name"     json:"display_name"`
+		IPAddress       string     `db:"ip_address"       json:"ip_address"`
+		TotalCPU        int        `db:"total_cpu"        json:"total_cpu"`
+		TotalRAMMB      int64      `db:"total_ram_mb"     json:"total_ram_mb"`
+		TotalVRAMMB     int64      `db:"total_vram_mb"    json:"total_vram_mb"`
+		Status          string     `db:"status"           json:"status"`
+		Cordoned        bool       `db:"cordoned"         json:"cordoned"`
+		CordonReason    string     `db:"cordon_reason"    json:"cordon_reason"`
+		AgentVersion    string     `db:"agent_version"    json:"agent_version"`
+		LastHeartbeatAt *time.Time `db:"last_heartbeat_at" json:"last_heartbeat_at"`
+		Labels          []byte     `db:"labels"           json:"-"`
+		LabelsStr       string     `json:"labels"`
+		CreatedAt       time.Time  `db:"created_at"       json:"created_at"`
 	}
 	var rows []nodeRow
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `
 		SELECT id, hostname, display_name, total_cpu, total_ram_mb, total_vram_mb,
-		       status, COALESCE(agent_version,'') AS agent_version,
+		       status, COALESCE(cordoned, FALSE) AS cordoned,
+		       COALESCE(cordon_reason, '') AS cordon_reason,
+		       COALESCE(agent_version,'') AS agent_version,
 		       last_heartbeat_at, labels, created_at,
 		       COALESCE(host(ip_address), '') AS ip_address
 		FROM nodes ORDER BY hostname`); err != nil {
@@ -156,9 +160,9 @@ func (h *NodeHandler) GetNode(c *gin.Context) {
 
 	// Latest telemetry
 	type telRow struct {
-		CPUUtilPct float64 `db:"cpu_util_pct" json:"cpu_util_pct"`
-		RAMUsedMB  int64   `db:"ram_used_mb"  json:"ram_used_mb"`
-		RAMAvailMB int64   `db:"ram_avail_mb" json:"ram_avail_mb"`
+		CPUUtilPct float64   `db:"cpu_util_pct" json:"cpu_util_pct"`
+		RAMUsedMB  int64     `db:"ram_used_mb"  json:"ram_used_mb"`
+		RAMAvailMB int64     `db:"ram_avail_mb" json:"ram_avail_mb"`
 		RecordedAt time.Time `db:"recorded_at" json:"recorded_at"`
 	}
 	var tel *telRow
@@ -176,23 +180,40 @@ func (h *NodeHandler) GetNode(c *gin.Context) {
 	})
 }
 
-// UpdateLabels handles PUT /admin/v1/nodes/:id/labels
+// SetLabels handles PUT /admin/v1/nodes/:id/labels
+// Merges the provided labels into the node's existing label set.
+// To remove a label, set its value to "" (empty string).
 func (h *NodeHandler) UpdateLabels(c *gin.Context) {
 	nodeID := c.Param("id")
 	var input struct {
-		Labels map[string]interface{} `json:"labels" binding:"required"`
+		Labels map[string]string `json:"labels" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	labelsJSON := "{}"
-	if b, err := marshalLabels(input.Labels); err == nil {
-		labelsJSON = string(b)
+
+	// Load existing labels first, then merge
+	var existing []byte
+	_ = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(labels, '{}') FROM nodes WHERE id = $1`, nodeID).Scan(&existing)
+
+	merged := make(map[string]string)
+	if len(existing) > 0 {
+		_ = json.Unmarshal(existing, &merged)
 	}
+	for k, v := range input.Labels {
+		if v == "" {
+			delete(merged, k) // empty string = remove label
+		} else {
+			merged[k] = v
+		}
+	}
+
+	labelsJSON, _ := json.Marshal(merged)
 	res, err := h.db.ExecContext(c.Request.Context(),
 		`UPDATE nodes SET labels = $1, updated_at = NOW() WHERE id = $2`,
-		labelsJSON, nodeID)
+		string(labelsJSON), nodeID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -202,7 +223,7 @@ func (h *NodeHandler) UpdateLabels(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "labels updated", "node_id": nodeID})
+	c.JSON(http.StatusOK, gin.H{"message": "labels updated", "node_id": nodeID, "labels": merged})
 }
 
 // ─── Agent API ────────────────────────────────────────────────────────────────
@@ -399,6 +420,62 @@ func marshalLabels(m map[string]interface{}) ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// CordonNode handles POST /admin/v1/nodes/:id/cordon
+// A cordoned node stays online but the scheduler skips it for new placements.
+// Existing workloads keep running. This is the first step before draining.
+func (h *NodeHandler) CordonNode(c *gin.Context) {
+	nodeID := c.Param("id")
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.ShouldBindJSON(&input)
+	if input.Reason == "" {
+		input.Reason = "admin cordoned"
+	}
+
+	res, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE nodes
+		SET cordoned = TRUE, cordon_reason = $1, cordoned_at = NOW(), updated_at = NOW()
+		WHERE id = $2`, input.Reason, nodeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO node_health_events (node_id, from_status, to_status, reason)
+		SELECT id, status, status||' (cordoned)', $1 FROM nodes WHERE id=$2`, input.Reason, nodeID)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "node cordoned — no new workloads will be scheduled",
+		"node_id": nodeID,
+		"reason":  input.Reason,
+	})
+}
+
+// UncordonNode handles POST /admin/v1/nodes/:id/uncordon
+// Removes the cordon so the scheduler can place new workloads again.
+func (h *NodeHandler) UncordonNode(c *gin.Context) {
+	nodeID := c.Param("id")
+	res, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE nodes
+		SET cordoned = FALSE, cordon_reason = '', cordoned_at = NULL, updated_at = NOW()
+		WHERE id = $1`, nodeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "node uncordoned — ready for new workloads", "node_id": nodeID})
+}
+
 // DrainNode handles POST /admin/v1/nodes/:id/drain
 // Puts the node into DRAINING state — no new deployments, finish existing.
 func (h *NodeHandler) DrainNode(c *gin.Context) {
@@ -464,7 +541,7 @@ func (h *NodeHandler) DeleteNode(c *gin.Context) {
 		WHERE node_id = $1 AND state IN ('active','warm','loading','starting','pulling')`, nodeID)
 	if activeCount > 0 {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":          "node has active runtimes — stop them or drain the node first",
+			"error":           "node has active runtimes — stop them or drain the node first",
 			"active_runtimes": activeCount,
 		})
 		return

@@ -1,8 +1,9 @@
-.PHONY: build build-gateway build-admin build-scheduler build-nodeagent \
+.PHONY: build build-gateway build-admin build-scheduler build-nodeagent build-web \
         run-gateway run-admin run-scheduler run-nodeagent run-web web-install \
+        docker-build docker-push docker-build-web \
         test lint \
-        docker-build docker-push \
-        migrate dev-up dev-up-gpu dev-down \
+        migrate migrate-external migrate-dry \
+        dev-up dev-up-gpu dev-down \
         generate-key \
         placement-simulate node-status \
         deploy-gemma2-2b pull-gguf runtime-status \
@@ -10,7 +11,7 @@
         clean
 
 BINARY_DIR := bin
-REGISTRY   := registry.internal/nexusllm
+REGISTRY   ?= registry.internal/nexusllm
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GO_FLAGS   := -ldflags="-w -s -X main.Version=$(VERSION)"
 
@@ -44,6 +45,19 @@ build-nodeagent:
 	@echo "→ Building nexus-nodeagent..."
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-nodeagent ./cmd/nodeagent
+
+# Build the Admin Web UI production image (requires Docker)
+# Usage: make build-web
+# Override the admin URL at build time: make build-web NEXUS_ADMIN_URL=http://admin:8081/admin/v1
+build-web:
+	@echo "→ Building nexus-web Docker image..."
+	docker build \
+	  --build-arg NEXUS_ADMIN_URL=$(or $(NEXUS_ADMIN_URL),http://localhost:8081/admin/v1) \
+	  -f Dockerfile.web \
+	  -t nexusllm/web:$(VERSION) \
+	  .
+	@echo "✓ Image: nexusllm/web:$(VERSION)"
+	@echo "  Run: docker run -p 3000:3000 -e NEXUS_ADMIN_URL=http://admin:8081/admin/v1 nexusllm/web:$(VERSION)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run locally (postgres + redis must be running via make dev-up)
@@ -104,12 +118,14 @@ docker-build:
 	docker build -f Dockerfile.admin     -t $(REGISTRY)/admin:$(VERSION)     .
 	docker build -f Dockerfile.scheduler -t $(REGISTRY)/scheduler:$(VERSION) .
 	docker build -f Dockerfile.nodeagent -t $(REGISTRY)/nodeagent:$(VERSION) .
+	docker build -f Dockerfile.web       -t $(REGISTRY)/web:$(VERSION)       .
 
 docker-push: docker-build
 	docker push $(REGISTRY)/gateway:$(VERSION)
 	docker push $(REGISTRY)/admin:$(VERSION)
 	docker push $(REGISTRY)/scheduler:$(VERSION)
 	docker push $(REGISTRY)/nodeagent:$(VERSION)
+	docker push $(REGISTRY)/web:$(VERSION)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Database migrations
@@ -141,7 +157,117 @@ migrate:
 	$(call run_migration,010_lazy_runtime.sql)
 	@echo "→ 011 projects, preemption, deployment queue"
 	$(call run_migration,011_projects.sql)
+	@echo "→ 011b runtime config GPU"
+	$(call run_migration,011_runtime_config_gpu.sql)
+	@echo "→ 012 unified startup states"
+	$(call run_migration,012_unified_startup_states.sql)
+	@echo "→ 013 START_MODEL task type"
+	$(call run_migration,013_start_model_task_type.sql)
+	@echo "→ 014 execution mode"
+	$(call run_migration,014_execution_mode.sql)
+	@echo "→ 015 catchup schema"
+	$(call run_migration,015_catchup_schema.sql)
+	@echo "→ 016 workload policy"
+	$(call run_migration,016_workload_policy.sql)
+	@echo "→ 017 scheduler tables"
+	$(call run_migration,017_scheduler.sql)
+	@echo "→ 018 weighted priority"
+	$(call run_migration,018_weighted_priority.sql)
+	@echo "→ 019 HA replicas"
+	$(call run_migration,019_ha_replicas.sql)
+	@echo "→ 020 port allocator"
+	$(call run_migration,020_port_allocator.sql)
+	@echo "→ 021 missing columns"
+	$(call run_migration,021_missing_columns.sql)
+	@echo "→ 022 project API keys"
+	$(call run_migration,022_project_api_keys.sql)
+	@echo "→ 023 project policies & usage rollups"
+	$(call run_migration,023_project_policies.sql)
 	@echo "✓ All migrations complete"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# External DB migrations
+# Use these when postgres is NOT running in docker-compose (e.g. RDS, CloudSQL,
+# managed Postgres, or a separate server).
+#
+# Required env var:
+#   DB_DSN  — full Postgres connection string
+#             postgres://user:pass@host:5432/nexusllm?sslmode=require
+#
+# Works even without local psql — uses Docker postgres image as psql client.
+#
+# Usage:
+#   make migrate-external DB_DSN="postgres://nexus:secret@10.0.0.5:5432/nexusllm"
+#   make migrate-external DB_DSN="postgres://nexus:nexus@192.168.0.200:5540/nexusllm"
+#   make migrate-dry   # list files without connecting
+# ─────────────────────────────────────────────────────────────────────────────
+DB_DSN ?=
+
+# Internal: run one SQL file against external DB using Docker psql client.
+# Avoids requiring psql to be installed on the build machine.
+define run_migration_external
+	@echo "  → migrations/$(1)"
+	@docker run --rm \
+	  --network host \
+	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  -v "$(CURDIR)/migrations:/migrations:ro" \
+	  postgres:15-alpine \
+	  psql "$(DB_DSN)" -f /migrations/$(1) -v ON_ERROR_STOP=1 \
+	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|$$)" || true
+endef
+
+_check-dsn:
+	@test -n "$(DB_DSN)" || { echo ""; echo "ERROR: DB_DSN is required."; echo ""; echo "  Usage: make migrate-external DB_DSN=\"postgres://user:pass@host:5432/db\""; echo ""; exit 1; }
+
+migrate-external: _check-dsn
+	@echo "→ Migrating external DB: $(DB_DSN)"
+	@echo "  Using Docker postgres client (no local psql required)"
+	@echo "  Testing connection..."
+	@docker run --rm \
+	  --network host \
+	  postgres:15-alpine \
+	  psql "$(DB_DSN)" -c "SELECT version();" -t 2>&1 | grep -q "PostgreSQL" \
+	  || { echo "ERROR: Cannot connect to database. Check DB_DSN and network access."; exit 1; }
+	@echo "  ✓ Connected"
+	$(call run_migration_external,001_initial.sql)
+	$(call run_migration_external,002_seed_data.sql)
+	$(call run_migration_external,003_runtime_layer.sql)
+	$(call run_migration_external,004_single_gpu_runtime_seed.sql)
+	$(call run_migration_external,005_ai_platform.sql)
+	$(call run_migration_external,005_enterprise_platform.sql)
+	$(call run_migration_external,006_controller_columns.sql)
+	$(call run_migration_external,006_h200_platform_seed.sql)
+	$(call run_migration_external,007_agent_tasks.sql)
+	$(call run_migration_external,008_node_model_cache.sql)
+	$(call run_migration_external,009_resilience.sql)
+	$(call run_migration_external,010_lazy_runtime.sql)
+	$(call run_migration_external,011_projects.sql)
+	$(call run_migration_external,011_runtime_config_gpu.sql)
+	$(call run_migration_external,012_unified_startup_states.sql)
+	$(call run_migration_external,013_start_model_task_type.sql)
+	$(call run_migration_external,014_execution_mode.sql)
+	$(call run_migration_external,015_catchup_schema.sql)
+	$(call run_migration_external,016_workload_policy.sql)
+	$(call run_migration_external,017_scheduler.sql)
+	$(call run_migration_external,018_weighted_priority.sql)
+	$(call run_migration_external,019_ha_replicas.sql)
+	$(call run_migration_external,020_port_allocator.sql)
+	$(call run_migration_external,021_missing_columns.sql)
+	$(call run_migration_external,022_project_api_keys.sql)
+	$(call run_migration_external,023_project_policies.sql)
+	@echo "✓ All migrations complete on external DB"
+
+# Dry-run: print the SQL files that would be applied without connecting
+migrate-dry:
+	@echo "→ Migrations that would be applied (dry-run):"
+	@for f in $$(ls migrations/*.sql | sort); do echo "  $$f"; done
+	@echo ""
+	@echo "To run against an external DB:"
+	@echo "  make migrate-external DB_DSN=\"postgres://user:pass@host:5432/nexusllm\""
+	@echo ""
+	@echo "To run a single migration manually:"
+	@echo "  docker run --rm --network host -v \$$(pwd)/migrations:/m postgres:15-alpine \\"
+	@echo "    psql \"\$$DB_DSN\" -f /m/023_project_policies.sql"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local dev stack

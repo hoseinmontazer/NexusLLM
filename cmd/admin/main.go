@@ -288,6 +288,8 @@ func main() {
 	a.GET("/nodes/:id/telemetry", nodeH.GetTelemetry)
 	a.GET("/nodes/:id/inventory", nodeH.GetInventory)
 	a.POST("/nodes/:id/drain", nodeH.DrainNode)
+	a.POST("/nodes/:id/cordon", nodeH.CordonNode)
+	a.POST("/nodes/:id/uncordon", nodeH.UncordonNode)
 	a.DELETE("/nodes/:id", nodeH.DeleteNode)
 	a.GET("/nodes/:id/gpus", nodeH.GetNodeGPUs)
 	a.GET("/nodes/:id/health-events", nodeH.GetNodeHealthEvents)
@@ -496,8 +498,21 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 	}
 
 	var rows []stuckRow
+	// The sweeper ONLY catches startup-stuck runtimes: rows that have been in a
+	// transient startup state longer than the threshold.
+	//
+	// NEVER kill READY/ACTIVE/WARM/IDLE runtimes here — those are handled by:
+	//   - runtime watcher (health check failures → StatusDown after 3 fails)
+	//   - node health monitor (node offline → LOST)
+	//   - reconciler (LOST/FAILED below desired_replicas → new replica)
+	//
+	// HA replicas created by the reconciler have endpoint_id=NULL. They must
+	// NOT be swept just because a legacy model_endpoints row has is_enabled=FALSE.
+	// Runtime liveness is determined by runtime.state + container health, not
+	// by endpoint row existence.
 	err := db.SelectContext(ctx, &rows, `
-		-- Case 1: runtimes stuck in startup states too long
+		-- Only startup-stuck runtimes: stuck in a transient state beyond threshold.
+		-- READY/ACTIVE/WARM/IDLE runtimes are NEVER touched by this sweeper.
 		SELECT ar.id, ar.model_id::text, m.name AS model_name,
 		       ar.node_id::text, ar.state, ar.backend,
 		       ar.runtime_name, ar.bind_host, ar.bind_port, ar.updated_at
@@ -505,26 +520,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		JOIN models m ON m.id = ar.model_id
 		WHERE ar.state IN ('loading_model','waiting_ready','starting','pending','validating','downloading')
 		  AND ar.updated_at < NOW() - ($1 || ' seconds')::interval
-		  AND m.enabled = TRUE
-
-		UNION ALL
-
-		-- Case 2: runtimes marked ready/active but endpoint is down
-		-- (container was removed without going through stopped/failed state)
-		SELECT ar.id, ar.model_id::text, m.name AS model_name,
-		       ar.node_id::text, ar.state, ar.backend,
-		       ar.runtime_name, ar.bind_host, ar.bind_port, ar.updated_at
-		FROM agent_runtimes ar
-		JOIN models m ON m.id = ar.model_id
-		WHERE ar.state IN ('ready','active','warm','idle')
-		  AND ar.updated_at < NOW() - INTERVAL '60 seconds'
-		  AND m.enabled = TRUE
-		  AND EXISTS (
-		      SELECT 1 FROM model_endpoints me
-		      WHERE (me.id = ar.endpoint_id OR me.model_id = ar.model_id)
-		        AND me.health_status = 'down'
-		        AND me.is_enabled = FALSE
-		  )`,
+		  AND m.enabled = TRUE`,
 		int(threshold.Seconds()),
 	)
 	if err != nil {
@@ -539,10 +535,26 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 
 	for _, row := range rows {
 		age := time.Since(row.UpdatedAt)
-		log.Warn("stuck-runtime sweep: marking failed",
+
+		// Fetch extra context for diagnostics before taking any action.
+		var containerID, endpointID string
+		var nodeOnline bool
+		_ = db.QueryRowContext(ctx,
+			`SELECT COALESCE(container_id,''), COALESCE(endpoint_id::text,'')
+			 FROM agent_runtimes WHERE id=$1`, row.RuntimeID,
+		).Scan(&containerID, &endpointID)
+		_ = db.QueryRowContext(ctx,
+			`SELECT status IN ('online','degraded') FROM nodes WHERE id=$1`, row.NodeID,
+		).Scan(&nodeOnline)
+
+		log.Warn("stuck-runtime sweep: marking startup-stuck runtime failed",
 			zap.String("runtime_id", row.RuntimeID),
 			zap.String("model", row.ModelName),
 			zap.String("state", row.State),
+			zap.String("container_id", containerID),
+			zap.String("endpoint_id", endpointID),
+			zap.String("node", row.NodeID),
+			zap.Bool("node_online", nodeOnline),
 			zap.Duration("stuck_for", age),
 		)
 

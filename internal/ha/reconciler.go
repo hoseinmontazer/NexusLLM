@@ -502,9 +502,10 @@ func (r *Reconciler) selectNode(ctx context.Context, status ReplicaStatus) (stri
 		) gt ON TRUE
 		LEFT JOIN agent_runtimes ar ON ar.node_id = n.id
 		WHERE n.status IN ('online','degraded')
+		  AND n.cordoned = FALSE
 		GROUP BY n.id, n.hostname ORDER BY n.id`)
 	if err != nil || len(nodes) == 0 {
-		return "", fmt.Errorf("no online nodes available")
+		return "", fmt.Errorf("no online uncordoned nodes available")
 	}
 
 	var existingNodes []string
@@ -519,28 +520,40 @@ func (r *Reconciler) selectNode(ctx context.Context, status ReplicaStatus) (stri
 
 	policy := PlacementPolicy(status.PlacementPolicy)
 
+	// anti_affinity: HARD rule — never place on a node that already has a replica
 	if policy == PolicyAntiAffinity {
 		for _, n := range nodes {
 			if !existingSet[n.ID] {
 				return n.ID, nil
 			}
 		}
-		return "", fmt.Errorf("anti_affinity: no node available without existing replica")
+		// All nodes have a replica — if single-node cluster, allow packing as fallback
+		if len(nodes) == 1 {
+			return nodes[0].ID, nil
+		}
+		return "", fmt.Errorf("anti_affinity: no node available without existing replica (have %d nodes, %d with replicas)", len(nodes), len(existingSet))
 	}
+
+	// spread: prefer nodes without existing replicas, fall back to least-loaded
 	if policy == PolicySpread {
 		for _, n := range nodes {
 			if !existingSet[n.ID] {
 				return n.ID, nil
 			}
 		}
+		// All nodes have replicas — pick the one with most free VRAM
 	}
+
+	// pack: prefer nodes that already have replicas of this model
 	if policy == PolicyPack {
 		for _, n := range nodes {
 			if existingSet[n.ID] {
 				return n.ID, nil
 			}
 		}
+		// No node has a replica yet — fall through to default
 	}
+
 	// Default: most free VRAM
 	best := nodes[0]
 	for _, n := range nodes[1:] {

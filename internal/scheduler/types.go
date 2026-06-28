@@ -14,6 +14,56 @@ import (
 // Request & Decision types
 // ─────────────────────────────────────────────────────────────────────────────
 
+// PlacementMode is the high-level deployment targeting mode.
+type PlacementMode string
+
+const (
+	// ModeAuto — scheduler picks the best available node (default).
+	ModeAuto PlacementMode = "auto"
+	// ModeSpecificNode — must deploy to a single named node_id.
+	// Validated: request fails if node lacks resources.
+	ModeSpecificNode PlacementMode = "specific_node"
+	// ModeNodeGroup — deploy to any node that belongs to a named group
+	// (nodes share the label "node_group=<group_id>").
+	ModeNodeGroup PlacementMode = "node_group"
+	// ModeLabelSelector — deploy to any node whose labels match all
+	// key=value pairs in NodeSelector (AND semantics).
+	ModeLabelSelector PlacementMode = "label_selector"
+)
+
+// PlacementValidationError carries a human-readable rejection reason
+// for specific_node or label_selector placements that fail resource checks.
+type PlacementValidationError struct {
+	Reason    string
+	Requested map[string]int64 // resource name → requested amount
+	Available map[string]int64 // resource name → available on the target
+}
+
+func (e *PlacementValidationError) Error() string { return e.Reason }
+
+// PlacementStrategy controls how the scheduler picks a node.
+type PlacementStrategy string
+
+const (
+	// StrategyAuto — scheduler picks the best node (default).
+	StrategyAuto PlacementStrategy = "auto"
+	// StrategyPinned — must use the specified node_id (legacy alias for ModeSpecificNode).
+	StrategyPinned PlacementStrategy = "pinned"
+	// StrategySpread — prefer nodes that don't already have a replica of this model.
+	StrategySpread PlacementStrategy = "spread"
+	// StrategyPacked — prefer nodes that already carry replicas (minimise fragmentation).
+	StrategyPacked PlacementStrategy = "packed"
+)
+
+// AcceleratorType describes the required compute hardware.
+type AcceleratorType string
+
+const (
+	AcceleratorAny AcceleratorType = "any" // default — use GPU if available
+	AcceleratorGPU AcceleratorType = "gpu" // must have at least one GPU
+	AcceleratorCPU AcceleratorType = "cpu" // must be CPU-only
+)
+
 // PlacementRequest describes a model that needs to be placed on a node.
 type PlacementRequest struct {
 	// Identity
@@ -28,6 +78,28 @@ type PlacementRequest struct {
 	RequiredGPUs   int
 	ExecutionMode  string // cpu | gpu | auto
 
+	// ── Placement targeting ───────────────────────────────────────────────────
+	// Mode drives which targeting path the scheduler uses.
+	Mode PlacementMode // auto | specific_node | node_group | label_selector
+
+	// SpecificNodeID is the hard-pinned node (Mode == ModeSpecificNode).
+	// The scheduler validates resource availability and returns
+	// PlacementValidationError if the node cannot accommodate the request.
+	SpecificNodeID string
+
+	// NodeGroupID targets any node with label "node_group=<id>" (Mode == ModeNodeGroup).
+	NodeGroupID string
+
+	// NodeSelector is a map of label key → value. ALL pairs must match
+	// (Mode == ModeLabelSelector). Example: {"accelerator":"h200","storage":"nvme"}
+	NodeSelector map[string]string
+
+	// Strategy controls intra-mode tie-breaking (spread vs packed vs auto).
+	Strategy       PlacementStrategy // auto | pinned | spread | packed
+	AcceleratorReq AcceleratorType   // any | gpu | cpu
+	PinnedNodeID   string            // legacy: used when Strategy == StrategyPinned
+
+	// ─────────────────────────────────────────────────────────────────────────
 	// Priority (numeric weight + computed effective value)
 	PriorityWeight    project.PriorityWeight
 	EffectivePriority int // computed by scheduler: weight + aging + bonuses - penalties
@@ -36,7 +108,7 @@ type PlacementRequest struct {
 	WorkloadPolicy string // lazy_load | always_on
 	Preemptible    bool   // may this project be preempted to serve others?
 
-	// Placement hints (soft/hard)
+	// Soft hints (used when Mode == auto)
 	PreferNodeID  string
 	RequireNodeID string
 }

@@ -18,6 +18,7 @@ package scheduler
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -209,7 +210,7 @@ func (s *Scheduler) Apply(ctx context.Context, dec *PlacementDecision, req Place
 // Scheduler helpers — node loading, scoring, decision building
 // ─────────────────────────────────────────────────────────────────────────────
 
-// loadCandidateNodes returns online nodes that meet the hard constraints.
+// loadCandidateNodes returns online, uncordoned nodes that meet the hard constraints.
 func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest) ([]Node, error) {
 	type dbRow struct {
 		ID           string  `db:"id"`
@@ -220,27 +221,80 @@ func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest
 		TotalVRAMMB  int64   `db:"total_vram_mb"`
 		CPUUtilPct   float64 `db:"cpu_util_pct"`
 		RuntimeCount int     `db:"runtime_count"`
+		Labels       []byte  `db:"labels"`
 	}
 
+	// ── Build base query ──────────────────────────────────────────────────────
 	q := `
 		SELECT n.id, n.hostname, n.status,
 		       n.total_cpu, n.total_ram_mb, n.total_vram_mb,
 		       COALESCE(nt.cpu_util_pct, 0) AS cpu_util_pct,
-		       COUNT(ar.id) FILTER (WHERE ar.state IN ('ready','active','warm','loading_model')) AS runtime_count
+		       COUNT(ar.id) FILTER (WHERE ar.state IN ('ready','active','warm','loading_model')) AS runtime_count,
+		       COALESCE(n.labels, '{}') AS labels
 		FROM nodes n
 		LEFT JOIN LATERAL (
 		    SELECT cpu_util_pct FROM node_telemetry
 		    WHERE node_id = n.id ORDER BY recorded_at DESC LIMIT 1
 		) nt ON TRUE
 		LEFT JOIN agent_runtimes ar ON ar.node_id = n.id
-		WHERE n.status IN ('online','degraded')`
+		WHERE n.status IN ('online','degraded')
+		  AND n.cordoned = FALSE`
 
 	args := []interface{}{}
-	if req.RequireNodeID != "" {
-		q += " AND n.id = $1"
-		args = append(args, req.RequireNodeID)
+	argIdx := 1
+
+	// ── Mode-specific filtering ───────────────────────────────────────────────
+	switch req.Mode {
+	case ModeSpecificNode:
+		// Hard pin — only one candidate, validated below
+		if req.SpecificNodeID == "" {
+			return nil, fmt.Errorf("placement: specific_node mode requires node_id")
+		}
+		q += fmt.Sprintf(" AND n.id = $%d", argIdx)
+		args = append(args, req.SpecificNodeID)
+		argIdx++
+
+	case ModeNodeGroup:
+		if req.NodeGroupID == "" {
+			return nil, fmt.Errorf("placement: node_group mode requires node_group_id")
+		}
+		// Nodes with label node_group=<id>
+		q += fmt.Sprintf(" AND n.labels @> $%d::jsonb", argIdx)
+		args = append(args, fmt.Sprintf(`{"node_group":"%s"}`, req.NodeGroupID))
+		argIdx++
+
+	case ModeLabelSelector:
+		if len(req.NodeSelector) == 0 {
+			return nil, fmt.Errorf("placement: label_selector mode requires at least one label")
+		}
+		// Build a single jsonb containment check: labels @> '{"k1":"v1","k2":"v2"}'
+		selectorJSON, jerr := json.Marshal(req.NodeSelector)
+		if jerr != nil {
+			return nil, fmt.Errorf("placement: invalid node_selector: %w", jerr)
+		}
+		q += fmt.Sprintf(" AND n.labels @> $%d::jsonb", argIdx)
+		args = append(args, string(selectorJSON))
+		argIdx++
+
+	default: // ModeAuto / StrategyPinned legacy
+		// Strategy: pinned → hard node requirement
+		switch req.Strategy {
+		case StrategyPinned:
+			if req.PinnedNodeID != "" {
+				q += fmt.Sprintf(" AND n.id = $%d", argIdx)
+				args = append(args, req.PinnedNodeID)
+				argIdx++
+			}
+		default:
+			if req.RequireNodeID != "" {
+				q += fmt.Sprintf(" AND n.id = $%d", argIdx)
+				args = append(args, req.RequireNodeID)
+				argIdx++
+			}
+		}
 	}
-	q += " GROUP BY n.id, n.hostname, n.status, n.total_cpu, n.total_ram_mb, n.total_vram_mb, nt.cpu_util_pct"
+
+	q += " GROUP BY n.id, n.hostname, n.status, n.total_cpu, n.total_ram_mb, n.total_vram_mb, nt.cpu_util_pct, n.labels"
 	q += " ORDER BY n.total_vram_mb DESC"
 
 	var rows []dbRow
@@ -248,7 +302,7 @@ func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest
 		return nil, fmt.Errorf("loadCandidateNodes: %w", err)
 	}
 
-	// For each node, calculate free resources and GPU devices
+	// ── Enrich nodes with live resource data ──────────────────────────────────
 	nodes := make([]Node, 0, len(rows))
 	for _, r := range rows {
 		node := Node{
@@ -262,44 +316,178 @@ func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest
 			RuntimeCount: r.RuntimeCount,
 		}
 
-		// Load GPU devices and compute free VRAM
 		node.GPUDevices, node.FreeVRAMMB = s.loadGPUState(ctx, r.ID)
 		node.HasGPU = len(node.GPUDevices) > 0
 		node.GPUCount = len(node.GPUDevices)
 
-		// Compute free RAM from latest telemetry
 		var ramAvail int64
 		_ = s.db.GetContext(ctx, &ramAvail,
 			`SELECT COALESCE(ram_avail_mb, 0) FROM node_telemetry WHERE node_id=$1 ORDER BY recorded_at DESC LIMIT 1`,
 			r.ID)
 		if ramAvail == 0 && r.TotalRAMMB > 0 {
-			ramAvail = r.TotalRAMMB / 2 // fallback estimate
+			ramAvail = r.TotalRAMMB / 2
 		}
 		node.FreeRAMMB = ramAvail
 
-		// Compute free CPU
 		var allocCPU int
 		_ = s.db.GetContext(ctx, &allocCPU,
 			`SELECT COALESCE(SUM(cpu_cores),0) FROM cpu_allocations WHERE node_id=$1 AND released_at IS NULL`, r.ID)
 		node.FreeCPU = r.TotalCPU - allocCPU
 
-		// Hard filter: check if node can accommodate requirements
-		if req.RequiredVRAMMB > 0 && node.FreeVRAMMB < req.RequiredVRAMMB {
-			continue
+		// ── Hard resource validation ──────────────────────────────────────────
+		// For specific_node mode: reject with a descriptive error instead of silently skipping.
+		if req.Mode == ModeSpecificNode {
+			if err := s.validateNodeResources(node, req); err != nil {
+				return nil, err // caller gets the validation error directly
+			}
+		} else {
+			// For all other modes, silently skip nodes that can't accommodate the request
+			if req.RequiredVRAMMB > 0 && node.FreeVRAMMB < req.RequiredVRAMMB {
+				continue
+			}
+			if req.RequiredRAMMB > 0 && node.FreeRAMMB < req.RequiredRAMMB {
+				continue
+			}
+			if req.RequiredCPU > 0 && node.FreeCPU < req.RequiredCPU {
+				continue
+			}
+			if req.ExecutionMode == "gpu" && !node.HasGPU {
+				continue
+			}
 		}
-		if req.RequiredRAMMB > 0 && node.FreeRAMMB < req.RequiredRAMMB {
-			continue
-		}
-		if req.RequiredCPU > 0 && node.FreeCPU < req.RequiredCPU {
-			continue
-		}
-		if req.ExecutionMode == "gpu" && !node.HasGPU {
-			continue
+
+		// Accelerator requirement filter
+		switch req.AcceleratorReq {
+		case AcceleratorGPU:
+			if !node.HasGPU {
+				continue
+			}
+		case AcceleratorCPU:
+			if node.HasGPU {
+				continue
+			}
 		}
 
 		nodes = append(nodes, node)
 	}
+
+	// ── Spread / packed ordering for non-specific modes ───────────────────────
+	if req.Strategy == StrategySpread && req.ModelID != "" {
+		var existingNodeIDs []string
+		_ = s.db.SelectContext(ctx, &existingNodeIDs, `
+			SELECT DISTINCT node_id::text FROM agent_runtimes
+			WHERE model_id = $1
+			  AND state NOT IN ('stopped','deleted','archived','unloaded','failed','lost')`,
+			req.ModelID)
+		existing := make(map[string]bool, len(existingNodeIDs))
+		for _, id := range existingNodeIDs {
+			existing[id] = true
+		}
+		var spread, other []Node
+		for _, n := range nodes {
+			if existing[n.ID] {
+				other = append(other, n)
+			} else {
+				spread = append(spread, n)
+			}
+		}
+		if len(spread) > 0 {
+			nodes = append(spread, other...)
+		}
+	}
+
+	if req.Strategy == StrategyPacked && req.ModelID != "" {
+		var existingNodeIDs []string
+		_ = s.db.SelectContext(ctx, &existingNodeIDs, `
+			SELECT DISTINCT node_id::text FROM agent_runtimes
+			WHERE model_id = $1
+			  AND state NOT IN ('stopped','deleted','archived','unloaded','failed','lost')`,
+			req.ModelID)
+		existing := make(map[string]bool, len(existingNodeIDs))
+		for _, id := range existingNodeIDs {
+			existing[id] = true
+		}
+		var packed, other []Node
+		for _, n := range nodes {
+			if existing[n.ID] {
+				packed = append(packed, n)
+			} else {
+				other = append(other, n)
+			}
+		}
+		if len(packed) > 0 {
+			nodes = append(packed, other...)
+		}
+	}
+
 	return nodes, nil
+}
+
+// validateNodeResources checks whether a specific node can accommodate the request.
+// Returns a PlacementValidationError with human-readable details if it cannot.
+func (s *Scheduler) validateNodeResources(node Node, req PlacementRequest) error {
+	requested := map[string]int64{}
+	available := map[string]int64{}
+	failures := []string{}
+
+	if req.RequiredVRAMMB > 0 {
+		requested["vram_mb"] = req.RequiredVRAMMB
+		available["vram_mb"] = node.FreeVRAMMB
+		if node.FreeVRAMMB < req.RequiredVRAMMB {
+			failures = append(failures,
+				fmt.Sprintf("VRAM: requested %dMB (%.0fGB), available %dMB (%.0fGB)",
+					req.RequiredVRAMMB, float64(req.RequiredVRAMMB)/1024,
+					node.FreeVRAMMB, float64(node.FreeVRAMMB)/1024))
+		}
+	}
+	if req.RequiredRAMMB > 0 {
+		requested["ram_mb"] = req.RequiredRAMMB
+		available["ram_mb"] = node.FreeRAMMB
+		if node.FreeRAMMB < req.RequiredRAMMB {
+			failures = append(failures,
+				fmt.Sprintf("RAM: requested %dMB (%.0fGB), available %dMB (%.0fGB)",
+					req.RequiredRAMMB, float64(req.RequiredRAMMB)/1024,
+					node.FreeRAMMB, float64(node.FreeRAMMB)/1024))
+		}
+	}
+	if req.RequiredCPU > 0 {
+		requested["cpu"] = int64(req.RequiredCPU)
+		available["cpu"] = int64(node.FreeCPU)
+		if node.FreeCPU < req.RequiredCPU {
+			failures = append(failures,
+				fmt.Sprintf("CPU: requested %d cores, available %d cores",
+					req.RequiredCPU, node.FreeCPU))
+		}
+	}
+	if req.AcceleratorReq == AcceleratorGPU && !node.HasGPU {
+		failures = append(failures, "GPU required but node has no GPU devices")
+	}
+	if req.ExecutionMode == "gpu" && !node.HasGPU {
+		failures = append(failures, "GPU execution mode requested but node has no GPUs")
+	}
+
+	if len(failures) == 0 {
+		return nil
+	}
+
+	reason := fmt.Sprintf("node %q cannot accommodate deployment: %s",
+		node.Hostname, joinStrings(failures, "; "))
+	return &PlacementValidationError{
+		Reason:    reason,
+		Requested: requested,
+		Available: available,
+	}
+}
+
+func joinStrings(ss []string, sep string) string {
+	result := ""
+	for i, s := range ss {
+		if i > 0 {
+			result += sep
+		}
+		result += s
+	}
+	return result
 }
 
 // loadGPUState loads GPU devices for a node and computes total free VRAM.

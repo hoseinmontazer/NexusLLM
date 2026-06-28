@@ -3,7 +3,7 @@
 // Unified Infrastructure page — Nodes · GPU · Placement Simulator
 // Replaces the three separate /nodes, /gpu, /placement pages.
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type ClusterNode } from '@/lib/api'
@@ -101,11 +101,14 @@ function NodeGPUPanel({ nodeId }: { nodeId: string }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // NODES TAB
 // ─────────────────────────────────────────────────────────────────────────────
+// Confirm-action state: 'drain' | 'delete' | 'cordon' | null
+type NodeAction = { id: string; action: 'drain' | 'delete' | 'cordon' } | null
+
 function NodesTab() {
   const qc = useQueryClient()
   const [expanded, setExpanded] = useState<string | null>(null)
   const [openRegister, setOpenRegister] = useState(false)
-  const [confirmDrain, setConfirmDrain] = useState<string | null>(null)
+  const [confirm, setConfirm] = useState<NodeAction>(null)
 
   const { data, isLoading } = useQuery({
     queryKey: ['nodes'],
@@ -116,14 +119,41 @@ function NodesTab() {
 
   const drain = useMutation({
     mutationFn: (id: string) => api.nodes.drain(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['nodes'] }); setConfirmDrain(null); toast({ title: 'Node draining' }) },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['nodes'] }); setConfirm(null); toast({ title: 'Node draining' }) },
     onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
   })
+
+  const del = useMutation({
+    mutationFn: (id: string) => api.nodes.delete(id),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['nodes'] }); setConfirm(null); toast({ title: 'Node deleted' }) },
+    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
+  })
+
+  const cordon = useMutation({
+    mutationFn: (id: string) => api.nodes.cordon(id),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['nodes'] }); setConfirm(null); toast({ title: 'Node cordoned — no new workloads' }) },
+    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
+  })
+
+  const uncordon = useMutation({
+    mutationFn: (id: string) => api.nodes.uncordon(id),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['nodes'] }); toast({ title: 'Node uncordoned' }) },
+    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
+  })
+
+  const onlineCount  = nodes.filter(n => n.status === 'online' && !n.cordoned).length
+  const cordonedCount = nodes.filter(n => n.cordoned).length
+  const offlineCount = nodes.filter(n => n.status === 'offline').length
 
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center">
-        <p className="text-sm text-muted-foreground">{nodes.length} node{nodes.length !== 1 ? 's' : ''} registered</p>
+        <div className="flex items-center gap-3">
+          <p className="text-sm text-muted-foreground">{nodes.length} node{nodes.length !== 1 ? 's' : ''}</p>
+          {onlineCount > 0   && <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700">{onlineCount} online</span>}
+          {cordonedCount > 0 && <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-800">{cordonedCount} cordoned</span>}
+          {offlineCount > 0  && <span className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-600">{offlineCount} offline</span>}
+        </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['nodes'] })}>
             <RefreshCw className="w-3.5 h-3.5 mr-1" />Refresh
@@ -148,65 +178,160 @@ function NodesTab() {
         </CardContent></Card>
       )}
 
-      {nodes.map(node => (
-        <Card key={node.id}>
-          <CardContent className="pt-4 pb-4">
-            {/* Header row */}
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-3 min-w-0">
-                <Server className="w-4 h-4 text-muted-foreground shrink-0" />
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-semibold">{node.hostname}</span>
-                    <NodeStatusBadge status={node.status} />
+      {nodes.map(node => {
+        const heartbeatSecs = node.last_heartbeat_at
+          ? Math.round((Date.now() - new Date(node.last_heartbeat_at).getTime()) / 1000)
+          : null
+        const isConfirming = confirm?.id === node.id
+        const isPending = drain.isPending || del.isPending || cordon.isPending
+
+        return (
+          <Card key={node.id} className={node.cordoned ? 'border-yellow-300 bg-yellow-50/30' : ''}>
+            <CardContent className="pt-4 pb-4">
+              {/* Header row */}
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3 min-w-0">
+                  <Server className="w-4 h-4 text-muted-foreground shrink-0" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold">
+                        {node.hostname && node.hostname !== node.id
+                          ? node.hostname
+                          : <span className="font-mono text-sm">{node.id.slice(0, 8)}</span>}
+                      </span>
+                      <NodeStatusBadge status={node.status} />
+                      {node.cordoned && (
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-800 font-medium">
+                          cordoned
+                        </span>
+                      )}
+                      {node.agent_version && (
+                        <span className="text-xs text-muted-foreground hidden sm:inline">
+                          agent {node.agent_version}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-0.5 flex flex-wrap gap-x-2">
+                      {node.ip_address && <span>{node.ip_address}</span>}
+                      {node.total_cpu > 0 && <span>{node.total_cpu} CPUs</span>}
+                      {node.total_ram_mb > 0 && <span>{Math.round(node.total_ram_mb / 1024)}GB RAM</span>}
+                      {(node.total_vram_mb ?? 0) > 0 && <span>{Math.round((node.total_vram_mb ?? 0) / 1024)}GB VRAM</span>}
+                      {node.cordoned && node.cordon_reason && (
+                        <span className="text-yellow-700">— {node.cordon_reason}</span>
+                      )}
+                    </p>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {node.ip_address && <span className="mr-2">{node.ip_address}</span>}
-                    {node.total_cpu > 0 && <span className="mr-2">{node.total_cpu} CPUs</span>}
-                    {node.total_ram_mb > 0 && <span className="mr-2">{Math.round(node.total_ram_mb / 1024)}GB RAM</span>}
-                    {(node.total_vram_mb ?? 0) > 0 && <span>{Math.round((node.total_vram_mb ?? 0) / 1024)}GB VRAM</span>}
-                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {heartbeatSecs !== null && (
+                    <span className={`text-xs ${heartbeatSecs > 60 ? 'text-red-500' : 'text-muted-foreground'}`}>
+                      {heartbeatSecs}s ago
+                    </span>
+                  )}
+
+                  {/* Confirm zone */}
+                  {isConfirming ? (
+                    <>
+                      <span className="text-xs text-muted-foreground">
+                        {confirm.action === 'drain' ? 'Drain node?' : confirm.action === 'cordon' ? 'Cordon node?' : 'Delete node?'}
+                      </span>
+                      <Button size="sm" variant="destructive" disabled={isPending}
+                        onClick={() => {
+                          if (confirm.action === 'drain') drain.mutate(node.id)
+                          else if (confirm.action === 'cordon') cordon.mutate(node.id)
+                          else del.mutate(node.id)
+                        }}>
+                        {isPending ? '…' : 'Confirm'}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => setConfirm(null)}>Cancel</Button>
+                    </>
+                  ) : (
+                    <>
+                      {node.cordoned ? (
+                        <Button size="sm" variant="outline"
+                          className="text-green-700 border-green-200 hover:bg-green-50"
+                          disabled={uncordon.isPending}
+                          onClick={() => uncordon.mutate(node.id)}>
+                          Uncordon
+                        </Button>
+                      ) : (
+                        <Button size="sm" variant="outline"
+                          className="text-yellow-700 border-yellow-200 hover:bg-yellow-50"
+                          onClick={() => setConfirm({ id: node.id, action: 'cordon' })}>
+                          Cordon
+                        </Button>
+                      )}
+                      <Button size="sm" variant="outline"
+                        onClick={() => setConfirm({ id: node.id, action: 'drain' })}>
+                        Drain
+                      </Button>
+                      <Button size="sm" variant="outline"
+                        className="text-red-600 border-red-200 hover:bg-red-50"
+                        onClick={() => setConfirm({ id: node.id, action: 'delete' })}>
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </Button>
+                    </>
+                  )}
+
+                  <Button variant="ghost" size="sm"
+                    onClick={() => setExpanded(e => e === node.id ? null : node.id)}>
+                    {expanded === node.id ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  </Button>
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
-                {node.last_heartbeat_at && (
-                  <span className="text-xs text-muted-foreground">
-                    {Math.round((Date.now() - new Date(node.last_heartbeat_at).getTime()) / 1000)}s ago
-                  </span>
-                )}
-                {confirmDrain === node.id ? (
-                  <>
-                    <Button size="sm" variant="destructive" disabled={drain.isPending}
-                      onClick={() => drain.mutate(node.id)}>
-                      {drain.isPending ? 'Draining…' : 'Confirm Drain'}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => setConfirmDrain(null)}>Cancel</Button>
-                  </>
-                ) : (
-                  <Button size="sm" variant="outline" onClick={() => setConfirmDrain(node.id)}>Drain</Button>
-                )}
-                <Button variant="ghost" size="sm"
-                  onClick={() => setExpanded(e => e === node.id ? null : node.id)}>
-                  {expanded === node.id ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                </Button>
-              </div>
-            </div>
 
-            {/* Expanded: telemetry + GPUs */}
-            {expanded === node.id && <NodeDetail nodeId={node.id} />}
-          </CardContent>
-        </Card>
-      ))}
+              {/* Expanded: telemetry + GPUs */}
+              {expanded === node.id && <NodeDetail nodeId={node.id} />}
+            </CardContent>
+          </Card>
+        )
+      })}
     </div>
   )
 }
 
 function NodeDetail({ nodeId }: { nodeId: string }) {
+  const qc = useQueryClient()
+  const [editingLabels, setEditingLabels] = useState(false)
+  const [labelPairs, setLabelPairs] = useState<{k: string; v: string}[]>([])
+
   const { data } = useQuery({
     queryKey: ['node-telemetry', nodeId],
     queryFn: () => api.nodes.getTelemetry(nodeId),
     refetchInterval: 15_000,
   })
+  const { data: nodeData } = useQuery({
+    queryKey: ['nodes'],
+    queryFn: api.nodes.list,
+  })
+  const node = nodeData?.data?.find(n => n.id === nodeId)
+  const existingLabels: Record<string, string> = (() => {
+    if (!node?.labels || node.labels === '{}') return {}
+    try { return JSON.parse(node.labels) } catch { return {} }
+  })()
+
+  const saveLabelsMut = useMutation({
+    mutationFn: () => {
+      const labels: Record<string, string> = {}
+      labelPairs.forEach(p => { if (p.k) labels[p.k] = p.v })
+      return api.nodes.setLabels(nodeId, labels)
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['nodes'] })
+      setEditingLabels(false)
+      toast({ title: 'Labels saved' })
+    },
+    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
+  })
+
+  const startEditLabels = () => {
+    const pairs = Object.entries(existingLabels).map(([k, v]) => ({ k, v }))
+    if (pairs.length === 0) pairs.push({ k: '', v: '' })
+    setLabelPairs(pairs)
+    setEditingLabels(true)
+  }
+
   const latest = data?.data?.[0]
   return (
     <div className="mt-4 border-t pt-4 space-y-3">
@@ -231,6 +356,62 @@ function NodeDetail({ nodeId }: { nodeId: string }) {
           </div>
         </div>
       )}
+
+      {/* Labels panel */}
+      <div className="border rounded-md p-3 bg-gray-50/50">
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Node Labels</p>
+          {!editingLabels && (
+            <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={startEditLabels}>
+              Edit labels
+            </Button>
+          )}
+        </div>
+
+        {editingLabels ? (
+          <div className="space-y-2">
+            {labelPairs.map((pair, i) => (
+              <div key={i} className="flex gap-2 items-center">
+                <input className="flex-1 border rounded px-2 py-1 text-xs"
+                  value={pair.k} placeholder="key"
+                  onChange={e => setLabelPairs(p => p.map((x, idx) => idx === i ? { ...x, k: e.target.value } : x))} />
+                <span className="text-muted-foreground text-xs">=</span>
+                <input className="flex-1 border rounded px-2 py-1 text-xs"
+                  value={pair.v} placeholder="value"
+                  onChange={e => setLabelPairs(p => p.map((x, idx) => idx === i ? { ...x, v: e.target.value } : x))} />
+                <button className="text-red-400 text-xs px-1" type="button"
+                  onClick={() => setLabelPairs(p => p.filter((_, idx) => idx !== i))}>×</button>
+              </div>
+            ))}
+            <div className="flex gap-2 pt-1">
+              <Button type="button" variant="outline" size="sm" className="h-7 text-xs"
+                onClick={() => setLabelPairs(p => [...p, { k: '', v: '' }])}>+ Add</Button>
+              <Button type="button" size="sm" className="h-7 text-xs"
+                disabled={saveLabelsMut.isPending} onClick={() => saveLabelsMut.mutate()}>
+                {saveLabelsMut.isPending ? 'Saving…' : 'Save'}
+              </Button>
+              <Button type="button" variant="ghost" size="sm" className="h-7 text-xs"
+                onClick={() => setEditingLabels(false)}>Cancel</Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Common labels: <code className="bg-white border rounded px-1">accelerator=h200</code>{' '}
+              <code className="bg-white border rounded px-1">node_group=cluster-1</code>{' '}
+              <code className="bg-white border rounded px-1">storage=nvme</code>
+            </p>
+          </div>
+        ) : Object.keys(existingLabels).length === 0 ? (
+          <p className="text-xs text-muted-foreground">No labels — click Edit to add placement labels.</p>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            {Object.entries(existingLabels).map(([k, v]) => (
+              <span key={k} className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-mono">
+                {k}={v}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
       <NodeGPUPanel nodeId={nodeId} />
     </div>
   )
@@ -419,7 +600,7 @@ function PlacementTab() {
 // ─────────────────────────────────────────────────────────────────────────────
 type Tab = 'nodes' | 'gpu' | 'placement'
 
-export default function ClusterPage() {
+function ClusterPageInner() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const [tab, setTab] = useState<Tab>(() => {
@@ -468,6 +649,16 @@ export default function ClusterPage() {
       {tab === 'gpu'       && <GPUInventoryTab />}
       {tab === 'placement' && <PlacementTab />}
     </div>
+  )
+}
+
+// Suspense wrapper required because useSearchParams() reads from the URL
+// during static generation — Next.js requires a boundary here.
+export default function ClusterPage() {
+  return (
+    <Suspense fallback={<div className="p-8 text-muted-foreground text-sm">Loading…</div>}>
+      <ClusterPageInner />
+    </Suspense>
   )
 }
 

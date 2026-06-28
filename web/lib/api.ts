@@ -108,9 +108,10 @@ export interface ResourceReservation {
 
 export interface ClusterNode {
   id: string; hostname: string; display_name: string
-  ip_address: string     // real IP reported by node agent (empty string if not registered)
+  ip_address: string
   total_cpu: number; total_ram_mb: number; total_vram_mb: number
   status: string; agent_version: string
+  cordoned: boolean; cordon_reason: string
   last_heartbeat_at?: string; labels: string; created_at: string
 }
 
@@ -150,11 +151,21 @@ export interface DeployModelInput {
   tensor_parallel?: number; gpu_memory_util?: number
   max_model_len?: number; dtype?: string; hf_token?: string
   start_now?: boolean
-  // Node agent deployment
+  // Legacy node agent deployment
   node_id?: string
   auto_place?: boolean
   min_vram_mb?: number
   priority?: string
+  // Placement v2 — strategy
+  placement_strategy?: 'auto' | 'pinned' | 'spread' | 'packed'
+  accelerator_type?: 'any' | 'gpu' | 'cpu'
+  replica_distribution?: 'spread' | 'pack' | 'anti_affinity'
+  pinned_node_id?: string
+  // Placement v2 — modes
+  placement_mode?: 'auto' | 'specific_node' | 'node_group' | 'label_selector'
+  specific_node_id?: string
+  node_group_id?: string
+  node_selector?: Record<string, string>
   // llamacpp-specific
   llamacpp_model_path?: string
   llamacpp_hf_repo?: string
@@ -586,6 +597,12 @@ export const api = {
       req<{ data: NodeGPUDevice[]; node_id: string; total: number }>('GET', `/nodes/${id}/gpus`),
     drain: (id: string) =>
       req<{ message: string; node_id: string }>('POST', `/nodes/${id}/drain`, {}),
+    cordon: (id: string, reason?: string) =>
+      req<{ message: string; node_id: string }>('POST', `/nodes/${id}/cordon`, { reason: reason ?? 'admin cordoned' }),
+    uncordon: (id: string) =>
+      req<{ message: string; node_id: string }>('POST', `/nodes/${id}/uncordon`, {}),
+    setLabels: (id: string, labels: Record<string, string>) =>
+      req<{ message: string; node_id: string; labels: Record<string, string> }>('PUT', `/nodes/${id}/labels`, { labels }),
     getHealthEvents: (id: string) =>
       req<{ data: { id: number; from_status: string; to_status: string; reason: string; created_at: string }[]; node_id: string }>('GET', `/nodes/${id}/health-events`),
     // Task management
