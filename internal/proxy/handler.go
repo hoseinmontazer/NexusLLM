@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,12 +42,13 @@ type Handler struct {
 	aliasResolver *alias.Resolver
 	lifecycleMgr  *lifecycle.Manager
 	registry      *runtime.Registry
-	activator     runtimemgr.Activator // lazy-load: starts model on demand
+	activator     runtimemgr.Activator
 	usageTracker  *usage.Tracker
 	log           *zap.Logger
+	mu            sync.RWMutex
 	teamPolicies  map[string]*policy.TeamPolicy
 	httpClient    *http.Client
-	db            *sqlx.DB // for project context lookup; may be nil
+	db            *sqlx.DB
 }
 
 // NewHandler constructs the proxy Handler.
@@ -581,8 +583,19 @@ func isConnectError(err error) bool {
 		strings.Contains(msg, "context deadline exceeded")
 }
 
+// SwapTeamPolicies atomically replaces the in-memory team policy map.
+// Called by the gateway's 60-second reload goroutine. Safe for concurrent use.
+func (h *Handler) SwapTeamPolicies(fresh map[string]*policy.TeamPolicy) {
+	h.mu.Lock()
+	h.teamPolicies = fresh
+	h.mu.Unlock()
+}
+
 func (h *Handler) teamPolicy(teamID string) *policy.TeamPolicy {
-	if tp, ok := h.teamPolicies[teamID]; ok {
+	h.mu.RLock()
+	tp := h.teamPolicies[teamID]
+	h.mu.RUnlock()
+	if tp != nil {
 		return tp
 	}
 	return &policy.TeamPolicy{RPMLimit: 100, TPDLimit: 1_000_000, MaxConcurrent: 10, MaxContextTokens: 8192}

@@ -149,16 +149,18 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 // The server binary is `llama-server` which exposes an OpenAI-compatible API.
 //
 // Model loading (first match wins):
-//   a) LlamaCppModelPath set → --model /models/file.gguf  (local GGUF on volume)
-//   b) LlamaCppHFRepo + LlamaCppHFFile set → --hf-repo ORG/REPO --hf-file file.gguf
-//   c) LlamaCppHFRepo only → --hf-repo ORG/REPO  (server picks default GGUF)
-//   d) ModelName is a local path (starts with "/") → --model <ModelName>
+//
+//	a) LlamaCppModelPath set → --model /models/file.gguf  (local GGUF on volume)
+//	b) LlamaCppHFRepo + LlamaCppHFFile set → --hf-repo ORG/REPO --hf-file file.gguf
+//	c) LlamaCppHFRepo only → --hf-repo ORG/REPO  (server picks default GGUF)
+//	d) ModelName is a local path (starts with "/") → --model <ModelName>
 //
 // For (b) and (c), set HUGGING_FACE_HUB_TOKEN in Env for gated repos.
 // GPU offload is controlled by LlamaCppNGPULayers:
-//   0   = CPU-only (default when no GPUDevices assigned)
-//   -1  = all layers on GPU (default when GPUDevices is non-empty)
-//   N>0 = offload N layers to GPU (partial offload)
+//
+//	0   = CPU-only (default when no GPUDevices assigned)
+//	-1  = all layers on GPU (default when GPUDevices is non-empty)
+//	N>0 = offload N layers to GPU (partial offload)
 func (d *dockerDriver) buildLlamaCppArgs(spec RuntimeSpec) []string {
 	args := []string{"run", "-d",
 		"--name", containerName(spec),
@@ -245,6 +247,7 @@ func (d *dockerDriver) buildLlamaCppArgs(spec RuntimeSpec) []string {
 func isHFRepo(s string) bool {
 	return len(s) > 0 && strings.Count(s, "/") == 1 && !strings.HasPrefix(s, "/")
 }
+
 // to an args slice. Used by all backend builders.
 func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) []string {
 	// Environment variables

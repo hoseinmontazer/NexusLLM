@@ -623,6 +623,27 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		}
 
 		// Step 3: create a fresh runtime row and enqueue START_MODEL.
+		// Guard: skip if there's already a newer pending/starting runtime for
+		// this model on this node that was created AFTER we marked this one failed.
+		// This prevents the sweeper from spawning a new container every 60s
+		// when the previous recovery attempt is still in progress.
+		var newerPendingCount int
+		_ = db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM agent_runtimes
+			WHERE model_id = $1
+			  AND node_id  = $2
+			  AND id       != $3
+			  AND state IN ('pending','validating','downloading','starting','loading_model','waiting_ready','ready','active','warm','idle')`,
+			row.ModelID, row.NodeID, row.RuntimeID,
+		).Scan(&newerPendingCount)
+		if newerPendingCount > 0 {
+			log.Info("stuck-runtime sweep: newer runtime already in progress — skipping re-enqueue",
+				zap.String("model", row.ModelName),
+				zap.Int("newer_count", newerPendingCount),
+			)
+			continue
+		}
+
 		newRuntimeID := uuid.New().String()
 		suffix := strings.ReplaceAll(newRuntimeID, "-", "")[:6]
 		sanitize := func(s string) string {

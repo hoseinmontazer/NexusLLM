@@ -62,6 +62,13 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		//   "auto" — detect node GPU capability at startup (default)
 		ExecutionMode string `json:"execution_mode"` // cpu | gpu | auto
 
+		// ExtraArgs are appended verbatim to the backend command after all
+		// structured flags. Useful for model-specific tuning:
+		//   ["-thk","0"]           — disable Qwen3 thinking mode
+		//   ["--rope-scale","2"]   — extend context via RoPE scaling
+		//   ["--no-warmup"]        — skip warmup inference on startup
+		ExtraArgs []string `json:"extra_args"`
+
 		// Idle behaviour (0 = use cluster default)
 		IdleTimeoutSecs *int `json:"idle_timeout_secs"`
 	}
@@ -78,6 +85,14 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		}
 	}
 
+	// Encode extra_args as JSON array for storage.
+	extraArgsJSON := "[]"
+	if len(input.ExtraArgs) > 0 {
+		if b, err := json.Marshal(input.ExtraArgs); err == nil {
+			extraArgsJSON = string(b)
+		}
+	}
+
 	// Upsert into model_runtime_configs.
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_runtime_configs
@@ -85,12 +100,12 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		   gguf_path, hf_repo, hf_file, hf_token,
 		   ctx_size, n_gpu_layers, cpu_threads, memory_limit, models_volume,
 		   gpu_devices, node_id,
-		   idle_timeout_secs, execution_mode, updated_at)
+		   idle_timeout_secs, execution_mode, extra_args, updated_at)
 		VALUES (gen_random_uuid(), $1,
 		        $2, $3, $4, $5,
 		        $6, $7, COALESCE($8, 0), $9, $10,
 		        $11::jsonb, $12::uuid,
-		        $13, $14, NOW())
+		        $13, $14, $15::jsonb, NOW())
 		ON CONFLICT (model_id) DO UPDATE SET
 		  gguf_path         = COALESCE(EXCLUDED.gguf_path,         model_runtime_configs.gguf_path),
 		  hf_repo           = COALESCE(EXCLUDED.hf_repo,           model_runtime_configs.hf_repo),
@@ -105,6 +120,7 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		  node_id           = COALESCE(EXCLUDED.node_id,           model_runtime_configs.node_id),
 		  idle_timeout_secs = EXCLUDED.idle_timeout_secs,
 		  execution_mode    = COALESCE(NULLIF(EXCLUDED.execution_mode,''), model_runtime_configs.execution_mode, 'auto'),
+		  extra_args        = EXCLUDED.extra_args,
 		  updated_at        = NOW()`,
 		modelID,
 		nilableStr(input.GGUFPath), nilableStr(input.HFRepo), nilableStr(input.HFFile), nilableStr(input.HFToken),
@@ -112,6 +128,7 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		gpuDevicesJSON, nilableStr(input.NodeID),
 		input.IdleTimeoutSecs,
 		orDefault(input.ExecutionMode, "auto"),
+		extraArgsJSON,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -136,6 +153,7 @@ func (h *LazyRuntimeHandler) GetLazyConfig(c *gin.Context) {
 		NodeID        *string         `db:"node_id"            json:"node_id"`
 		IdleTimeout   *int            `db:"idle_timeout_secs"  json:"idle_timeout_secs"`
 		ExecutionMode string          `db:"execution_mode"     json:"execution_mode"`
+		ExtraArgs     json.RawMessage `db:"extra_args"         json:"extra_args"`
 		UpdatedAt     time.Time       `db:"updated_at"         json:"updated_at"`
 	}
 	if err := h.db.GetContext(c.Request.Context(), &row, `
@@ -147,10 +165,11 @@ func (h *LazyRuntimeHandler) GetLazyConfig(c *gin.Context) {
 		       cpu_threads,
 		       memory_limit,
 		       models_volume,
-		       COALESCE(gpu_devices, '[]'::jsonb)   AS gpu_devices,
+		       COALESCE(gpu_devices, '[]'::jsonb)    AS gpu_devices,
 		       node_id::text                  AS node_id,
 		       idle_timeout_secs,
 		       COALESCE(execution_mode,'auto') AS execution_mode,
+		       COALESCE(extra_args, '[]'::jsonb)      AS extra_args,
 		       updated_at
 		FROM model_runtime_configs WHERE model_id = $1`, modelID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no lazy config found for this model"})

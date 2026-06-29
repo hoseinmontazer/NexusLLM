@@ -564,11 +564,19 @@ func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
 		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/complete", resultMap, nil); err != nil {
 			a.log.Warn("failed to report task completion", zap.Error(err))
 		}
+		// Also PUT the runtime row directly — belt-and-suspenders for bind_port.
+		// CompleteTask updates by runtime_id from the result map, but if that
+		// fails (e.g. network blip), this PUT path also persists bind_port.
 		if result.RuntimeID != "" && result.RuntimeState != "" {
-			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, map[string]interface{}{
+			putBody := map[string]interface{}{
 				"state":        result.RuntimeState,
 				"container_id": result.ContainerID,
-			}, nil)
+			}
+			// Include bind_port if the agent resolved one (port=0 → allocated).
+			if bp, ok := result.Data["bind_port"]; ok {
+				putBody["bind_port"] = bp
+			}
+			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, putBody, nil)
 		}
 	} else {
 		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/fail",

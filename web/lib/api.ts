@@ -179,12 +179,16 @@ export interface LazyConfig {
   gguf_path?: string
   hf_repo?: string
   hf_file?: string
+  hf_token?: string
   ctx_size: number
   n_gpu_layers: number
   cpu_threads?: number
   memory_limit?: string
   models_volume?: string
   idle_timeout_secs?: number
+  execution_mode?: string
+  node_id?: string
+  extra_args?: string[]
   updated_at: string
 }
 

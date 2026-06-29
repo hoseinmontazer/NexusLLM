@@ -540,9 +540,6 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 			case "loading_model", "waiting_ready", "active", "warm", "loading":
 				// Record when we first entered the loading stage.
 				if loadingModelEnteredAt.IsZero() {
-					// Try to use the DB row's updated_at as the entry time so we
-					// don't restart the clock each time waitForReady is called for
-					// the same stuck runtime.
 					var stateUpdatedAt time.Time
 					_ = a.db.QueryRowContext(ctx,
 						`SELECT updated_at FROM agent_runtimes WHERE id = $1`, rt.ID,
@@ -575,6 +572,19 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 				if port == 0 {
 					port = cfg.BindPort
 				}
+
+				// Port is still 0 — agent hasn't reported the allocated port yet.
+				// This is normal for the first few ticks after bind_port=0 was sent.
+				// Skip the health check and wait for the next poll to pick up the
+				// agent's bind_port update.
+				if port == 0 {
+					a.log.Debug("waitForReady: port not yet reported by agent — waiting",
+						zap.String("model", cfg.ModelName),
+						zap.String("runtime_id", rt.ID),
+					)
+					continue
+				}
+
 				endpointURL := fmt.Sprintf("http://%s:%d", host, port)
 
 				healthy := a.httpHealthCheck(endpointURL)
@@ -827,6 +837,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		IdleTimeout    *int    `db:"idle_timeout_secs"`
 		ExecutionMode  string  `db:"execution_mode"`
 		WorkloadPolicy string  `db:"workload_policy"`
+		ExtraArgsJSON  string  `db:"extra_args_json"`
 	}
 	// Node assignment priority:
 	//   1. model_endpoints.node_id  — set by admin deploy or placement engine
@@ -858,7 +869,8 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    COALESCE(ar.numa_node, -1)                    AS numa_node,
 		    mrc.idle_timeout_secs,
 		    %s                                             AS execution_mode,
-		    %s                                             AS workload_policy
+		    %s                                             AS workload_policy,
+		    %s                                             AS extra_args_json
 		FROM models m
 		LEFT JOIN model_endpoints me
 		       ON me.model_id = m.id
@@ -879,11 +891,13 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 
 	execModeExpr := `COALESCE(mrc.execution_mode, 'auto')`
 	policyExpr := `COALESCE(mrc.workload_policy, 'lazy_load')`
+	extraArgsExpr := `COALESCE(mrc.extra_args::text, '[]')`
 	if !withExecutionMode {
 		execModeExpr = `'auto'`
 		policyExpr = `'lazy_load'`
+		extraArgsExpr = `'[]'`
 	}
-	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr)
+	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr, extraArgsExpr)
 
 	err := a.db.GetContext(ctx, &row, q, modelName)
 	if err != nil {
@@ -893,6 +907,10 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 	var gpuDevices []int
 	if row.GPUDevicesJSON != "" && row.GPUDevicesJSON != "[]" {
 		_ = json.Unmarshal([]byte(row.GPUDevicesJSON), &gpuDevices)
+	}
+	var extraArgs []string
+	if row.ExtraArgsJSON != "" && row.ExtraArgsJSON != "[]" {
+		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
 	}
 	cpuThreads := row.CPUThreads
 	if cpuThreads == "0" {
@@ -925,6 +943,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		NUMANode:       row.NUMANode,
 		ExecutionMode:  row.ExecutionMode,
 		WorkloadPolicy: row.WorkloadPolicy,
+		ExtraArgs:      extraArgs,
 	}
 	if row.IdleTimeout != nil {
 		cfg.IdleTimeout = time.Duration(*row.IdleTimeout) * time.Second

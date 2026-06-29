@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -31,6 +32,101 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Port management helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// allocateFreePort asks the OS for a free TCP port by binding to :0.
+// The kernel assigns an ephemeral port atomically — no TOCTOU race.
+// This is the preferred method when bind_port == 0 in the task payload,
+// meaning the control plane delegated port selection to the agent.
+func allocateFreePort() (int, error) {
+	l, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		return 0, fmt.Errorf("allocateFreePort: %w", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	// Brief gap between Close and the container binding — acceptable in practice
+	// because the port was ephemeral and no other service is targeting it.
+	return port, nil
+}
+
+// isPortAvailable returns true when no process is listening on host:port.
+func isPortAvailable(port int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+// findAvailablePort returns the first free TCP port in [start, start+maxSearch).
+func findAvailablePort(start, maxSearch int) (int, bool) {
+	for i := 0; i < maxSearch; i++ {
+		candidate := start + i
+		if candidate > 65535 {
+			break
+		}
+		if isPortAvailable(candidate) {
+			return candidate, true
+		}
+	}
+	return 0, false
+}
+
+// runningContainerPort returns the host port that a running container named
+// `name` is actually bound to, or 0 if the container is not running or has
+// no port mapping that can be detected.
+//
+// For containers started with --network host (llamacpp, vllm, tgi) this
+// inspects the command-line arguments inside the container to find the --port
+// flag value, since host-networked containers don't show port bindings via
+// docker inspect PortBindings.
+func (e *Executor) runningContainerPort(ctx context.Context, name string) int {
+	// Check container state first — only inspect running containers.
+	stateOut, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", "{{.State.Running}}", name).Output()
+	if err != nil || strings.TrimSpace(string(stateOut)) != "true" {
+		return 0
+	}
+
+	// For bridge-networked containers, check PortBindings.
+	bindOut, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}`,
+		name).Output()
+	if err == nil {
+		if p := strings.TrimSpace(string(bindOut)); p != "" {
+			if port, convErr := strconv.Atoi(p); convErr == nil && port > 0 {
+				return port
+			}
+		}
+	}
+
+	// For host-networked containers, extract --port from the container args.
+	argsOut, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{join .Args " "}}`, name).Output()
+	if err != nil {
+		return 0
+	}
+	args := strings.Fields(strings.TrimSpace(string(argsOut)))
+	for i, arg := range args {
+		if (arg == "--port" || arg == "-p") && i+1 < len(args) {
+			if port, convErr := strconv.Atoi(args[i+1]); convErr == nil && port > 0 {
+				return port
+			}
+		}
+		// Also handle --port=NNNN form.
+		if strings.HasPrefix(arg, "--port=") {
+			if port, convErr := strconv.Atoi(strings.TrimPrefix(arg, "--port=")); convErr == nil && port > 0 {
+				return port
+			}
+		}
+	}
+	return 0
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task types (mirrors taskmanager — no import to keep agent binary lean)
@@ -288,10 +384,10 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 			Error: "validation failed: container image is required",
 		}
 	}
-	if p.BindPort == 0 {
+	if p.BindPort < 0 {
 		return TaskResult{
 			Success: false, RuntimeID: p.RuntimeID, RuntimeState: "failed",
-			Error: "validation failed: bind_port is required",
+			Error: "validation failed: bind_port must be 0 (auto) or a positive port number",
 		}
 	}
 	if p.Backend == "" {
@@ -330,7 +426,94 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 	}
 
 	// ── Stage: STARTING ─────────────────────────────────────────────────────
-	// Remove any stale container with this name, then start a fresh one.
+	// Port resolution — three cases handled in priority order:
+	//
+	//   Case A: bind_port == 0  → control plane delegated port selection to the
+	//           agent. Use allocateFreePort() which asks the OS for a free port
+	//           atomically via :0 bind. This is the preferred production path.
+	//
+	//   Case B: bind_port > 0 AND container already running on that port →
+	//           reuse the existing instance (avoids duplicate containers).
+	//
+	//   Case C: bind_port > 0 AND port is occupied by something else →
+	//           scan forward up to 50 ports. This is a recovery fallback for
+	//           legacy deployments that had a fixed port configured.
+
+	// Case A — zero means "agent picks"
+	if p.BindPort == 0 {
+		freePort, allocErr := allocateFreePort()
+		if allocErr != nil {
+			return TaskResult{
+				Success:      false,
+				RuntimeID:    p.RuntimeID,
+				RuntimeState: "failed",
+				Error:        "port allocation failed: " + allocErr.Error(),
+			}
+		}
+		p.BindPort = freePort
+		e.log.Info("startModel: OS-allocated free port",
+			zap.String("runtime", p.RuntimeName),
+			zap.Int("port", p.BindPort),
+		)
+	} else {
+		// Case B — check if the exact container is already running on this port
+		if existingPort := e.runningContainerPort(ctx, p.RuntimeName); existingPort > 0 {
+			cl := &net.Dialer{Timeout: 2 * time.Second}
+			if conn, dialErr := cl.DialContext(ctx, "tcp", fmt.Sprintf("localhost:%d", existingPort)); dialErr == nil {
+				_ = conn.Close()
+				e.log.Info("startModel: REUSING existing running container",
+					zap.String("runtime", p.RuntimeName),
+					zap.Int("port", existingPort),
+				)
+				cidOut, _ := exec.CommandContext(ctx, "docker", "inspect",
+					"--format", "{{.Id}}", p.RuntimeName).Output()
+				containerID := strings.TrimSpace(string(cidOut))
+				return TaskResult{
+					Success:      true,
+					RuntimeID:    p.RuntimeID,
+					ContainerID:  containerID,
+					RuntimeState: "loading_model",
+					Data: map[string]interface{}{
+						"container_id": containerID,
+						"bind_port":    existingPort,
+						"reused":       true,
+					},
+				}
+			}
+			e.log.Info("startModel: container exists but port not reachable — will recreate",
+				zap.String("runtime", p.RuntimeName),
+				zap.Int("port", existingPort),
+			)
+		}
+
+		// Case C — configured port is busy, scan forward
+		if !isPortAvailable(p.BindPort) {
+			e.log.Warn("startModel: configured port busy, scanning for free port",
+				zap.String("runtime", p.RuntimeName),
+				zap.Int("configured_port", p.BindPort),
+			)
+			if freePort, found := findAvailablePort(p.BindPort+1, 50); found {
+				e.log.Info("startModel: found free port via scan",
+					zap.String("runtime", p.RuntimeName),
+					zap.Int("original_port", p.BindPort),
+					zap.Int("actual_port", freePort),
+				)
+				p.BindPort = freePort
+			} else {
+				return TaskResult{
+					Success:      false,
+					RuntimeID:    p.RuntimeID,
+					RuntimeState: "failed",
+					Error: fmt.Sprintf(
+						"port %d is busy and no free port found scanning %d–%d",
+						p.BindPort, p.BindPort+1, p.BindPort+50,
+					),
+				}
+			}
+		}
+	}
+
+	// Remove any stale container with this name, then start fresh.
 	// This covers: first deploy, re-deploy, crash recovery, idle restart.
 	if out, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", p.RuntimeName).CombinedOutput(); rmErr != nil {
 		if !strings.Contains(string(out), "No such container") {
@@ -469,20 +652,31 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 			hostVolumeDir + "/" + p.HFRepo + "/" + p.HFFile,
 		}
 		for _, candidate := range candidatePaths {
-			if _, statErr := exec.CommandContext(ctx, "test", "-f", candidate).CombinedOutput(); statErr == nil {
-				// File found locally — switch to local mode.
-				// Compute the container path relative to /models mount.
-				relToVolume := strings.TrimPrefix(candidate, hostVolumeDir+"/")
-				p.GGUFPath = "/models/" + relToVolume
-				e.log.Info("model file already cached — using local path instead of HF download",
-					zap.String("host_path", candidate),
-					zap.String("container_path", p.GGUFPath),
-				)
-				// Clear HF fields so buildDockerArgs uses -m, not --hf-repo.
-				p.HFRepo = ""
-				p.HFFile = ""
-				return TaskResult{Success: true}
+			statOut, statErr := exec.CommandContext(ctx, "stat", "-c", "%s", candidate).Output()
+			if statErr != nil {
+				continue // file doesn't exist
 			}
+			sizeStr := strings.TrimSpace(string(statOut))
+			if sizeStr == "0" || sizeStr == "" {
+				// Zero-byte placeholder — remove it, don't treat as cached
+				_, _ = exec.CommandContext(ctx, "rm", "-f", candidate).CombinedOutput()
+				e.log.Warn("found zero-byte cached file — removing",
+					zap.String("path", candidate),
+				)
+				continue
+			}
+			// File found and non-empty — switch to local mode.
+			relToVolume := strings.TrimPrefix(candidate, hostVolumeDir+"/")
+			p.GGUFPath = "/models/" + relToVolume
+			e.log.Info("model file already cached — using local path instead of HF download",
+				zap.String("host_path", candidate),
+				zap.String("container_path", p.GGUFPath),
+				zap.String("size", sizeStr),
+			)
+			// Clear HF fields so buildDockerArgs uses -m, not --hf-repo.
+			p.HFRepo = ""
+			p.HFFile = ""
+			return TaskResult{Success: true}
 		}
 		// File not cached — fall through to let llama-server download at startup.
 		e.log.Info("model file not in cache — llama-server will download via HF",
@@ -505,12 +699,23 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 	}
 	hostFilePath := hostVolumeDir + "/" + relPath
 
-	// Case 1: file already cached.
-	if _, statErr := exec.CommandContext(ctx, "test", "-f", hostFilePath).CombinedOutput(); statErr == nil {
-		e.log.Info("model already in cache — skipping download",
+	// Case 1: file already cached — verify it exists AND is non-empty.
+	// A zero-byte file means a previous download was interrupted; treat it as missing.
+	statOut, statErr := exec.CommandContext(ctx, "stat", "-c", "%s", hostFilePath).Output()
+	if statErr == nil {
+		sizeStr := strings.TrimSpace(string(statOut))
+		if sizeStr != "0" && sizeStr != "" {
+			e.log.Info("model already in cache — skipping download",
+				zap.String("path", hostFilePath),
+				zap.String("size", sizeStr),
+			)
+			return TaskResult{Success: true}
+		}
+		// Zero-byte or unreadable — remove and re-download.
+		e.log.Warn("cached file is zero-byte or unreadable — removing and re-downloading",
 			zap.String("path", hostFilePath),
 		)
-		return TaskResult{Success: true}
+		_, _ = exec.CommandContext(ctx, "rm", "-f", hostFilePath).CombinedOutput()
 	}
 
 	// Case 2: file missing — download.
@@ -544,7 +749,7 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 }
 
 // downloadFromHF downloads a GGUF file from HuggingFace into the host volume.
-// Uses huggingface-cli if available, falling back to wget.
+// Uses huggingface-cli if available, then aria2c (multi-connection), then wget.
 // Returns (TaskResult, actualHostPath).
 func (e *Executor) downloadFromHF(ctx context.Context, p *startModelPayload, hostVolumeDir, relPath string) (TaskResult, string) {
 	targetDir := hostVolumeDir
@@ -556,6 +761,7 @@ func (e *Executor) downloadFromHF(ctx context.Context, p *startModelPayload, hos
 			Error: fmt.Sprintf("mkdir %s: %s — %s", targetDir, err, string(out))}, ""
 	}
 
+	// ── Option 1: huggingface-cli ─────────────────────────────────────────
 	if path, err := exec.LookPath("huggingface-cli"); err == nil {
 		e.log.Info("downloading via huggingface-cli",
 			zap.String("hf_repo", p.HFRepo),
@@ -579,10 +785,40 @@ func (e *Executor) downloadFromHF(ctx context.Context, p *startModelPayload, hos
 		return TaskResult{Success: true}, targetDir + "/" + p.HFFile
 	}
 
-	// Fallback: wget direct URL.
+	// ── Option 2: aria2c (multi-connection, faster than wget) ────────────
+	if p.HFFile != "" {
+		if _, err := exec.LookPath("aria2c"); err == nil {
+			url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", p.HFRepo, p.HFFile)
+			targetFile := targetDir + "/" + p.HFFile
+			aria2Args := []string{
+				"--continue=true",
+				"--max-connection-per-server=8",
+				"--split=8",
+				"--min-split-size=50M",
+				"--dir", targetDir,
+				"--out", p.HFFile,
+			}
+			if p.HFToken != "" {
+				aria2Args = append(aria2Args, "--header=Authorization: Bearer "+p.HFToken)
+			}
+			aria2Args = append(aria2Args, url)
+			e.log.Info("downloading via aria2c",
+				zap.String("url", url),
+				zap.String("target", targetFile),
+			)
+			out, err := exec.CommandContext(ctx, "aria2c", aria2Args...).CombinedOutput()
+			if err != nil {
+				return TaskResult{Success: false,
+					Error: fmt.Sprintf("aria2c download: %s — %s", err, string(out))}, ""
+			}
+			return TaskResult{Success: true}, targetFile
+		}
+	}
+
+	// ── Option 3: wget fallback ───────────────────────────────────────────
 	if p.HFFile == "" {
 		return TaskResult{Success: false,
-			Error: "huggingface-cli not found and no hf_file set for wget fallback"}, ""
+			Error: "huggingface-cli and aria2c not found and no hf_file set for wget fallback"}, ""
 	}
 	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", p.HFRepo, p.HFFile)
 	targetFile := targetDir + "/" + p.HFFile
@@ -590,6 +826,10 @@ func (e *Executor) downloadFromHF(ctx context.Context, p *startModelPayload, hos
 	if p.HFToken != "" {
 		wgetArgs = append([]string{"--header", "Authorization: Bearer " + p.HFToken}, wgetArgs...)
 	}
+	e.log.Info("downloading via wget",
+		zap.String("url", url),
+		zap.String("target", targetFile),
+	)
 	out, err := exec.CommandContext(ctx, "wget", wgetArgs...).CombinedOutput()
 	if err != nil {
 		return TaskResult{Success: false,

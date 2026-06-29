@@ -104,47 +104,13 @@ func main() {
 	usageTracker := usage.NewTracker(db, rdb, log)
 	teamPolicies := loadTeamPolicies(ctx, db, log)
 
-	// ── Policy live reload every 60s ──────────────────────────────────────────
-	// This ensures policy changes (RPM, TPD, max context) take effect without
-	// restarting the gateway. The map is swapped atomically using a sync.Map
-	// approach through the proxyHandler.
-	go func() {
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-watchCtx.Done():
-				return
-			case <-t.C:
-				fresh := loadTeamPolicies(watchCtx, db, log)
-				// Re-seed model permissions from DB in case they changed
-				seedModelPermissions(watchCtx, db, policyEngine, log)
-				// Replace the map entries in-place (same underlying map)
-				for k, v := range fresh {
-					teamPolicies[k] = v
-				}
-				// Remove teams that no longer exist
-				for k := range teamPolicies {
-					if _, ok := fresh[k]; !ok {
-						delete(teamPolicies, k)
-					}
-				}
-			}
-		}
-	}()
-
 	// Lifecycle manager — unload endpoints idle for >30 min
 	lifecycleMgr := lifecycle.NewManager(db, rdb, 30*time.Minute, nil, log)
 	go lifecycleMgr.Start(watchCtx)
 
 	// ── Runtime Manager (lazy-load architecture) ──────────────────────────────
-	// Connects to the admin control plane's task manager via the DB.
-	// The gateway uses it to start models on demand instead of returning 503.
 	taskMgr := taskmanager.NewManager(db, log)
 
-	// ── DB schema validation — fail fast ─────────────────────────────────────
-	// Probes the live database constraint, not migration history.
-	// Catches: migration never ran, ran against wrong DB, partial failure.
 	if err := taskMgr.ValidateSchema(ctx); err != nil {
 		log.Fatal("database schema incompatible — run pending migrations before starting",
 			zap.Error(err),
@@ -184,6 +150,24 @@ func main() {
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		lifecycleMgr, registry, usageTracker, teamPolicies, log,
 	).WithActivator(activator).WithDB(db)
+
+	// ── Policy live reload every 60s ──────────────────────────────────────────
+	// Uses a sync.RWMutex-protected wrapper to avoid data races between the
+	// reload goroutine (writer) and request handlers (readers).
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-t.C:
+				fresh := loadTeamPolicies(watchCtx, db, log)
+				seedModelPermissions(watchCtx, db, policyEngine, log)
+				proxyHandler.SwapTeamPolicies(fresh)
+			}
+		}
+	}()
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)

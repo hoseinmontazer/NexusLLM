@@ -306,6 +306,24 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 				  AND (gguf_path IS NULL OR gguf_path = '')`,
 				ggufPath, runtimeID)
 		}
+		// If the agent picked a different port (port conflict resolution), persist it
+		// so the control plane polls the correct address during waitForReady.
+		if bindPort, ok := result["bind_port"].(float64); ok && bindPort > 0 {
+			_, _ = h.db.ExecContext(c.Request.Context(), `
+				UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW() WHERE id=$2`,
+				int(bindPort), runtimeID)
+			// Also sync back to model_endpoints so the registry and health watcher
+			// use the correct port. This is the critical path for port=0 deploys:
+			// the agent is the source of truth for the actual bound port.
+			_, _ = h.db.ExecContext(c.Request.Context(), `
+				UPDATE model_endpoints
+				SET port = $1, updated_at = NOW()
+				WHERE id = (
+				    SELECT endpoint_id FROM agent_runtimes
+				    WHERE id = $2 AND endpoint_id IS NOT NULL
+				)`,
+				int(bindPort), runtimeID)
+		}
 	}
 
 	// For UNLOAD_RUNTIME tasks: transition runtime to stopped and re-enable
@@ -565,6 +583,16 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW()
 			WHERE id=$2 AND node_id=$3`,
 			input.BindPort, runtimeID, claims.NodeID)
+		// Sync port to model_endpoints so the registry and health watcher
+		// use the correct address. Critical when port was 0 (agent-allocated).
+		_, _ = h.db.ExecContext(c.Request.Context(), `
+			UPDATE model_endpoints
+			SET port = $1, updated_at = NOW()
+			WHERE id = (
+			    SELECT endpoint_id FROM agent_runtimes
+			    WHERE id = $2 AND endpoint_id IS NOT NULL
+			)`,
+			input.BindPort, runtimeID)
 	}
 
 	// Sync back to model_endpoints if linked

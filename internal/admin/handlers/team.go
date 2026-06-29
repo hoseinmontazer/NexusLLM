@@ -290,7 +290,7 @@ func (h *TeamHandler) UpdateTeamPolicy(c *gin.Context) {
 				"max_concurrent", p.MaxConcurrent,
 				"max_context_tokens", p.MaxContextTokens,
 			)
-			pipe.Expire(ctx, policyKey, 48*60*60*1_000_000_000) // 48h TTL
+			pipe.Expire(ctx, policyKey, 48*time.Hour)
 			_, _ = pipe.Exec(ctx)
 		}
 	}
