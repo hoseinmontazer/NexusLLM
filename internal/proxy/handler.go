@@ -76,10 +76,15 @@ func NewHandler(
 		log:           log,
 		teamPolicies:  teamPolicies,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Minute,
+			// No Timeout here — streaming responses can take arbitrarily long.
+			// Per-request deadlines are managed via context (from Gin's request context).
+			// A global Timeout would kill long-running inference streams mid-response.
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 32,
 				IdleConnTimeout:     90 * time.Second,
+				// ResponseHeaderTimeout guards against a backend that accepts
+				// the connection but never sends response headers (stuck server).
+				ResponseHeaderTimeout: 2 * time.Minute,
 			},
 		},
 	}
@@ -647,8 +652,9 @@ func (h *Handler) streamChat(
 					continue
 				}
 				if normalized != payload {
-					// Rewritten — emit the clean version.
-					fmt.Fprintf(c.Writer, "data: %s\n", normalized)
+					// Rewritten — emit the clean version as a complete SSE event.
+					// SSE spec: each event must be terminated by a blank line (\n\n).
+					fmt.Fprintf(c.Writer, "data: %s\n\n", normalized)
 					if canFlush {
 						flusher.Flush()
 					}
@@ -656,7 +662,24 @@ func (h *Handler) streamChat(
 				}
 			}
 		}
-		fmt.Fprintf(c.Writer, "%s\n", line)
+
+		// Forward the line as-is.
+		// SSE framing: blank lines are event separators; data lines need
+		// a trailing blank line to form a complete event.
+		// The upstream server sends properly framed SSE, but sseStream.ReadLine
+		// strips the trailing \n, so we must re-add the correct framing:
+		//   - blank line (event separator) → emit as \n  (adds back the separator)
+		//   - data: line                   → emit as line + \n\n  (complete event)
+		//   - other lines (comment, field) → emit as line + \n
+		if line == "" {
+			// Blank line = SSE event separator. Emit it.
+			fmt.Fprintf(c.Writer, "\n")
+		} else if strings.HasPrefix(line, "data:") {
+			// Complete SSE event: data line + blank line separator.
+			fmt.Fprintf(c.Writer, "%s\n\n", line)
+		} else {
+			fmt.Fprintf(c.Writer, "%s\n", line)
+		}
 		if canFlush {
 			flusher.Flush()
 		}
