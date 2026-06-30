@@ -169,7 +169,9 @@ func (h *LazyRuntimeHandler) GetLazyConfig(c *gin.Context) {
 		       node_id::text                  AS node_id,
 		       idle_timeout_secs,
 		       COALESCE(execution_mode,'auto') AS execution_mode,
-		       COALESCE(extra_args, '[]'::jsonb)      AS extra_args,
+		       CASE WHEN jsonb_typeof(COALESCE(extra_args, '[]'::jsonb)) = 'array'
+		            THEN COALESCE(extra_args, '[]'::jsonb)
+		            ELSE '[]'::jsonb END AS extra_args,
 		       updated_at
 		FROM model_runtime_configs WHERE model_id = $1`, modelID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no lazy config found for this model"})
