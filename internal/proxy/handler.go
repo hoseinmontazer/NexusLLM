@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -150,8 +151,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Read body once so we can both log it and parse it.
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		abortErr(c, http.StatusBadRequest, "read_error", "Failed to read request body")
+		return
+	}
+	// Log the raw request at DEBUG level so we can diagnose client compatibility issues.
+	h.log.Debug("incoming chat request",
+		zap.String("body", string(rawBody)),
+		zap.String("content_type", c.GetHeader("Content-Type")),
+		zap.String("user_agent", c.GetHeader("User-Agent")),
+	)
+	// Restore body for binding.
+	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+
 	var req models.InferenceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		h.log.Warn("request binding failed",
+			zap.Error(err),
+			zap.String("body", string(rawBody)),
+		)
 		abortErr(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -321,6 +341,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	c.Header("X-Nexus-Endpoint", ep.ID)
 
 	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: ep.URL}
+
+	// ── Backend compatibility sanitization ────────────────────────────────
+	// Strip fields that are valid OpenAI API extensions but cause llama.cpp
+	// and other local backends to return 400 "unknown field" errors.
+	// We do this on a copy so the original req is unchanged for logging/retry.
+	sanitized := sanitizeForBackend(req, backend.Type())
+	chatReq.Req = &sanitized
 
 	// ── Thinking mode resolution ───────────────────────────────────────────
 	// Resolve whether thinking should be active for this request, then inject
@@ -607,6 +634,36 @@ func (h *Handler) streamChat(
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return true
 	}
+
+	// Check for non-2xx from the upstream BEFORE setting SSE headers.
+	// If the upstream returns 400/500, the stream body contains an error
+	// message, not SSE events. Forward the status and body directly.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.Stream != nil {
+			// Read the error body from the stream and forward it as JSON.
+			var errBody strings.Builder
+			for {
+				line, readErr := resp.Stream.ReadLine()
+				if readErr != nil {
+					break
+				}
+				errBody.WriteString(line)
+			}
+			resp.Stream.Close()
+			bodyStr := strings.TrimSpace(errBody.String())
+			if bodyStr == "" {
+				abortErr(c, resp.StatusCode, "upstream_error",
+					fmt.Sprintf("upstream returned HTTP %d with no body", resp.StatusCode))
+			} else {
+				c.Data(resp.StatusCode, "application/json", []byte(bodyStr))
+			}
+		} else {
+			abortErr(c, resp.StatusCode, "upstream_error",
+				fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode))
+		}
+		return true
+	}
+
 	if resp.Stream == nil {
 		abortErr(c, http.StatusBadGateway, "no_stream", "Backend did not return a stream")
 		return true
@@ -746,6 +803,34 @@ func (h *Handler) coldStartTimeout() time.Duration {
 	// Default to 20 minutes — large models (235B) take 10-15 min to load.
 	// Can be overridden via NEXUS_RUNTIMEMGR_COLDSTARTTIMEOUT env var.
 	return 20 * time.Minute
+}
+
+// sanitizeForBackend removes fields that are valid in the OpenAI API spec but
+// cause local backends (llama.cpp, Ollama, TGI) to return 400 errors because
+// they don't recognise them. Called on a copy of the request so the original
+// is untouched for logging and retry purposes.
+//
+// Known problematic fields per backend:
+//
+//	llama.cpp / cpu_native:
+//	  - stream_options        (OpenAI-only, causes 400 in llama.cpp)
+//	  - service_tier          (OpenAI-only)
+//	  - parallel_tool_calls   (OpenAI-only)
+//
+//	All local backends (not openai_compat):
+//	  - user                  (forwarded but ignored; keep it — harmless)
+func sanitizeForBackend(req models.InferenceRequest, backendType runtime.BackendType) models.InferenceRequest {
+	switch backendType {
+	case runtime.BackendOpenAICompat:
+		// True OpenAI-compatible remote provider — forward everything as-is.
+		return req
+	default:
+		// Local backends: llama.cpp, vllm, ollama, tgi, cpu_native.
+		// Strip fields that cause 400 errors on local servers.
+		req.StreamOptions = nil
+		// Keep everything else — vLLM and llama.cpp handle most standard fields.
+		return req
+	}
 }
 
 func estimateTokens(messages []models.Message) int {
