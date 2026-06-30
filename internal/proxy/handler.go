@@ -244,25 +244,43 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if err != nil {
 		// Registry miss — try lazy-loading via the runtime activator.
 		if h.activator != nil {
-			h.log.Info("registry miss — triggering lazy-load",
-				zap.String("model", req.Model),
-			)
-			// On the very first cold-start the request can take minutes.
-			// Return 503 with Retry-After so the client retries; don't hold
-			// the HTTP connection for the full cold-start duration.
-			warmup, warmErr := h.activator.EnsureRunning(c.Request.Context(), req.Model)
-			if warmErr != nil {
-				h.log.Warn("activator failed",
+			// Check if model is already starting up (in-flight warm-up).
+			// If it is, return 503 + Retry-After immediately so the client
+			// retries rather than holding a long HTTP connection open.
+			// Holding the connection open causes the HTTP write timeout to
+			// fire (default 30s), which the client receives as a 400/EOF.
+			//
+			// We use a short probe context (3s) to detect if the model is
+			// already healthy right now. If it responds immediately it was
+			// just slow to register in the registry — proceed. Otherwise
+			// kick off the warm-up in the background and tell the client
+			// to retry in 10 seconds.
+			probeCtx, probeCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			_, probeErr := h.activator.EnsureRunning(probeCtx, req.Model)
+			probeCancel()
+
+			if probeErr != nil {
+				// Model not yet ready — start it in background and tell client to retry.
+				h.log.Info("cold-start triggered — returning 503 Retry-After",
 					zap.String("model", req.Model),
-					zap.Error(warmErr),
 				)
+				go func() {
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
+					defer bgCancel()
+					if _, startErr := h.activator.EnsureRunning(bgCtx, req.Model); startErr != nil {
+						h.log.Warn("background cold-start failed",
+							zap.String("model", req.Model),
+							zap.Error(startErr),
+						)
+					}
+				}()
+				c.Header("Retry-After", "10")
 				abortErr(c, http.StatusServiceUnavailable, "model_starting",
-					fmt.Sprintf("model %q is starting up, please retry in a moment: %s", req.Model, warmErr.Error()))
+					fmt.Sprintf("model %q is starting up, please retry in ~10 seconds", req.Model))
 				return
 			}
-			// Record how long the cold start took.
-			c.Header("X-Nexus-Warmup-Ms", fmt.Sprintf("%d", warmup.WarmupMs))
-			// Re-resolve now that the model is warm.
+			// Probe succeeded immediately — re-resolve and continue.
+			c.Header("X-Nexus-Warmup-Ms", "0")
 			ep, backend, err = h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
 			if err != nil {
 				abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint",
@@ -699,6 +717,12 @@ func (h *Handler) teamPolicy(teamID string) *policy.TeamPolicy {
 		return tp
 	}
 	return &policy.TeamPolicy{RPMLimit: 100, TPDLimit: 1_000_000, MaxConcurrent: 10, MaxContextTokens: 8192}
+}
+
+func (h *Handler) coldStartTimeout() time.Duration {
+	// Default to 20 minutes — large models (235B) take 10-15 min to load.
+	// Can be overridden via NEXUS_RUNTIMEMGR_COLDSTARTTIMEOUT env var.
+	return 20 * time.Minute
 }
 
 func estimateTokens(messages []models.Message) int {

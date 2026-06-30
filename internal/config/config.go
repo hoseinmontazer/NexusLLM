@@ -45,16 +45,16 @@ type RedisConfig struct {
 
 // AuthConfig controls JWT and API-key validation.
 type AuthConfig struct {
-	JWTSecret        string
-	APIKeyCacheTTL   time.Duration
-	JWTCacheTTL      time.Duration
+	JWTSecret      string
+	APIKeyCacheTTL time.Duration
+	JWTCacheTTL    time.Duration
 }
 
 // SchedulerConfig names the Redis Streams used by the scheduler.
 type SchedulerConfig struct {
-	QueueHighStream string
-	QueueMedStream  string
-	QueueLowStream  string
+	QueueHighStream  string
+	QueueMedStream   string
+	QueueLowStream   string
 	DispatchInterval time.Duration
 }
 
@@ -95,7 +95,7 @@ func Load() (*Config, error) {
 	v.SetDefault("server.metricsport", "9090")
 	v.SetDefault("server.mode", "release")
 	v.SetDefault("server.readtimeout", "30s")
-	v.SetDefault("server.writetimeout", "120s")
+	v.SetDefault("server.writetimeout", "30m") // must exceed runtimemgr.coldstarttimeout
 	v.SetDefault("server.shutdowntimeout", "15s")
 
 	v.SetDefault("database.dsn", "postgres://nexus:nexus@localhost:5432/nexusllm?sslmode=disable")
@@ -119,7 +119,7 @@ func Load() (*Config, error) {
 	v.SetDefault("vllm.pollinterval", "5s")
 
 	v.SetDefault("runtimemgr.idletimeout", "15m")
-	v.SetDefault("runtimemgr.coldstarttimeout", "5m")
+	v.SetDefault("runtimemgr.coldstarttimeout", "20m")
 	v.SetDefault("runtimemgr.modelsvolume", "llamacpp_models")
 	v.SetDefault("runtimemgr.defaultimage", "ghcr.io/ggml-org/llama.cpp:server")
 
@@ -175,10 +175,10 @@ func Load() (*Config, error) {
 	//   NEXUS_VLLM_ENDPOINTS_<MODEL>=http://host:port
 
 	// RuntimeMgr
-	cfg.RuntimeMgr.DefaultIdleTimeout  = v.GetDuration("runtimemgr.idletimeout")
-	cfg.RuntimeMgr.ColdStartTimeout    = v.GetDuration("runtimemgr.coldstarttimeout")
+	cfg.RuntimeMgr.DefaultIdleTimeout = v.GetDuration("runtimemgr.idletimeout")
+	cfg.RuntimeMgr.ColdStartTimeout = v.GetDuration("runtimemgr.coldstarttimeout")
 	cfg.RuntimeMgr.DefaultModelsVolume = v.GetString("runtimemgr.modelsvolume")
-	cfg.RuntimeMgr.DefaultImage        = v.GetString("runtimemgr.defaultimage")
+	cfg.RuntimeMgr.DefaultImage = v.GetString("runtimemgr.defaultimage")
 
 	return cfg, nil
 }
