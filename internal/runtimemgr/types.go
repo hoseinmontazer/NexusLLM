@@ -205,8 +205,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		DefaultIdleTimeout:  15 * time.Minute,
-		ColdStartTimeout:    5 * time.Minute,
-		HealthPollInterval:  2 * time.Second,
+		ColdStartTimeout:    20 * time.Minute, // large models (235B) can take 10-15 min to load
+		HealthPollInterval:  3 * time.Second,
 		EvictCheckInterval:  30 * time.Second,
 		MaxRetries:          2,
 		DefaultModelsVolume: "llamacpp_models",

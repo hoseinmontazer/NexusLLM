@@ -37,6 +37,103 @@ import (
 // Port management helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// llamacppHealthStartPeriod returns a Docker --health-start-period string
+// that is long enough for the model to finish loading into VRAM/RAM before
+// the first HEALTHCHECK fires.
+//
+// Docker marks a container "unhealthy" only after ALL retries fail after the
+// start-period expires. If the start-period is too short, large models are
+// flagged unhealthy before they are ready, triggering spurious failure loops.
+//
+// Heuristic (conservative, errs on the side of patience):
+//   - CPU-only (nGPULayers==0): 15 min — RAM loading is slow
+//   - Full GPU offload (nGPULayers<0 or large): 10 min — fast VRAM load
+//   - Partial offload: scale between 5 and 15 min based on ctx_size
+//
+// The control plane's ColdStartTimeout (default 5 min) is intentionally
+// shorter than these periods — the control plane polls /health directly and
+// marks READY as soon as the endpoint responds, independently of Docker's own
+// HEALTHCHECK state. Docker's HEALTHCHECK is therefore only a last-resort
+// safety net for `--restart unless-stopped`, not the primary readiness signal.
+func llamacppHealthStartPeriod(nGPULayers, ctxSize int) string {
+	switch {
+	case nGPULayers == 0:
+		// CPU-only: model weights go into RAM, which is slower than VRAM.
+		return "15m"
+	case nGPULayers < 0:
+		// Full GPU offload: fast VRAM load, but large models still take time.
+		return "10m"
+	default:
+		// Partial offload or unknown: use context-size as a rough proxy for
+		// model size. Larger context → bigger KV cache → slower initialisation.
+		if ctxSize >= 32768 {
+			return "15m"
+		}
+		if ctxSize >= 8192 {
+			return "10m"
+		}
+		return "8m"
+	}
+}
+
+// pruneExitedNexusContainers removes any stopped/exited containers whose
+// names start with "nexus-". These accumulate when:
+//   - The control plane retries a failed start (each retry does docker rm -f
+//     the current named container, but old containers from renamed/suffixed
+//     attempts or crashed runs linger in Exited state).
+//   - Docker's --restart policy creates then stops a container before the
+//     control plane cleans it up.
+//
+// This is a best-effort cleanup — errors are logged but never fatal.
+func (e *Executor) pruneExitedNexusContainers(ctx context.Context) {
+	// List all exited containers whose name starts with "nexus-".
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-a",
+		"--filter", "status=exited",
+		"--filter", "name=nexus-",
+		"--format", "{{.ID}} {{.Names}}",
+	).Output()
+	if err != nil || len(out) == 0 {
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var toRemove []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		cid := fields[0]
+		name := fields[1]
+		// Only remove containers strictly matching our naming convention.
+		if strings.HasPrefix(name, "nexus-") {
+			toRemove = append(toRemove, cid)
+		}
+	}
+
+	if len(toRemove) == 0 {
+		return
+	}
+
+	e.log.Info("pruning exited nexus containers",
+		zap.Int("count", len(toRemove)),
+	)
+
+	// Remove in one docker rm call to minimise subprocess overhead.
+	rmArgs := append([]string{"rm"}, toRemove...)
+	out, err = exec.CommandContext(ctx, "docker", rmArgs...).CombinedOutput()
+	if err != nil {
+		// Non-fatal — log the error but don't fail the startup.
+		e.log.Warn("pruneExitedNexusContainers: docker rm partial failure",
+			zap.String("output", string(out)),
+			zap.Error(err),
+		)
+	}
+}
+
 // allocateFreePort asks the OS for a free TCP port by binding to :0.
 // The kernel assigns an ephemeral port atomically — no TOCTOU race.
 // This is the preferred method when bind_port == 0 in the task payload,
@@ -524,6 +621,11 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 	}
 
+	// Opportunistically prune accumulated exited nexus containers.
+	// These build up over time from previous failed/restarted start attempts.
+	// Runs asynchronously so it never delays the current container start.
+	go e.pruneExitedNexusContainers(context.Background())
+
 	args := e.buildDockerArgs(p)
 
 	e.log.Info("startModel: STARTING container",
@@ -860,13 +962,19 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		// llamacpp uses host networking for simplicity.
 		args = append(args, "--network", "host")
 		// Override baked-in HEALTHCHECK to use the actual port.
+		// health-start-period must be long enough for large models to load into
+		// VRAM before the first check fires. 30s is fine for small models but
+		// will cause false-unhealthy for multi-hundred-B parameter models.
+		// Heuristic: base 60s + 30s per 10 n_gpu_layers (capped at 20 min).
+		// When NGPULayers == -1 (all layers) or == 0 (CPU), use a safe 10-min floor.
+		startPeriod := llamacppHealthStartPeriod(p.NGPULayers, p.CtxSize)
 		healthURL := fmt.Sprintf("http://localhost:%d/health", p.BindPort)
 		args = append(args,
 			"--health-cmd", fmt.Sprintf("curl -sf %s || exit 1", healthURL),
-			"--health-interval", "15s",
-			"--health-timeout", "5s",
-			"--health-retries", "3",
-			"--health-start-period", "30s",
+			"--health-interval", "30s",
+			"--health-timeout", "10s",
+			"--health-retries", "5",
+			"--health-start-period", startPeriod,
 		)
 
 	default:
