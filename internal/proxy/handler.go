@@ -342,32 +342,23 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: ep.URL}
 
-	// ── Backend compatibility sanitization ────────────────────────────────
-	// Strip fields that are valid OpenAI API extensions but cause llama.cpp
-	// and other local backends to return 400 "unknown field" errors.
-	// We do this on a copy so the original req is unchanged for logging/retry.
+	// ── Backend compatibility sanitization + Thinking mode resolution ─────
+	// Order matters:
+	//   1. Sanitize first (strips OpenAI-only fields that cause 400s on local backends)
+	//   2. Thinking injection second (may add/modify chat_template_kwargs)
+	// Both work on copies of req so the original is preserved for logging/retry.
 	sanitized := sanitizeForBackend(req, backend.Type())
 	chatReq.Req = &sanitized
 
-	// ── Thinking mode resolution ───────────────────────────────────────────
-	// Resolve whether thinking should be active for this request, then inject
-	// the appropriate control flags into the request before forwarding.
-	//
-	// We always load caps and always run ResolveMode — even for models not
-	// yet marked supports_thinking=true — because:
-	//   a) The client may already be passing chat_template_kwargs.thinking=false
-	//      and we must not overwrite it.
-	//   b) The model may still produce reasoning_content tokens that the
-	//      stream normaliser needs to strip (handled independently in streamChat).
 	var thinkingOn bool
 	var thinkingCaps thinking.ModelCaps
 	if h.thinkingRes != nil {
 		thinkingCaps = h.thinkingRes.LoadCaps(c.Request.Context(), req.Model)
 		if thinkingCaps.SupportsThinking {
 			thinkingOn = thinking.ResolveMode(&req, thinkingCaps)
-			injected := thinking.InjectThinkingControl(req, thinkingOn, thinkingCaps)
+			// Inject into the sanitized copy, not the original req.
+			injected := thinking.InjectThinkingControl(sanitized, thinkingOn, thinkingCaps)
 			chatReq.Req = &injected
-			// Record mode metric
 			mode := "fast"
 			if thinkingOn {
 				mode = "thinking"
@@ -375,10 +366,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			middleware.ThinkingRequestsTotal.WithLabelValues(
 				claims.TeamName, req.Model, mode).Inc()
 		} else {
-			// Model not marked as a thinking model in the DB, but the client
-			// may have sent chat_template_kwargs.thinking=false explicitly.
-			// Honour it: resolve mode from kwargs and inject if needed so we
-			// don't accidentally enable thinking via the model's default template.
 			thinkingOn = thinking.ResolveMode(&req, thinkingCaps) // always false when !SupportsThinking
 			_ = thinkingOn
 		}
@@ -566,6 +553,11 @@ func (h *Handler) syncChat(
 		return true, false
 	}
 
+	// llama.cpp returns tool_calls[].function.arguments as a JSON object,
+	// but the OpenAI spec requires it to be a JSON-encoded string.
+	// Normalise it here so the client always gets a spec-compliant response.
+	normalizeToolCallArguments(&chatResp)
+
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	// ── Thinking token accounting ────────────────────────────────────────
@@ -676,73 +668,119 @@ func (h *Handler) streamChat(
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 
-	firstToken := false
-	promptTokens, completionTokens := 0, 0
 	flusher, canFlush := c.Writer.(http.Flusher)
 
-	for {
-		line, err := resp.Stream.ReadLine()
-		if err != nil {
-			break
-		}
-		if !firstToken && strings.HasPrefix(line, "data:") {
-			middleware.ObserveTTFT(claims.TeamName, req.Model, time.Since(start))
-			firstToken = true
-		}
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload != "[DONE]" {
-				// Accumulate token counts from usage fields in chunks.
-				var chunk models.ChatCompletionResponse
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					promptTokens += chunk.Usage.PromptTokens
-					completionTokens += chunk.Usage.CompletionTokens
-				}
+	// Track whether the client requested usage in the final chunk.
+	// Kilo Code (via OpenAI SDK) always sends stream_options.include_usage=true.
+	// If the upstream doesn't emit a usage chunk, we synthesize one.
+	wantsUsage := req.StreamOptions != nil
+	var (
+		firstToken       bool
+		promptTokens     int
+		completionTokens int
+		seenUsageChunk   bool   // true if upstream already sent a usage chunk
+		streamID         string // captured from first chunk for synthesized usage chunk
+		streamModel      string
+		streamCreated    int64
+		done             bool
+	)
 
-				// Strip non-standard reasoning_content fields produced by
-				// Qwen3 / llama.cpp thinking models. Strictly-OpenAI-compatible
-				// clients (e.g. Kilo Code, Cursor) reject chunks that carry
-				// only reasoning_content with no delta.content.
-				normalized, forward := models.NormalizeStreamChunk(payload)
-				if !forward {
-					// Pure reasoning chunk — drop it, don't advance to writer.
-					continue
-				}
-				if normalized != payload {
-					// Rewritten — emit the clean version as a complete SSE event.
-					// SSE spec: each event must be terminated by a blank line (\n\n).
-					fmt.Fprintf(c.Writer, "data: %s\n\n", normalized)
-					if canFlush {
-						flusher.Flush()
-					}
-					continue
-				}
-			}
-		}
-
-		// Forward the line as-is.
-		// SSE framing: blank lines are event separators; data lines need
-		// a trailing blank line to form a complete event.
-		// The upstream server sends properly framed SSE, but sseStream.ReadLine
-		// strips the trailing \n, so we must re-add the correct framing:
-		//   - blank line (event separator) → emit as \n  (adds back the separator)
-		//   - data: line                   → emit as line + \n\n  (complete event)
-		//   - other lines (comment, field) → emit as line + \n
-		if line == "" {
-			// Blank line = SSE event separator. Emit it.
-			fmt.Fprintf(c.Writer, "\n")
-		} else if strings.HasPrefix(line, "data:") {
-			// Complete SSE event: data line + blank line separator.
-			fmt.Fprintf(c.Writer, "%s\n\n", line)
-		} else {
-			fmt.Fprintf(c.Writer, "%s\n", line)
-		}
+	writeSSE := func(data string) {
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
 		if canFlush {
 			flusher.Flush()
 		}
-		if line == "data: [DONE]" {
+	}
+
+	for {
+		line, readErr := resp.Stream.ReadLine()
+		if readErr != nil {
+			// Stream ended — may be normal EOF or a mid-stream error.
+			// If we haven't sent [DONE] yet, emit a mid-stream error event
+			// per the Kilo Code spec: finish_reason="error".
+			if !done {
+				errChunk := fmt.Sprintf(
+					`{"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,`+
+						`"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}`,
+					streamID, streamCreated, streamModel,
+				)
+				writeSSE(errChunk)
+				fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+				if canFlush {
+					flusher.Flush()
+				}
+			}
 			break
 		}
+
+		if !strings.HasPrefix(line, "data:") {
+			// SSE comment, field line, or blank separator — forward as-is.
+			// Blank lines between events are already handled by our \n\n framing,
+			// so just skip them to avoid double-spacing.
+			if line != "" {
+				fmt.Fprintf(c.Writer, "%s\n", line)
+				if canFlush {
+					flusher.Flush()
+				}
+			}
+			continue
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+		// Robust [DONE] detection — handles "data: [DONE]", "data:[DONE]", etc.
+		if payload == "[DONE]" {
+			done = true
+			// Synthesize a usage chunk before [DONE] if the client requested it
+			// and the upstream never sent one. This satisfies the Kilo Code / OpenAI
+			// SDK expectation that usage is always present in the final stream chunk.
+			if wantsUsage && !seenUsageChunk && (promptTokens+completionTokens) > 0 {
+				usageChunk := fmt.Sprintf(
+					`{"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,`+
+						`"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+					streamID, streamCreated, streamModel,
+					promptTokens, completionTokens, promptTokens+completionTokens,
+				)
+				writeSSE(usageChunk)
+			}
+			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			if canFlush {
+				flusher.Flush()
+			}
+			break
+		}
+
+		if !firstToken {
+			middleware.ObserveTTFT(claims.TeamName, req.Model, time.Since(start))
+			firstToken = true
+		}
+
+		// Parse chunk to accumulate token counts and capture stream metadata.
+		var chunk models.ChatCompletionResponse
+		if json.Unmarshal([]byte(payload), &chunk) == nil {
+			if streamID == "" && chunk.ID != "" {
+				streamID = chunk.ID
+				streamModel = chunk.Model
+				streamCreated = chunk.Created
+			}
+			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+				promptTokens += chunk.Usage.PromptTokens
+				completionTokens += chunk.Usage.CompletionTokens
+			}
+			// Detect if upstream already sent a usage chunk (choices=[]).
+			if len(chunk.Choices) == 0 && chunk.Usage.TotalTokens > 0 {
+				seenUsageChunk = true
+				promptTokens = chunk.Usage.PromptTokens
+				completionTokens = chunk.Usage.CompletionTokens
+			}
+		}
+
+		// Strip non-standard reasoning_content fields before forwarding.
+		normalized, forward := models.NormalizeStreamChunk(payload)
+		if !forward {
+			continue // pure reasoning chunk — drop silently
+		}
+		writeSSE(normalized)
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
@@ -799,6 +837,55 @@ func (h *Handler) teamPolicy(teamID string) *policy.TeamPolicy {
 	return &policy.TeamPolicy{RPMLimit: 100, TPDLimit: 1_000_000, MaxConcurrent: 10, MaxContextTokens: 8192}
 }
 
+// normalizeToolCallArguments ensures tool_calls[].function.arguments is always
+// a JSON-encoded string, as required by the OpenAI spec.
+//
+// llama.cpp (and some other local servers) return arguments as a raw JSON object:
+//
+//	{"location": "Tokyo"}
+//
+// The OpenAI spec requires it as a JSON-encoded string:
+//
+//	"{\"location\": \"Tokyo\"}"
+//
+// The OpenAI SDK and Kilo Code both expect the string form and will fail to
+// parse tool calls if they receive an object.
+func normalizeToolCallArguments(resp *models.ChatCompletionResponse) {
+	for i := range resp.Choices {
+		msg := resp.Choices[i].Message
+		if msg == nil {
+			continue
+		}
+		toolCalls, ok := msg.ToolCalls.([]interface{})
+		if !ok {
+			continue
+		}
+		for j := range toolCalls {
+			tc, ok := toolCalls[j].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fn, ok := tc["function"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			args := fn["arguments"]
+			if args == nil {
+				continue
+			}
+			// If arguments is already a string, it's fine.
+			if _, isStr := args.(string); isStr {
+				continue
+			}
+			// It's an object/map — marshal it to a JSON string.
+			encoded, err := json.Marshal(args)
+			if err == nil {
+				fn["arguments"] = string(encoded)
+			}
+		}
+	}
+}
+
 func (h *Handler) coldStartTimeout() time.Duration {
 	// Default to 20 minutes — large models (235B) take 10-15 min to load.
 	// Can be overridden via NEXUS_RUNTIMEMGR_COLDSTARTTIMEOUT env var.
@@ -810,15 +897,14 @@ func (h *Handler) coldStartTimeout() time.Duration {
 // they don't recognise them. Called on a copy of the request so the original
 // is untouched for logging and retry purposes.
 //
-// Known problematic fields per backend:
+// Confirmed fields that cause llama.cpp to return 400:
+//   - stream_options        (OpenAI SDK adds this automatically; llama.cpp rejects it)
+//   - parallel_tool_calls   (OpenAI-only extension)
+//   - service_tier          (OpenAI routing hint, meaningless for local servers)
+//   - store                 (OpenAI storage API)
 //
-//	llama.cpp / cpu_native:
-//	  - stream_options        (OpenAI-only, causes 400 in llama.cpp)
-//	  - service_tier          (OpenAI-only)
-//	  - parallel_tool_calls   (OpenAI-only)
-//
-//	All local backends (not openai_compat):
-//	  - user                  (forwarded but ignored; keep it — harmless)
+// Fields that are safe to forward even if not used:
+//   - user, seed, logit_bias, response_format, stop — all handled or ignored
 func sanitizeForBackend(req models.InferenceRequest, backendType runtime.BackendType) models.InferenceRequest {
 	switch backendType {
 	case runtime.BackendOpenAICompat:
@@ -826,9 +912,11 @@ func sanitizeForBackend(req models.InferenceRequest, backendType runtime.Backend
 		return req
 	default:
 		// Local backends: llama.cpp, vllm, ollama, tgi, cpu_native.
-		// Strip fields that cause 400 errors on local servers.
+		// Strip fields that cause 400 "unknown parameter" errors.
 		req.StreamOptions = nil
-		// Keep everything else — vLLM and llama.cpp handle most standard fields.
+		req.ParallelToolCalls = nil
+		req.ServiceTier = nil
+		req.Store = nil
 		return req
 	}
 }

@@ -113,6 +113,8 @@ func containsBytes(s, sub string) bool {
 }
 
 // InferenceRequest mirrors the OpenAI Chat Completions request body.
+// Fields marked "OpenAI-only" are stripped before forwarding to local backends
+// (llama.cpp, vLLM, Ollama) by sanitizeForBackend in the proxy handler.
 type InferenceRequest struct {
 	Model            string        `json:"model"`
 	Messages         []Message     `json:"messages"`
@@ -130,7 +132,19 @@ type InferenceRequest struct {
 	ToolChoice       interface{}   `json:"tool_choice,omitempty"`
 	ResponseFormat   interface{}   `json:"response_format,omitempty"`
 	Seed             *int64        `json:"seed,omitempty"`
-	StreamOptions    interface{}   `json:"stream_options,omitempty"`
+
+	// stream_options: OpenAI SDK sends this automatically when stream=true.
+	// llama.cpp and most local servers return 400 for this field — stripped by sanitizeForBackend.
+	StreamOptions interface{} `json:"stream_options,omitempty"`
+
+	// parallel_tool_calls: OpenAI-only. Stripped for local backends.
+	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
+
+	// service_tier: OpenAI routing hint ("auto", "default"). Stripped for local backends.
+	ServiceTier *string `json:"service_tier,omitempty"`
+
+	// store: OpenAI storage API flag. Stripped for local backends.
+	Store *bool `json:"store,omitempty"`
 
 	// Thinking/reasoning mode control.
 	// When non-nil, overrides the model's deployment default.
