@@ -598,10 +598,29 @@ func (h *Handler) streamChat(
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if payload != "[DONE]" {
+				// Accumulate token counts from usage fields in chunks.
 				var chunk models.ChatCompletionResponse
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
 					promptTokens += chunk.Usage.PromptTokens
 					completionTokens += chunk.Usage.CompletionTokens
+				}
+
+				// Strip non-standard reasoning_content fields produced by
+				// Qwen3 / llama.cpp thinking models. Strictly-OpenAI-compatible
+				// clients (e.g. Kilo Code, Cursor) reject chunks that carry
+				// only reasoning_content with no delta.content.
+				normalized, forward := models.NormalizeStreamChunk(payload)
+				if !forward {
+					// Pure reasoning chunk — drop it, don't advance to writer.
+					continue
+				}
+				if normalized != payload {
+					// Rewritten — emit the clean version.
+					fmt.Fprintf(c.Writer, "data: %s\n", normalized)
+					if canFlush {
+						flusher.Flush()
+					}
+					continue
 				}
 			}
 		}

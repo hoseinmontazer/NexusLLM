@@ -1,6 +1,94 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// NormalizeStreamChunk rewrites a raw SSE data payload to be strictly
+// OpenAI-compatible by stripping non-standard fields produced by reasoning
+// models (e.g. Qwen3 / llama.cpp).
+//
+// Specifically it:
+//   - Removes delta.reasoning_content (llama.cpp thinking extension)
+//   - Skips chunks where delta.content is null AND reasoning_content is
+//     non-null (pure reasoning tokens that carry no visible content)
+//
+// Returns (rewritten JSON, true) when the chunk should be forwarded, or
+// ("", false) when the chunk should be silently dropped.
+func NormalizeStreamChunk(payload string) (string, bool) {
+	// Fast path: no reasoning_content present → nothing to do.
+	if !containsBytes(payload, "reasoning_content") {
+		return payload, true
+	}
+
+	// Parse just enough to inspect / mutate delta fields.
+	var chunk struct {
+		ID                string          `json:"id"`
+		Object            string          `json:"object"`
+		Created           int64           `json:"created"`
+		Model             string          `json:"model"`
+		SystemFingerprint string          `json:"system_fingerprint,omitempty"`
+		Choices           []chunkChoice   `json:"choices"`
+		Usage             json.RawMessage `json:"usage,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		// If we can't parse it, forward as-is and let the client deal.
+		return payload, true
+	}
+
+	for i := range chunk.Choices {
+		d := chunk.Choices[i].Delta
+		if d == nil {
+			continue
+		}
+		// Drop the non-standard field.
+		d.ReasoningContent = nil
+
+		// If content is also null/empty this was a pure reasoning chunk —
+		// skip it entirely (return false so the caller doesn't forward it).
+		if d.Content == nil {
+			return "", false
+		}
+		if s, ok := d.Content.(string); ok && s == "" {
+			return "", false
+		}
+	}
+
+	out, err := json.Marshal(chunk)
+	if err != nil {
+		return payload, true
+	}
+	return string(out), true
+}
+
+// chunkChoice is the per-choice type used only for stream normalisation.
+type chunkChoice struct {
+	Index        int             `json:"index"`
+	Delta        *chunkDelta     `json:"delta,omitempty"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     json.RawMessage `json:"logprobs,omitempty"`
+}
+
+// chunkDelta mirrors the OpenAI streaming delta, with the non-standard
+// reasoning_content field added so we can unmarshal and then remove it.
+type chunkDelta struct {
+	Role             string          `json:"role,omitempty"`
+	Content          interface{}     `json:"content"` // string | null
+	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
+	ReasoningContent interface{}     `json:"reasoning_content,omitempty"`
+}
+
+func containsBytes(s, sub string) bool {
+	return len(s) >= len(sub) && func() bool {
+		for i := 0; i <= len(s)-len(sub); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	}()
+}
 
 // InferenceRequest mirrors the OpenAI Chat Completions request body.
 type InferenceRequest struct {
@@ -75,9 +163,20 @@ type ChatCompletionResponse struct {
 type Choice struct {
 	Index        int         `json:"index"`
 	Message      *Message    `json:"message,omitempty"`
-	Delta        *Message    `json:"delta,omitempty"`
+	Delta        *Delta      `json:"delta,omitempty"`
 	FinishReason *string     `json:"finish_reason"`
 	Logprobs     interface{} `json:"logprobs,omitempty"`
+}
+
+// Delta is the streaming delta object in a chat completion chunk.
+// It extends the standard OpenAI delta with optional reasoning_content
+// used by llama.cpp / Qwen3 thinking models. The gateway strips
+// reasoning_content before forwarding to preserve strict OpenAI compatibility.
+type Delta struct {
+	Role             string      `json:"role,omitempty"`
+	Content          interface{} `json:"content"` // string or null — always emitted so clients see null → ""
+	ToolCalls        interface{} `json:"tool_calls,omitempty"`
+	ReasoningContent interface{} `json:"reasoning_content,omitempty"` // Qwen3/llama.cpp extension — stripped by gateway
 }
 
 // Usage holds token counts for a completion.
