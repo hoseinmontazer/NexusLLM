@@ -177,6 +177,10 @@ export interface DeployModelInput {
   llamacpp_ctx_size?: number
   llamacpp_n_gpu_layers?: number
   llamacpp_models_volume?: string
+  // Thinking / reasoning mode
+  supports_thinking?: boolean
+  thinking_enabled?: boolean
+  min_thinking_tokens?: number
 }
 
 export interface LazyConfig {
