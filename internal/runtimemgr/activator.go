@@ -446,7 +446,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		MaxModelLen:    cfg.MaxModelLen,
 		Dtype:          cfg.Dtype,
 		Quantization:   cfg.Quantization,
-		ExtraArgs:      cfg.ExtraArgs,
+		ExtraArgs:      injectReasoningFlag(ctx, a.db, cfg.ModelID, backend, cfg.ExtraArgs),
 		ExecutionMode:  effectiveMode,
 		WorkloadPolicy: workloadPolicy,
 		Env:            map[string]string{},
@@ -1103,4 +1103,47 @@ func (a *RuntimeActivator) httpHealthCheck(baseURL string) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// injectReasoningFlag ensures that llamacpp containers for thinking-capable
+// models with thinking DISABLED always start with "--reasoning off".
+//
+// This is the authoritative mechanism for disabling thinking at the server
+// level. Per-request injection via chat_template_kwargs is unreliable because
+// it depends on the model's Jinja template honouring the flag, whereas
+// --reasoning off is enforced by the llama-server binary itself (b9821+).
+//
+// Logic:
+//   - Only applies to backend == "llamacpp"
+//   - Queries supports_thinking and thinking_enabled from the models table
+//   - If supports_thinking=true AND thinking_enabled=false: prepend "--reasoning off"
+//   - If "--reasoning" is already in extraArgs, leaves it unchanged (operator override)
+//   - All other cases: returns extraArgs unmodified
+func injectReasoningFlag(ctx context.Context, db *sqlx.DB, modelID string, backend string, extraArgs []string) []string {
+	if backend != "llamacpp" {
+		return extraArgs
+	}
+
+	// Check if --reasoning is already explicitly set by the operator.
+	for _, a := range extraArgs {
+		if a == "--reasoning" || a == "-rea" {
+			return extraArgs // operator already controls this — don't override
+		}
+	}
+
+	var supportsThinking, thinkingEnabled bool
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(supports_thinking, FALSE), COALESCE(thinking_enabled, FALSE)
+		FROM models WHERE id = $1`, modelID,
+	).Scan(&supportsThinking, &thinkingEnabled)
+	if err != nil {
+		return extraArgs // table column may not exist — safe default
+	}
+
+	// Model supports thinking but it's disabled by default → enforce at server level.
+	if supportsThinking && !thinkingEnabled {
+		return append([]string{"--reasoning", "off"}, extraArgs...)
+	}
+
+	return extraArgs
 }
