@@ -15,13 +15,18 @@ import (
 //     reasoning_content is non-null AND finish_reason is null.
 //     (pure reasoning token — carries no visible content and isn't the stop chunk)
 //   - Chunks with finish_reason set are ALWAYS forwarded (even if content is empty/null)
+//   - delta:{} (empty object from llama.cpp stop chunks) is normalized to delta:{"content":""}
 //   - Chunks where content is a non-empty string are always forwarded
 //
 // Returns (rewritten JSON, true) when the chunk should be forwarded, or
 // ("", false) when the chunk should be silently dropped.
 func NormalizeStreamChunk(payload string) (string, bool) {
-	// Fast path: no reasoning_content present → nothing to do.
-	if !containsBytes(payload, "reasoning_content") {
+	// We always parse if either reasoning_content is present OR delta might be
+	// an empty object (which llama.cpp emits on stop chunks).
+	// Fast path only when we're sure neither case applies.
+	hasReasoning := containsBytes(payload, "reasoning_content")
+	hasEmptyDelta := containsBytes(payload, `"delta":{}`) || containsBytes(payload, `"delta": {}`)
+	if !hasReasoning && !hasEmptyDelta {
 		return payload, true
 	}
 
@@ -36,30 +41,41 @@ func NormalizeStreamChunk(payload string) (string, bool) {
 		Usage             json.RawMessage `json:"usage,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-		// If we can't parse it, forward as-is and let the client deal.
 		return payload, true
 	}
 
+	modified := false
 	shouldDrop := false
 	for i := range chunk.Choices {
 		ch := &chunk.Choices[i]
-		d := ch.Delta
-		if d == nil {
-			continue
+
+		// llama.cpp emits delta:{} on stop/length chunks.
+		// OpenAI SDK requires delta:{"content":""} — normalize it.
+		if ch.Delta == nil {
+			ch.Delta = &chunkDelta{Content: ""}
+			modified = true
 		}
 
+		d := ch.Delta
 		hasReasoningContent := d.ReasoningContent != nil
-		// Drop the non-standard field before forwarding.
-		d.ReasoningContent = nil
+
+		if hasReasoningContent {
+			d.ReasoningContent = nil
+			modified = true
+		}
 
 		// Never drop a chunk that has finish_reason set — it's the stop signal.
 		if ch.FinishReason != nil {
+			// Ensure content field is present (not nil) on stop chunks.
+			if d.Content == nil {
+				d.Content = ""
+				modified = true
+			}
 			continue
 		}
 
 		// Drop pure reasoning chunks: content is null/empty AND it only had
-		// reasoning_content (which we just removed), so there's nothing useful
-		// left to send.
+		// reasoning_content (now removed), leaving nothing useful.
 		if hasReasoningContent {
 			contentIsEmpty := d.Content == nil
 			if !contentIsEmpty {
@@ -75,6 +91,10 @@ func NormalizeStreamChunk(payload string) (string, bool) {
 
 	if shouldDrop && len(chunk.Choices) > 0 {
 		return "", false
+	}
+
+	if !modified {
+		return payload, true
 	}
 
 	out, err := json.Marshal(chunk)
