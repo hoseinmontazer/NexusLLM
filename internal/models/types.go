@@ -9,10 +9,13 @@ import (
 // OpenAI-compatible by stripping non-standard fields produced by reasoning
 // models (e.g. Qwen3 / llama.cpp).
 //
-// Specifically it:
-//   - Removes delta.reasoning_content (llama.cpp thinking extension)
-//   - Skips chunks where delta.content is null AND reasoning_content is
-//     non-null (pure reasoning tokens that carry no visible content)
+// Rules:
+//   - reasoning_content is always removed from delta
+//   - A chunk is dropped only when it has BOTH: content==null AND
+//     reasoning_content is non-null AND finish_reason is null.
+//     (pure reasoning token — carries no visible content and isn't the stop chunk)
+//   - Chunks with finish_reason set are ALWAYS forwarded (even if content is empty/null)
+//   - Chunks where content is a non-empty string are always forwarded
 //
 // Returns (rewritten JSON, true) when the chunk should be forwarded, or
 // ("", false) when the chunk should be silently dropped.
@@ -37,22 +40,41 @@ func NormalizeStreamChunk(payload string) (string, bool) {
 		return payload, true
 	}
 
+	shouldDrop := false
 	for i := range chunk.Choices {
-		d := chunk.Choices[i].Delta
+		ch := &chunk.Choices[i]
+		d := ch.Delta
 		if d == nil {
 			continue
 		}
-		// Drop the non-standard field.
+
+		hasReasoningContent := d.ReasoningContent != nil
+		// Drop the non-standard field before forwarding.
 		d.ReasoningContent = nil
 
-		// If content is also null/empty this was a pure reasoning chunk —
-		// skip it entirely (return false so the caller doesn't forward it).
-		if d.Content == nil {
-			return "", false
+		// Never drop a chunk that has finish_reason set — it's the stop signal.
+		if ch.FinishReason != nil {
+			continue
 		}
-		if s, ok := d.Content.(string); ok && s == "" {
-			return "", false
+
+		// Drop pure reasoning chunks: content is null/empty AND it only had
+		// reasoning_content (which we just removed), so there's nothing useful
+		// left to send.
+		if hasReasoningContent {
+			contentIsEmpty := d.Content == nil
+			if !contentIsEmpty {
+				if s, ok := d.Content.(string); ok && s == "" {
+					contentIsEmpty = true
+				}
+			}
+			if contentIsEmpty {
+				shouldDrop = true
+			}
 		}
+	}
+
+	if shouldDrop && len(chunk.Choices) > 0 {
+		return "", false
 	}
 
 	out, err := json.Marshal(chunk)
