@@ -39,7 +39,7 @@ build-admin:
 build-scheduler:
 	@echo "→ Building nexus-scheduler..."
 	@mkdir -p $(BINARY_DIR)
-as/scheduler
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-scheduler ./cmd/scheduler
 
 build-nodeagent:
 	@echo "→ Building nexus-nodeagent..."
