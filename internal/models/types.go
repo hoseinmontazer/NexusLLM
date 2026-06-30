@@ -21,6 +21,34 @@ type InferenceRequest struct {
 	ResponseFormat   interface{}   `json:"response_format,omitempty"`
 	Seed             *int64        `json:"seed,omitempty"`
 	StreamOptions    interface{}   `json:"stream_options,omitempty"`
+
+	// Thinking/reasoning mode control.
+	// When non-nil, overrides the model's deployment default.
+	// Supported by llama.cpp (via chat_template_kwargs) and vLLM (via thinking field).
+	Thinking *ThinkingControl `json:"thinking,omitempty"`
+
+	// ChatTemplateKwargs passes extra template variables to llama.cpp.
+	// Used to disable thinking: {"thinking": false}
+	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
+}
+
+// ThinkingControl mirrors the Anthropic/vLLM thinking field format.
+// {"type":"enabled","budget_tokens":1024} or {"type":"disabled"}
+type ThinkingControl struct {
+	// Type is "enabled" or "disabled".
+	Type string `json:"type"`
+	// BudgetTokens caps the internal reasoning token count (type=enabled only).
+	BudgetTokens *int `json:"budget_tokens,omitempty"`
+}
+
+// ThinkingEnabled returns a ThinkingControl that enables reasoning.
+func ThinkingEnabled(budgetTokens int) *ThinkingControl {
+	return &ThinkingControl{Type: "enabled", BudgetTokens: &budgetTokens}
+}
+
+// ThinkingDisabled returns a ThinkingControl that disables reasoning.
+func ThinkingDisabled() *ThinkingControl {
+	return &ThinkingControl{Type: "disabled"}
 }
 
 // Message is a single chat message.
@@ -57,6 +85,10 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Reasoning-specific counts (populated by thinking-capable models).
+	// ThinkingTokens is the number of tokens consumed by internal reasoning.
+	// VisibleTokens is completion_tokens minus thinking_tokens.
+	ThinkingTokens int `json:"thinking_tokens,omitempty"`
 }
 
 // EmbeddingRequest mirrors the OpenAI Embeddings request body.
@@ -128,53 +160,53 @@ type Organization struct {
 
 // Team represents a sub-tenant within an organization.
 type Team struct {
-	ID             string    `db:"id" json:"id"`
-	OrgID          string    `db:"org_id" json:"org_id"`
-	Name           string    `db:"name" json:"name"`
-	Slug           string    `db:"slug" json:"slug"`
-	Priority       int       `db:"priority" json:"priority"` // 1-10
-	Active         bool      `db:"active" json:"active"`
-	CreatedAt      time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
+	ID        string    `db:"id" json:"id"`
+	OrgID     string    `db:"org_id" json:"org_id"`
+	Name      string    `db:"name" json:"name"`
+	Slug      string    `db:"slug" json:"slug"`
+	Priority  int       `db:"priority" json:"priority"` // 1-10
+	Active    bool      `db:"active" json:"active"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // Policy holds rate-limit and quota rules for a team.
 type Policy struct {
-	ID                 string    `db:"id" json:"id"`
-	TeamID             string    `db:"team_id" json:"team_id"`
-	RPM                int       `db:"rpm" json:"rpm"`                 // requests per minute
-	TPD                int       `db:"tpd" json:"tpd"`                 // tokens per day
-	MaxConcurrent      int       `db:"max_concurrent" json:"max_concurrent"`
-	MaxContextTokens   int       `db:"max_context_tokens" json:"max_context_tokens"`
-	AllowedModels      []string  `db:"allowed_models" json:"allowed_models"`
-	CreatedAt          time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt          time.Time `db:"updated_at" json:"updated_at"`
+	ID               string    `db:"id" json:"id"`
+	TeamID           string    `db:"team_id" json:"team_id"`
+	RPM              int       `db:"rpm" json:"rpm"` // requests per minute
+	TPD              int       `db:"tpd" json:"tpd"` // tokens per day
+	MaxConcurrent    int       `db:"max_concurrent" json:"max_concurrent"`
+	MaxContextTokens int       `db:"max_context_tokens" json:"max_context_tokens"`
+	AllowedModels    []string  `db:"allowed_models" json:"allowed_models"`
+	CreatedAt        time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt        time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // APIKey is the metadata stored in the DB (raw key is shown once).
 type APIKey struct {
-	ID             string    `db:"id" json:"id"`
-	TeamID         string    `db:"team_id" json:"team_id"`
-	Name           string    `db:"name" json:"name"`
-	KeyHash        string    `db:"key_hash" json:"-"`
-	KeyPrefix      string    `db:"key_prefix" json:"key_prefix"`
-	Active         bool      `db:"active" json:"active"`
-	LastUsedAt     *time.Time `db:"last_used_at" json:"last_used_at,omitempty"`
-	ExpiresAt      *time.Time `db:"expires_at" json:"expires_at,omitempty"`
-	CreatedAt      time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
+	ID         string     `db:"id" json:"id"`
+	TeamID     string     `db:"team_id" json:"team_id"`
+	Name       string     `db:"name" json:"name"`
+	KeyHash    string     `db:"key_hash" json:"-"`
+	KeyPrefix  string     `db:"key_prefix" json:"key_prefix"`
+	Active     bool       `db:"active" json:"active"`
+	LastUsedAt *time.Time `db:"last_used_at" json:"last_used_at,omitempty"`
+	ExpiresAt  *time.Time `db:"expires_at" json:"expires_at,omitempty"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt  time.Time  `db:"updated_at" json:"updated_at"`
 }
 
 // Model represents a registered inference model.
 type Model struct {
-	ID          string    `db:"id" json:"id"`
-	Name        string    `db:"name" json:"name"`
-	DisplayName string    `db:"display_name" json:"display_name"`
-	VLLMEndpoint string   `db:"vllm_endpoint" json:"vllm_endpoint"`
-	MaxTokens   int       `db:"max_tokens" json:"max_tokens"`
-	Active      bool      `db:"active" json:"active"`
-	CreatedAt   time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt   time.Time `db:"updated_at" json:"updated_at"`
+	ID           string    `db:"id" json:"id"`
+	Name         string    `db:"name" json:"name"`
+	DisplayName  string    `db:"display_name" json:"display_name"`
+	VLLMEndpoint string    `db:"vllm_endpoint" json:"vllm_endpoint"`
+	MaxTokens    int       `db:"max_tokens" json:"max_tokens"`
+	Active       bool      `db:"active" json:"active"`
+	CreatedAt    time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt    time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,11 +215,11 @@ type Model struct {
 
 // RerankRequest mirrors the Cohere / Jina rerank API.
 type RerankRequest struct {
-	Model     string   `json:"model"`
-	Query     string   `json:"query"     binding:"required"`
-	Documents []string `json:"documents" binding:"required"`
-	TopN      *int     `json:"top_n,omitempty"`
-	ReturnDocuments *bool `json:"return_documents,omitempty"`
+	Model           string   `json:"model"`
+	Query           string   `json:"query"     binding:"required"`
+	Documents       []string `json:"documents" binding:"required"`
+	TopN            *int     `json:"top_n,omitempty"`
+	ReturnDocuments *bool    `json:"return_documents,omitempty"`
 }
 
 // RerankResult is one ranked document.
@@ -237,9 +269,9 @@ type OCRRequest struct {
 
 // OCRResponse is the parsed text from an OCR request.
 type OCRResponse struct {
-	Text   string  `json:"text"`
-	Model  string  `json:"model"`
-	Pages  []OCRPage `json:"pages,omitempty"`
+	Text  string    `json:"text"`
+	Model string    `json:"model"`
+	Pages []OCRPage `json:"pages,omitempty"`
 }
 
 // OCRPage is text extracted from one page/region.

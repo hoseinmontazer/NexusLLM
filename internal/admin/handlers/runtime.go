@@ -111,6 +111,14 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		LlamaCppNGPULayers   int    `json:"llamacpp_n_gpu_layers"`
 		LlamaCppModelsVolume string `json:"llamacpp_models_volume"`
 		ExecutionMode        string `json:"execution_mode"`
+
+		// ── Thinking/reasoning mode ──────────────────────────────────────────
+		// SupportsThinking marks this model as a reasoning model.
+		// ThinkingEnabled sets the deployment default (true = thinking on by default).
+		// MinThinkingTokens auto-disables thinking when max_tokens < this value.
+		SupportsThinking  bool `json:"supports_thinking"`
+		ThinkingEnabled   bool `json:"thinking_enabled"`
+		MinThinkingTokens int  `json:"min_thinking_tokens"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -175,19 +183,38 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 	// ── 1. Insert model row ────────────────────────────────────────────────
 	mID := uuid.New().String()
+	minThinkTok := input.MinThinkingTokens
+	if minThinkTok == 0 {
+		minThinkTok = 500
+	}
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type,
-		   max_context, max_output, enabled, tags, vllm_endpoint)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)`,
+		   max_context, max_output, enabled, tags, vllm_endpoint,
+		   supports_thinking, thinking_enabled, min_thinking_tokens)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9,$10,$11,$12)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
 		fmt.Sprintf("http://%s:%d", bindHost, input.Port),
+		input.SupportsThinking, input.ThinkingEnabled, minThinkTok,
 	)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
-		return
+		// May fail if migration 027 hasn't run — retry without thinking columns.
+		_, err = h.db.ExecContext(c.Request.Context(), `
+			INSERT INTO models
+			  (id, name, display_name, provider, backend_type,
+			   max_context, max_output, enabled, tags, vllm_endpoint)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)`,
+			mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
+			input.MaxContext, input.MaxOutput,
+			tagsJSON(input.Tags),
+			fmt.Sprintf("http://%s:%d", bindHost, input.Port),
+		)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
+			return
+		}
 	}
 
 	// Default version
@@ -732,24 +759,26 @@ func (h *RuntimeHandler) GetModelHealth(c *gin.Context) {
 }
 
 func (h *RuntimeHandler) ListModels(c *gin.Context) {
-	// By default, show only active models. Pass ?lifecycle=archived or ?lifecycle=all to see others.
 	lifecycle := c.Query("lifecycle")
 	if lifecycle == "" {
 		lifecycle = "active"
 	}
 
 	type mRow struct {
-		ID          string `db:"id"           json:"id"`
-		Name        string `db:"name"         json:"name"`
-		DisplayName string `db:"display_name" json:"display_name"`
-		Provider    string `db:"provider"     json:"provider"`
-		BackendType string `db:"backend_type" json:"backend_type"`
-		MaxContext  int    `db:"max_context"  json:"max_context"`
-		MaxOutput   int    `db:"max_output"   json:"max_output"`
-		Enabled     bool   `db:"enabled"      json:"enabled"`
-		Lifecycle   string `db:"lifecycle"    json:"lifecycle"`
-		EndpointCnt int    `db:"endpoint_cnt" json:"endpoint_count"`
-		HealthyCnt  int    `db:"healthy_cnt"  json:"healthy_count"`
+		ID                string `db:"id"                  json:"id"`
+		Name              string `db:"name"                json:"name"`
+		DisplayName       string `db:"display_name"        json:"display_name"`
+		Provider          string `db:"provider"            json:"provider"`
+		BackendType       string `db:"backend_type"        json:"backend_type"`
+		MaxContext        int    `db:"max_context"         json:"max_context"`
+		MaxOutput         int    `db:"max_output"          json:"max_output"`
+		Enabled           bool   `db:"enabled"             json:"enabled"`
+		Lifecycle         string `db:"lifecycle"           json:"lifecycle"`
+		EndpointCnt       int    `db:"endpoint_cnt"        json:"endpoint_count"`
+		HealthyCnt        int    `db:"healthy_cnt"         json:"healthy_count"`
+		SupportsThinking  bool   `db:"supports_thinking"   json:"supports_thinking"`
+		ThinkingEnabled   bool   `db:"thinking_enabled"    json:"thinking_enabled"`
+		MinThinkingTokens int    `db:"min_thinking_tokens" json:"min_thinking_tokens"`
 	}
 	rows := make([]mRow, 0)
 
@@ -758,7 +787,10 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		       m.max_context, m.max_output, m.enabled,
 		       COALESCE(m.lifecycle,'active') AS lifecycle,
 		       COUNT(me.id) AS endpoint_cnt,
-		       COUNT(me.id) FILTER (WHERE me.health_status='healthy') AS healthy_cnt
+		       COUNT(me.id) FILTER (WHERE me.health_status='healthy') AS healthy_cnt,
+		       COALESCE(m.supports_thinking, FALSE)  AS supports_thinking,
+		       COALESCE(m.thinking_enabled,  FALSE)  AS thinking_enabled,
+		       COALESCE(m.min_thinking_tokens, 500)  AS min_thinking_tokens
 		FROM models m
 		LEFT JOIN model_endpoints me ON me.model_id = m.id AND me.is_enabled = TRUE`
 
@@ -777,6 +809,38 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
+}
+
+// SetThinkingMode handles PUT /admin/v1/models/:id/thinking
+// Updates the thinking capability flags for an existing model.
+func (h *RuntimeHandler) SetThinkingMode(c *gin.Context) {
+	modelID := c.Param("id")
+	var input struct {
+		SupportsThinking  *bool `json:"supports_thinking"`
+		ThinkingEnabled   *bool `json:"thinking_enabled"`
+		MinThinkingTokens *int  `json:"min_thinking_tokens"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE models SET
+		  supports_thinking   = COALESCE($2, supports_thinking),
+		  thinking_enabled    = COALESCE($3, thinking_enabled),
+		  min_thinking_tokens = COALESCE($4, min_thinking_tokens),
+		  updated_at          = NOW()
+		WHERE id = $1`,
+		modelID,
+		input.SupportsThinking,
+		input.ThinkingEnabled,
+		input.MinThinkingTokens,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "thinking mode updated", "model_id": modelID})
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

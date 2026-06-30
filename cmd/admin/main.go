@@ -320,6 +320,7 @@ func main() {
 	a.PUT("/models/:id/lazy-config", lazyH.SetLazyConfig)
 	a.GET("/models/:id/lazy-config", lazyH.GetLazyConfig)
 	a.GET("/models/:id/runtime-status", lazyH.GetRuntimeStatus)
+	a.PUT("/models/:id/thinking", runtimeH.SetThinkingMode)
 
 	// ── Projects ──────────────────────────────────────────────────────────────
 	a.POST("/projects", projectH.CreateProject)

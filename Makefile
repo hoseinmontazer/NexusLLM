@@ -39,7 +39,7 @@ build-admin:
 build-scheduler:
 	@echo "→ Building nexus-scheduler..."
 	@mkdir -p $(BINARY_DIR)
-	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-scheduler ./cmd/scheduler
+as/scheduler
 
 build-nodeagent:
 	@echo "→ Building nexus-nodeagent..."
@@ -250,11 +250,17 @@ migrate-external: _check-dsn
 	$(call run_migration_external,016_workload_policy.sql)
 	$(call run_migration_external,017_scheduler.sql)
 	$(call run_migration_external,018_weighted_priority.sql)
+	$(call run_migration_external,018b_catchup_weighted.sql)
+	$(call run_migration_external,018b_weighted_priority_fixup.sql)
 	$(call run_migration_external,019_ha_replicas.sql)
 	$(call run_migration_external,020_port_allocator.sql)
 	$(call run_migration_external,021_missing_columns.sql)
 	$(call run_migration_external,022_project_api_keys.sql)
 	$(call run_migration_external,023_project_policies.sql)
+	$(call run_migration_external,024_placement_v2.sql)
+	$(call run_migration_external,025_placement_labels.sql)
+	$(call run_migration_external,026_extra_args.sql)
+	$(call run_migration_external,027_thinking_mode.sql)
 	@echo "✓ All migrations complete on external DB"
 
 # Dry-run: print the SQL files that would be applied without connecting

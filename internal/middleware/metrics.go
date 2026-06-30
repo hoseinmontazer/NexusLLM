@@ -67,6 +67,28 @@ var (
 		Name:      "rejected_requests_total",
 		Help:      "Requests rejected by the policy engine.",
 	}, []string{"team", "reason"})
+
+	// Thinking/reasoning mode metrics
+	ThinkingRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Subsystem: "gateway",
+		Name:      "thinking_requests_total",
+		Help:      "Total chat requests that used reasoning/thinking mode.",
+	}, []string{"team", "model", "mode"}) // mode: "thinking" | "fast"
+
+	ThinkingTokensTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Subsystem: "gateway",
+		Name:      "thinking_tokens_total",
+		Help:      "Total tokens consumed by internal reasoning chains.",
+	}, []string{"team", "model"})
+
+	VisibleCompletionTokensTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Subsystem: "gateway",
+		Name:      "visible_completion_tokens_total",
+		Help:      "Total visible (non-thinking) completion tokens.",
+	}, []string{"team", "model"})
 )
 
 // MetricsMiddleware records per-request Prometheus metrics.

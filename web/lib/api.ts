@@ -45,6 +45,10 @@ export interface Model {
   enabled: boolean; endpoint_count: number; healthy_count: number
   lifecycle: string  // active | archived | deleted
   tags?: string
+  // Thinking/reasoning mode capability flags
+  supports_thinking: boolean
+  thinking_enabled: boolean
+  min_thinking_tokens: number
 }
 
 export interface RuntimeRequirements {
@@ -188,7 +192,7 @@ export interface LazyConfig {
   idle_timeout_secs?: number
   execution_mode?: string
   node_id?: string
-  extra_args?: string[]
+  extra_args?: string[] | null
   updated_at: string
 }
 
@@ -545,6 +549,11 @@ export const api = {
       req<LazyConfig>('GET', `/models/${id}/lazy-config`),
     setLazyConfig: (id: string, b: Partial<LazyConfig>) =>
       req<{ message: string }>('PUT', `/models/${id}/lazy-config`, b),
+    setThinkingMode: (id: string, b: {
+      supports_thinking?: boolean
+      thinking_enabled?: boolean
+      min_thinking_tokens?: number
+    }) => req<{ message: string }>('PUT', `/models/${id}/thinking`, b),
     getRuntimeStatus: (id: string) =>
       req<{ model_id: string; runtimes: RuntimeStatus[]; count: number }>(
         'GET', `/models/${id}/runtime-status`),

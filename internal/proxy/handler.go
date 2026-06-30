@@ -28,6 +28,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/runtimemgr"
+	"github.com/nexusllm/nexusllm/internal/thinking"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"go.uber.org/zap"
 )
@@ -49,6 +50,7 @@ type Handler struct {
 	teamPolicies  map[string]*policy.TeamPolicy
 	httpClient    *http.Client
 	db            *sqlx.DB
+	thinkingRes   *thinking.Resolver
 }
 
 // NewHandler constructs the proxy Handler.
@@ -93,6 +95,7 @@ func (h *Handler) WithActivator(a runtimemgr.Activator) *Handler {
 // WithDB attaches a database connection for project context enrichment.
 func (h *Handler) WithDB(db *sqlx.DB) *Handler {
 	h.db = db
+	h.thinkingRes = thinking.NewResolver(db)
 	return h
 }
 
@@ -296,6 +299,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: ep.URL}
 
+	// ── Thinking mode resolution ───────────────────────────────────────────
+	// Resolve whether thinking should be active for this request, then inject
+	// the appropriate control flags into the request before forwarding.
+	var thinkingOn bool
+	var thinkingCaps thinking.ModelCaps
+	if h.thinkingRes != nil {
+		thinkingCaps = h.thinkingRes.LoadCaps(c.Request.Context(), req.Model)
+		if thinkingCaps.SupportsThinking {
+			thinkingOn = thinking.ResolveMode(&req, thinkingCaps)
+			injected := thinking.InjectThinkingControl(req, thinkingOn, thinkingCaps)
+			chatReq.Req = &injected
+			// Record mode metric
+			mode := "fast"
+			if thinkingOn {
+				mode = "thinking"
+			}
+			middleware.ThinkingRequestsTotal.WithLabelValues(
+				claims.TeamName, req.Model, mode).Inc()
+		}
+	}
+
 	if req.Stream {
 		// For streaming, try up to maxFailoverAttempts endpoints.
 		// If the first one is unreachable (connection refused), mark it down
@@ -338,7 +362,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				backend = b2
 				chatReq.EndpointURL = ep.URL
 			}
-			done := h.syncChat(c, claims, req, chatReq, backend, ep, start)
+			done, emptyContent := h.syncChat(c, claims, req, chatReq, backend, ep, start, thinkingCaps)
+			if done && emptyContent && thinkingOn && h.thinkingRes != nil {
+				// Thinking consumed all tokens — retry once with thinking disabled.
+				h.log.Info("thinking produced empty content — retrying with thinking disabled",
+					zap.String("model", req.Model),
+				)
+				disabledReq := thinking.InjectThinkingControl(req, false, thinkingCaps)
+				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: ep.URL}
+				c.Header("X-Nexus-Thinking-Retry", "1")
+				middleware.ThinkingRequestsTotal.WithLabelValues(
+					claims.TeamName, req.Model, "fast_retry").Inc()
+				h.syncChat(c, claims, req, retryReq, backend, ep, start, thinkingCaps)
+				return
+			}
 			if done {
 				return
 			}
@@ -448,30 +485,60 @@ func (h *Handler) syncChat(
 	backend runtime.Backend,
 	ep *runtime.Endpoint,
 	start time.Time,
-) (ok bool) {
+	thinkingCaps thinking.ModelCaps,
+) (ok bool, emptyContent bool) {
 	resp, err := backend.Chat(c.Request.Context(), chatReq)
 	if err != nil {
-		// Distinguish connection-level failures (retry-able) from upstream errors.
 		if isConnectError(err) {
-			return false // caller will mark endpoint down and retry
+			return false, false // caller will mark endpoint down and retry
 		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
-		return true // wrote response, do not retry
+		return true, false
 	}
 
 	var chatResp models.ChatCompletionResponse
 	if err := json.Unmarshal(resp.Body, &chatResp); err != nil {
 		abortErr(c, http.StatusBadGateway, "parse_error", "Failed to parse upstream response")
-		return true
+		return true, false
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
+
+	// ── Thinking token accounting ────────────────────────────────────────
+	// Detect and record thinking tokens. Also check for empty visible content
+	// so the caller can trigger a retry with thinking disabled.
+	contentEmpty := false
+	if thinkingCaps.SupportsThinking && len(chatResp.Choices) > 0 {
+		msg := chatResp.Choices[0].Message
+		if msg != nil {
+			if s, ok := msg.Content.(string); ok {
+				thinkTok, _ := thinking.EstimateThinkingTokens(s)
+				if thinkTok > 0 {
+					middleware.ThinkingTokensTotal.WithLabelValues(
+						claims.TeamName, req.Model).Add(float64(thinkTok))
+					chatResp.Usage.ThinkingTokens = thinkTok
+				}
+				contentEmpty = thinking.IsEmptyVisible(s)
+			}
+		}
+	}
+
 	_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 	middleware.RecordTokens(claims.TeamName, req.Model,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+
+	visibleTok := chatResp.Usage.CompletionTokens - chatResp.Usage.ThinkingTokens
+	if visibleTok < 0 {
+		visibleTok = 0
+	}
+	if thinkingCaps.SupportsThinking {
+		middleware.VisibleCompletionTokensTotal.WithLabelValues(
+			claims.TeamName, req.Model).Add(float64(visibleTok))
+	}
+
 	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
@@ -483,7 +550,7 @@ func (h *Handler) syncChat(
 		ProjectPriorityWeight: projPriorityWeight,
 	})
 	c.JSON(resp.StatusCode, chatResp)
-	return true
+	return true, contentEmpty
 }
 
 func (h *Handler) streamChat(
