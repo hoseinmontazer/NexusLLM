@@ -302,6 +302,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// ── Thinking mode resolution ───────────────────────────────────────────
 	// Resolve whether thinking should be active for this request, then inject
 	// the appropriate control flags into the request before forwarding.
+	//
+	// We always load caps and always run ResolveMode — even for models not
+	// yet marked supports_thinking=true — because:
+	//   a) The client may already be passing chat_template_kwargs.thinking=false
+	//      and we must not overwrite it.
+	//   b) The model may still produce reasoning_content tokens that the
+	//      stream normaliser needs to strip (handled independently in streamChat).
 	var thinkingOn bool
 	var thinkingCaps thinking.ModelCaps
 	if h.thinkingRes != nil {
@@ -317,6 +324,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			middleware.ThinkingRequestsTotal.WithLabelValues(
 				claims.TeamName, req.Model, mode).Inc()
+		} else {
+			// Model not marked as a thinking model in the DB, but the client
+			// may have sent chat_template_kwargs.thinking=false explicitly.
+			// Honour it: resolve mode from kwargs and inject if needed so we
+			// don't accidentally enable thinking via the model's default template.
+			thinkingOn = thinking.ResolveMode(&req, thinkingCaps) // always false when !SupportsThinking
+			_ = thinkingOn
 		}
 	}
 

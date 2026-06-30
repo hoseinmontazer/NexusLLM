@@ -64,23 +64,39 @@ func (r *Resolver) LoadCaps(ctx context.Context, modelName string) ModelCaps {
 // ResolveMode decides whether thinking should be active for this request.
 //
 // Resolution order (highest priority first):
-//  1. Explicit request override: req.Thinking != nil
-//  2. Auto-disable: max_tokens < caps.MinThinkingTokens
-//  3. Model deployment default: caps.ThinkingEnabled
+//  1. Explicit request override via req.Thinking (vLLM-style)
+//  2. Explicit request override via chat_template_kwargs.thinking (llama.cpp-style)
+//  3. Auto-disable: max_tokens < caps.MinThinkingTokens
+//  4. Model deployment default: caps.ThinkingEnabled
 func ResolveMode(req *models.InferenceRequest, caps ModelCaps) bool {
 	if !caps.SupportsThinking {
 		return false
 	}
-	// 1. Explicit request override
+	// 1. Explicit vLLM-style override: {"thinking": {"type": "enabled|disabled"}}
 	if req.Thinking != nil {
 		return req.Thinking.Type == "enabled"
 	}
-	// 2. Auto-disable when token budget is too tight for meaningful reasoning
+	// 2. Explicit llama.cpp-style override: {"chat_template_kwargs": {"thinking": false}}
+	// Clients that talk directly to llama.cpp use this field. We must honour it
+	// so that passing "thinking": false doesn't get overwritten by the gateway.
+	if req.ChatTemplateKwargs != nil {
+		if v, ok := req.ChatTemplateKwargs["thinking"]; ok {
+			switch val := v.(type) {
+			case bool:
+				return val
+			case float64: // JSON numbers decode as float64
+				return val != 0
+			case string:
+				return val == "true" || val == "1" || val == "enabled"
+			}
+		}
+	}
+	// 3. Auto-disable when token budget is too tight for meaningful reasoning
 	if req.MaxTokens != nil && caps.MinThinkingTokens > 0 &&
 		*req.MaxTokens < caps.MinThinkingTokens {
 		return false
 	}
-	// 3. Model deployment default
+	// 4. Model deployment default
 	return caps.ThinkingEnabled
 }
 
