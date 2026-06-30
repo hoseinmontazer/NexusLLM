@@ -356,6 +356,24 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// Build the unified START_MODEL payload.
 		// All startup scenarios — initial deploy, cold start, re-deploy, recovery —
 		// use this exact payload structure via TaskStartModel.
+		//
+		// Inject --reasoning off for llamacpp backends where thinking is supported
+		// but disabled — this enforces the setting at the server level, which is
+		// more reliable than chat_template_kwargs (which depends on the Jinja template).
+		effectiveExtraArgs := input.ExtraArgs
+		if input.BackendType == "llamacpp" && input.SupportsThinking && !input.ThinkingEnabled {
+			alreadySet := false
+			for _, a := range effectiveExtraArgs {
+				if a == "--reasoning" || a == "-rea" {
+					alreadySet = true
+					break
+				}
+			}
+			if !alreadySet {
+				effectiveExtraArgs = append([]string{"--reasoning", "off"}, effectiveExtraArgs...)
+			}
+		}
+
 		payload := taskmanager.StartModelPayload{
 			RuntimeID:      runtimeID,
 			EndpointID:     epID,
@@ -373,7 +391,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			MaxModelLen:    input.MaxModelLen,
 			Dtype:          input.Dtype,
 			Quantization:   input.Quantization,
-			ExtraArgs:      input.ExtraArgs,
+			ExtraArgs:      effectiveExtraArgs,
 			HFToken:        input.HFToken,
 			Env:            map[string]string{},
 			// llamacpp model source
