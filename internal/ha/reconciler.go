@@ -65,6 +65,10 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 // sweep runs one full reconciliation cycle.
 func (r *Reconciler) sweep(ctx context.Context) {
+	// Clean up failed/stuck containers before checking replica counts.
+	// This ensures failed replicas don't block new healthy ones from spawning.
+	r.sweepFailedContainers(ctx)
+
 	statuses, err := r.loadReplicaStatuses(ctx)
 	if err != nil {
 		r.log.Warn("reconciler: failed to load replica statuses", zap.Error(err))
@@ -119,13 +123,16 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 	}
 
 	// Direct DB count of ALL non-terminal rows — bypasses view lag.
-	// This is the authoritative check: if any runtime exists in a non-dead state,
-	// do NOT spawn another one. This prevents the burst-spawn problem.
+	// IMPORTANT: 'failed' is intentionally included here as non-terminal.
+	// A container that failed health checks is still a Docker container on disk.
+	// Excluding 'failed' causes the reconciler to spawn replacements while the
+	// failed containers accumulate, leading to N×desired containers over time.
+	// The stuck-runtime sweeper handles cleanup of failed containers separately.
 	var nonTerminal int
 	_ = r.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM agent_runtimes
 		WHERE model_id = $1
-		  AND state NOT IN ('stopped','deleted','archived','unloaded','failed','lost')`,
+		  AND state NOT IN ('stopped','deleted','archived','unloaded','lost')`,
 		status.ModelID,
 	).Scan(&nonTerminal)
 
@@ -183,52 +190,57 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 
 // runtimeConfig holds everything needed to start a container.
 type runtimeConfig struct {
-	ModelID        string
-	ModelName      string
-	Backend        string
-	Image          string
-	GGUFPath       string
-	HFRepo         string
-	HFFile         string
-	HFToken        string
-	ModelsVolume   string
-	CtxSize        int
-	NGPULayers     int
-	ExecutionMode  string
-	WorkloadPolicy string
-	MemoryLimit    string
-	CPUThreads     string
-	TensorParallel int
-	GPUMemoryUtil  float64
-	MaxModelLen    int
-	Dtype          string
-	Quantization   string
-	ExtraArgs      []string
+	ModelID          string
+	ModelName        string
+	Backend          string
+	Image            string
+	GGUFPath         string
+	HFRepo           string
+	HFFile           string
+	HFToken          string
+	ModelsVolume     string
+	CtxSize          int
+	NGPULayers       int
+	ExecutionMode    string
+	WorkloadPolicy   string
+	MemoryLimit      string
+	CPUThreads       string
+	TensorParallel   int
+	GPUMemoryUtil    float64
+	MaxModelLen      int
+	Dtype            string
+	Quantization     string
+	ExtraArgs        []string
+	SupportsThinking bool
+	ThinkingEnabled  bool
 }
 
 // loadRuntimeConfig reads all fields needed to build a StartModelPayload.
 func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*runtimeConfig, error) {
 	var row struct {
-		ModelID        string  `db:"model_id"`
-		ModelName      string  `db:"model_name"`
-		Backend        string  `db:"backend"`
-		Image          string  `db:"image"`
-		GGUFPath       string  `db:"gguf_path"`
-		HFRepo         string  `db:"hf_repo"`
-		HFFile         string  `db:"hf_file"`
-		HFToken        string  `db:"hf_token"`
-		ModelsVolume   string  `db:"models_volume"`
-		CtxSize        int     `db:"ctx_size"`
-		NGPULayers     int     `db:"n_gpu_layers"`
-		ExecutionMode  string  `db:"execution_mode"`
-		WorkloadPolicy string  `db:"workload_policy"`
-		MemoryLimit    string  `db:"memory_limit"`
-		CPUThreads     string  `db:"cpu_threads"`
-		TensorParallel int     `db:"tensor_parallel"`
-		GPUMemoryUtil  float64 `db:"gpu_memory_util"`
-		MaxModelLen    int     `db:"max_model_len"`
-		Dtype          string  `db:"dtype"`
-		Quantization   string  `db:"quantization"`
+		ModelID          string  `db:"model_id"`
+		ModelName        string  `db:"model_name"`
+		Backend          string  `db:"backend"`
+		Image            string  `db:"image"`
+		GGUFPath         string  `db:"gguf_path"`
+		HFRepo           string  `db:"hf_repo"`
+		HFFile           string  `db:"hf_file"`
+		HFToken          string  `db:"hf_token"`
+		ModelsVolume     string  `db:"models_volume"`
+		CtxSize          int     `db:"ctx_size"`
+		NGPULayers       int     `db:"n_gpu_layers"`
+		ExecutionMode    string  `db:"execution_mode"`
+		WorkloadPolicy   string  `db:"workload_policy"`
+		MemoryLimit      string  `db:"memory_limit"`
+		CPUThreads       string  `db:"cpu_threads"`
+		TensorParallel   int     `db:"tensor_parallel"`
+		GPUMemoryUtil    float64 `db:"gpu_memory_util"`
+		MaxModelLen      int     `db:"max_model_len"`
+		Dtype            string  `db:"dtype"`
+		Quantization     string  `db:"quantization"`
+		ExtraArgsJSON    string  `db:"extra_args_json"`
+		SupportsThinking bool    `db:"supports_thinking"`
+		ThinkingEnabled  bool    `db:"thinking_enabled"`
 	}
 	err := r.db.GetContext(ctx, &row, `
 		SELECT
@@ -251,7 +263,10 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		    COALESCE(mrc.gpu_memory_util, 0.90)         AS gpu_memory_util,
 		    COALESCE(mrc.max_model_len, 0)              AS max_model_len,
 		    COALESCE(mrc.dtype, 'auto')                 AS dtype,
-		    COALESCE(mrc.quantization, '')              AS quantization
+		    COALESCE(mrc.quantization, '')              AS quantization,
+		    COALESCE(mrc.extra_args::text, '[]')        AS extra_args_json,
+		    COALESCE(m.supports_thinking, FALSE)        AS supports_thinking,
+		    COALESCE(m.thinking_enabled, FALSE)         AS thinking_enabled
 		FROM models m
 		LEFT JOIN model_endpoints me  ON me.model_id = m.id AND me.lifecycle_state NOT IN ('deleted')
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = m.id
@@ -261,27 +276,52 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 	if err != nil {
 		return nil, fmt.Errorf("loadRuntimeConfig %s: %w", modelID, err)
 	}
+
+	var extraArgs []string
+	if row.ExtraArgsJSON != "" && row.ExtraArgsJSON != "[]" {
+		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
+	}
+
+	// Inject --reasoning off for llamacpp thinking models with thinking disabled.
+	// This is the same logic as injectReasoningFlag in runtimemgr/activator.go.
+	// HA-recovered replicas must have the same startup args as the original deploy.
+	if row.Backend == "llamacpp" && row.SupportsThinking && !row.ThinkingEnabled {
+		alreadySet := false
+		for _, a := range extraArgs {
+			if a == "--reasoning" || a == "-rea" {
+				alreadySet = true
+				break
+			}
+		}
+		if !alreadySet {
+			extraArgs = append([]string{"--reasoning", "off"}, extraArgs...)
+		}
+	}
+
 	return &runtimeConfig{
-		ModelID:        row.ModelID,
-		ModelName:      row.ModelName,
-		Backend:        row.Backend,
-		Image:          row.Image,
-		GGUFPath:       row.GGUFPath,
-		HFRepo:         row.HFRepo,
-		HFFile:         row.HFFile,
-		HFToken:        row.HFToken,
-		ModelsVolume:   row.ModelsVolume,
-		CtxSize:        row.CtxSize,
-		NGPULayers:     row.NGPULayers,
-		ExecutionMode:  row.ExecutionMode,
-		WorkloadPolicy: row.WorkloadPolicy,
-		MemoryLimit:    row.MemoryLimit,
-		CPUThreads:     row.CPUThreads,
-		TensorParallel: row.TensorParallel,
-		GPUMemoryUtil:  row.GPUMemoryUtil,
-		MaxModelLen:    row.MaxModelLen,
-		Dtype:          row.Dtype,
-		Quantization:   row.Quantization,
+		ModelID:          row.ModelID,
+		ModelName:        row.ModelName,
+		Backend:          row.Backend,
+		Image:            row.Image,
+		GGUFPath:         row.GGUFPath,
+		HFRepo:           row.HFRepo,
+		HFFile:           row.HFFile,
+		HFToken:          row.HFToken,
+		ModelsVolume:     row.ModelsVolume,
+		CtxSize:          row.CtxSize,
+		NGPULayers:       row.NGPULayers,
+		ExecutionMode:    row.ExecutionMode,
+		WorkloadPolicy:   row.WorkloadPolicy,
+		MemoryLimit:      row.MemoryLimit,
+		CPUThreads:       row.CPUThreads,
+		TensorParallel:   row.TensorParallel,
+		GPUMemoryUtil:    row.GPUMemoryUtil,
+		MaxModelLen:      row.MaxModelLen,
+		Dtype:            row.Dtype,
+		Quantization:     row.Quantization,
+		ExtraArgs:        extraArgs,
+		SupportsThinking: row.SupportsThinking,
+		ThinkingEnabled:  row.ThinkingEnabled,
 	}, nil
 }
 
@@ -421,6 +461,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		MaxModelLen:    cfg.MaxModelLen,
 		Dtype:          cfg.Dtype,
 		Quantization:   cfg.Quantization,
+		ExtraArgs:      cfg.ExtraArgs, // includes --reasoning off when thinking is disabled
 		ExecutionMode:  effectiveMode,
 		WorkloadPolicy: cfg.WorkloadPolicy,
 		Env:            map[string]string{},
@@ -631,6 +672,30 @@ func sanitize(s string) string {
 		}
 		return '-'
 	}, s)
+}
+
+// sweepFailedContainers marks old failed agent_runtimes as 'stopped' once
+// their container has been running for more than the failure grace period.
+// This prevents the non-terminal count from being inflated by failed rows
+// and allows the reconciler to spawn fresh replacements.
+//
+// Strategy: a 'failed' runtime that is older than 5 minutes AND whose
+// container name is for an HA replica (contains "-r0-", "-r1-", etc.) is
+// transitioned to 'stopped' so it no longer blocks replica count checks.
+// The node agent is responsible for actually removing the Docker container.
+func (r *Reconciler) sweepFailedContainers(ctx context.Context) {
+	res, _ := r.db.ExecContext(ctx, `
+		UPDATE agent_runtimes
+		SET state      = 'stopped',
+		    error_msg  = COALESCE(error_msg, '') || ' [ha-sweep: moved failed→stopped after grace period]',
+		    updated_at = NOW()
+		WHERE state = 'failed'
+		  AND updated_at < NOW() - INTERVAL '5 minutes'`)
+	if n, _ := res.RowsAffected(); n > 0 {
+		r.log.Info("HA sweep: failed runtimes moved to stopped",
+			zap.Int64("count", n),
+		)
+	}
 }
 
 // Ensure json import is used
