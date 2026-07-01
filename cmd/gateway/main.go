@@ -188,8 +188,10 @@ func main() {
 	v1 := r.Group("/v1", middleware.AuthRequired(authSvc))
 	{
 		v1.POST("/chat/completions", proxyHandler.ChatCompletions)
+		v1.POST("/completions", proxyHandler.LegacyCompletions) // legacy text completions (Roo Code, Continue FIM)
 		v1.POST("/embeddings", proxyHandler.Embeddings)
 		v1.GET("/models", proxyHandler.Models)
+		v1.GET("/models/:model_id", proxyHandler.ModelByID) // single-model lookup (Cline, Continue, Kilo Code)
 
 		// Multi-service APIs (AI Platform)
 		v1.POST("/rerank", proxyHandler.Rerank)

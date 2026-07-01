@@ -140,15 +140,18 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 		return nil
 	}
 
-	// 90-second cooldown: if a recovery log entry was created recently,
-	// do not spawn again. Prevents double-spawn in the window between
-	// task dispatch and agent claiming the task.
+	// 6-minute cooldown: must be longer than the sweepFailedContainers grace
+	// period (5 minutes) so a failed row is guaranteed to be moved to 'stopped'
+	// before the cooldown expires and the reconciler is allowed to spawn again.
+	// Using 90 seconds was shorter than the 5-minute sweep grace, which allowed
+	// the cooldown to expire while old failed rows still counted as non-terminal,
+	// causing repeated spawns and accumulation of containers.
 	var recentLog int
 	_ = r.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM runtime_recovery_log
 		WHERE model_id = $1
 		  AND trigger   = 'reconcile'
-		  AND created_at > NOW() - INTERVAL '90 seconds'`,
+		  AND created_at > NOW() - INTERVAL '6 minutes'`,
 		status.ModelID,
 	).Scan(&recentLog)
 
@@ -552,7 +555,7 @@ func (r *Reconciler) selectNode(ctx context.Context, status ReplicaStatus) (stri
 	var existingNodes []string
 	_ = r.db.SelectContext(ctx, &existingNodes, `
 		SELECT DISTINCT node_id::text FROM agent_runtimes
-		WHERE model_id=$1 AND state NOT IN ('stopped','deleted','archived','unloaded','failed','lost')`,
+		WHERE model_id=$1 AND state NOT IN ('stopped','deleted','archived','unloaded','lost')`,
 		status.ModelID)
 	existingSet := make(map[string]bool, len(existingNodes))
 	for _, id := range existingNodes {

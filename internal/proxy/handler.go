@@ -514,16 +514,137 @@ func (h *Handler) Models(c *gin.Context) {
 	for _, name := range h.registry.ListModels() {
 		registered[name] = true
 	}
+	// Load stable created_at timestamps from the DB so the value is
+	// deterministic across calls. VS Code extensions (Cline, Continue) cache
+	// the model list and treat a changing `created` as a model replacement.
+	modelCreatedAt := make(map[string]int64)
+	if h.db != nil {
+		type row struct {
+			Name      string    `db:"name"`
+			CreatedAt time.Time `db:"created_at"`
+		}
+		var rows []row
+		_ = h.db.SelectContext(c.Request.Context(), &rows,
+			`SELECT name, created_at FROM models WHERE enabled = TRUE`)
+		for _, r := range rows {
+			modelCreatedAt[r.Name] = r.CreatedAt.Unix()
+		}
+	}
+	fallbackCreated := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+
 	var data []models.ModelObject
-	now := time.Now().Unix()
 	for _, modelName := range claims.Permissions {
 		if registered[modelName] {
+			created, ok := modelCreatedAt[modelName]
+			if !ok {
+				created = fallbackCreated
+			}
 			data = append(data, models.ModelObject{
-				ID: modelName, Object: "model", Created: now, OwnedBy: "nexusllm",
+				ID: modelName, Object: "model", Created: created, OwnedBy: "nexusllm",
 			})
 		}
 	}
 	c.JSON(http.StatusOK, models.ModelListResponse{Object: "list", Data: data})
+}
+
+// LegacyCompletions handles POST /v1/completions (legacy text completions API).
+// Several VS Code extensions (Roo Code, Continue fill-in-middle mode) still
+// call this endpoint. We translate it to a chat completions request so it
+// works transparently with all registered models.
+func (h *Handler) LegacyCompletions(c *gin.Context) {
+	var req struct {
+		Model       string      `json:"model"`
+		Prompt      interface{} `json:"prompt"` // string or []string
+		MaxTokens   *int        `json:"max_tokens,omitempty"`
+		Temperature *float64    `json:"temperature,omitempty"`
+		Stream      bool        `json:"stream"`
+		Stop        interface{} `json:"stop,omitempty"`
+		Suffix      string      `json:"suffix,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		abortErr(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	// Extract the prompt string.
+	var promptStr string
+	switch v := req.Prompt.(type) {
+	case string:
+		promptStr = v
+	case []interface{}:
+		if len(v) > 0 {
+			if s, ok := v[0].(string); ok {
+				promptStr = s
+			}
+		}
+	}
+
+	// Build a chat-completions request with the prompt as a user message.
+	chatReq := models.InferenceRequest{
+		Model:       req.Model,
+		Messages:    []models.Message{{Role: "user", Content: promptStr}},
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		Stream:      req.Stream,
+		Stop:        req.Stop,
+	}
+	// Swap out the parsed body so ChatCompletions can process it.
+	body, _ := json.Marshal(chatReq)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
+	h.ChatCompletions(c)
+}
+
+// ModelByID handles GET /v1/models/:model_id.
+// Cline, Continue, and Kilo Code all call this endpoint to verify a model
+// exists before submitting a request. Without it they receive 404 and fall
+// back to disabled mode or show a configuration error.
+func (h *Handler) ModelByID(c *gin.Context) {
+	claims := middleware.GetClaims(c)
+	if claims == nil {
+		abortErr(c, http.StatusUnauthorized, "unauthorized", "Missing authentication")
+		return
+	}
+	modelID := c.Param("model_id")
+
+	// Check the model is registered and the caller has permission.
+	registered := make(map[string]bool)
+	for _, name := range h.registry.ListModels() {
+		registered[name] = true
+	}
+	allowed := false
+	for _, p := range claims.Permissions {
+		if p == modelID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed || !registered[modelID] {
+		c.JSON(http.StatusNotFound, models.ErrorResponse{
+			Error: models.ErrorDetail{
+				Message: "The model '" + modelID + "' does not exist",
+				Type:    "invalid_request_error",
+				Code:    "model_not_found",
+			},
+		})
+		return
+	}
+
+	// Look up stable created_at from DB.
+	var createdAt int64
+	if h.db != nil {
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM models WHERE name=$1 AND enabled=TRUE`,
+			modelID,
+		).Scan(&createdAt)
+	}
+	if createdAt == 0 {
+		createdAt = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	}
+
+	c.JSON(http.StatusOK, models.ModelObject{
+		ID: modelID, Object: "model", Created: createdAt, OwnedBy: "nexusllm",
+	})
 }
 
 // ─── private ──────────────────────────────────────────────────────────────────
@@ -551,6 +672,20 @@ func (h *Handler) syncChat(
 	if err := json.Unmarshal(resp.Body, &chatResp); err != nil {
 		abortErr(c, http.StatusBadGateway, "parse_error", "Failed to parse upstream response")
 		return true, false
+	}
+
+	// Normalize the model field: always echo back the model name the client
+	// sent. llama.cpp may report an internal path or a different identifier.
+	// Cline validates response.model === request.model.
+	if chatResp.Model == "" || chatResp.Model != req.Model {
+		chatResp.Model = req.Model
+	}
+
+	// Inject a stable system_fingerprint so clients that require it don't
+	// receive an empty/missing field. Some OpenAI SDK versions treat an absent
+	// system_fingerprint as a protocol error.
+	if chatResp.SystemFingerprint == "" {
+		chatResp.SystemFingerprint = "nexusllm-v1"
 	}
 
 	// llama.cpp returns tool_calls[].function.arguments as a JSON object,
@@ -760,7 +895,14 @@ func (h *Handler) streamChat(
 		if json.Unmarshal([]byte(payload), &chunk) == nil {
 			if streamID == "" && chunk.ID != "" {
 				streamID = chunk.ID
-				streamModel = chunk.Model
+				// Always use the request model name — upstreams (llama.cpp) may
+				// emit their own internal identifier which won't match what the
+				// client sent. Cline/Continue validate that chunk.model === request.model.
+				if chunk.Model != "" {
+					streamModel = req.Model
+				} else if streamModel == "" {
+					streamModel = req.Model
+				}
 				streamCreated = chunk.Created
 			}
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
