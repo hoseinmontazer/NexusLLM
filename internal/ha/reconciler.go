@@ -154,14 +154,30 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 	// Using 90 seconds was shorter than the 5-minute sweep grace, which allowed
 	// the cooldown to expire while old failed rows still counted as non-terminal,
 	// causing repeated spawns and accumulation of containers.
+	//
+	// Exception: if the most-recent recovery log was triggered by a confirmed
+	// container death (container-dead tag), the grace was skipped and the failed
+	// row is already stopped — use a 60s cooldown to allow fast recovery.
 	var recentLog int
 	_ = r.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM runtime_recovery_log
 		WHERE model_id = $1
 		  AND trigger   = 'reconcile'
-		  AND created_at > NOW() - INTERVAL '6 minutes'`,
+		  AND created_at > NOW() - INTERVAL '60 seconds'
+		  AND reason LIKE '%container-dead%'`,
 		status.ModelID,
 	).Scan(&recentLog)
+
+	if recentLog == 0 {
+		// Standard path — use 6-minute cooldown.
+		_ = r.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM runtime_recovery_log
+			WHERE model_id = $1
+			  AND trigger   = 'reconcile'
+			  AND created_at > NOW() - INTERVAL '6 minutes'`,
+			status.ModelID,
+		).Scan(&recentLog)
+	}
 
 	if recentLog > 0 {
 		return nil
@@ -1207,24 +1223,38 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 	return runtimeID, nil
 }
 
-// their container has been running for more than the failure grace period.
-// This prevents the non-terminal count from being inflated by failed rows
-// and allows the reconciler to spawn fresh replacements.
-//
-// Strategy: a 'failed' runtime that is older than 5 minutes AND whose
-// container name is for an HA replica (contains "-r0-", "-r1-", etc.) is
-// transitioned to 'stopped' so it no longer blocks replica count checks.
-// The node agent is responsible for actually removing the Docker container.
+// sweepFailedContainers moves failed agent_runtimes to 'stopped'.
+// Two paths:
+//  1. Container confirmed dead by the node agent watcher ([container-dead] tag):
+//     moved immediately — no grace period needed, container is already gone.
+//  2. All other failed rows older than 5 minutes:
+//     moved after grace period so the reconciler doesn't double-spawn while
+//     the container is still exiting.
 func (r *Reconciler) sweepFailedContainers(ctx context.Context) {
-	res, _ := r.db.ExecContext(ctx, `
+	// Path 1: confirmed dead — move immediately, no grace period.
+	res1, _ := r.db.ExecContext(ctx, `
+		UPDATE agent_runtimes
+		SET state      = 'stopped',
+		    updated_at = NOW()
+		WHERE state = 'failed'
+		  AND error_msg LIKE '%[container-dead]%'`)
+	if n, _ := res1.RowsAffected(); n > 0 {
+		r.log.Info("HA sweep: confirmed-dead containers moved to stopped immediately",
+			zap.Int64("count", n),
+		)
+	}
+
+	// Path 2: other failed rows — 5-minute grace period.
+	res2, _ := r.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
 		SET state      = 'stopped',
 		    error_msg  = COALESCE(error_msg, '') || ' [ha-sweep: moved failed→stopped after grace period]',
 		    updated_at = NOW()
 		WHERE state = 'failed'
+		  AND error_msg NOT LIKE '%[container-dead]%'
 		  AND updated_at < NOW() - INTERVAL '5 minutes'`)
-	if n, _ := res.RowsAffected(); n > 0 {
-		r.log.Info("HA sweep: failed runtimes moved to stopped",
+	if n, _ := res2.RowsAffected(); n > 0 {
+		r.log.Info("HA sweep: failed runtimes moved to stopped after grace period",
 			zap.Int64("count", n),
 		)
 	}

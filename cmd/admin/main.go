@@ -360,6 +360,7 @@ func main() {
 		agent.POST("/model-cache", agentH.PushModelCache)
 		agent.PUT("/runtimes/:id", agentH.UpdateRuntime)
 		agent.GET("/runtimes", agentH.ListRuntimes)
+		agent.POST("/container-died", agentH.ContainerDied) // immediate container death notification
 	}
 
 	// ── Task Management (admin operator API for dispatching tasks) ────────────

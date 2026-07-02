@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -630,6 +631,79 @@ func (h *AgentHandler) ListRuntimes(c *gin.Context) {
 		rows = []runtimeRow{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
+}
+
+// ─── Container death notification ────────────────────────────────────────────
+
+// ContainerDied handles POST /agent/v1/container-died
+// Called by the node agent's containerWatchLoop when it detects a nexus-*
+// container has exited unexpectedly. Immediately marks the matching
+// agent_runtimes row as 'failed' so the reconciler and stuck-runtime sweeper
+// can react within one cycle instead of waiting for the 30s telemetry loop.
+func (h *AgentHandler) ContainerDied(c *gin.Context) {
+	claims := h.getAgentClaims(c)
+	if claims == nil {
+		return
+	}
+	var input struct {
+		ContainerName string `json:"container_name"`
+		ContainerID   string `json:"container_id"`
+		Reason        string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.ContainerName == "" && input.ContainerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "container_name or container_id required"})
+		return
+	}
+
+	reason := input.Reason
+	if reason == "" {
+		reason = "container exited unexpectedly (detected by node agent watcher)"
+	}
+	// Tag the error with a sentinel so sweepFailedContainers can skip the
+	// 5-minute grace period for containers that are confirmed gone.
+	const containerDeadTag = "[container-dead]"
+	if !strings.Contains(reason, containerDeadTag) {
+		reason = containerDeadTag + " " + reason
+	}
+
+	// Match by container_id first (exact), fall back to runtime_name.
+	// Only update rows that were in a live state — don't touch already-failed rows.
+	var res interface{ RowsAffected() (int64, error) }
+	var err error
+
+	if input.ContainerID != "" {
+		res, err = h.db.ExecContext(c.Request.Context(), `
+			UPDATE agent_runtimes
+			SET state     = 'failed',
+			    error_msg = $1,
+			    updated_at = NOW()
+			WHERE node_id = $2
+			  AND container_id = $3
+			  AND state IN ('ready','active','warm','idle','loading_model',
+			                'waiting_ready','loading','starting','pending')`,
+			reason, claims.NodeID, input.ContainerID)
+	} else {
+		res, err = h.db.ExecContext(c.Request.Context(), `
+			UPDATE agent_runtimes
+			SET state     = 'failed',
+			    error_msg = $1,
+			    updated_at = NOW()
+			WHERE node_id = $2
+			  AND runtime_name = $3
+			  AND state IN ('ready','active','warm','idle','loading_model',
+			                'waiting_ready','loading','starting','pending')`,
+			reason, claims.NodeID, input.ContainerName)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	n, _ := res.RowsAffected()
+	c.JSON(http.StatusOK, gin.H{"acknowledged": true, "rows_updated": n})
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────

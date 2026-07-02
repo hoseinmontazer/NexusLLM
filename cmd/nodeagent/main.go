@@ -155,6 +155,7 @@ func main() {
 	go agent.heartbeatLoop(ctx)
 	go agent.telemetryLoop(ctx)
 	go agent.taskPollLoop(ctx)
+	go agent.containerWatchLoop(ctx) // immediately reports container deaths
 
 	// ── 4. Auto re-register on 401 ────────────────────────────────────────────
 	// When any authenticated request receives HTTP 401, doRequest signals the
@@ -830,6 +831,91 @@ func (a *Agent) localIP() string {
 		return fields[0]
 	}
 	return ""
+}
+
+// ─── Container watcher ───────────────────────────────────────────────────────
+
+// containerWatchLoop polls Docker every 10s and reports any nexus-* container
+// that has died back to the control plane immediately. This is much faster than
+// waiting for the 30s telemetry cycle + 6-minute reconciler cooldown.
+//
+// When a container that was previously running is found to have exited, the
+// agent PUTs its runtime row to 'failed' so the control plane can:
+//   - Trigger a replacement via the stuck-runtime sweeper within 60s
+//   - Allow the HA reconciler to see the failure without waiting for the heartbeat
+//
+// This reduces recovery time from ~7 minutes (cooldown + detection) to ~60s.
+func (a *Agent) containerWatchLoop(ctx context.Context) {
+	// Track which containers we know are running. key=container_name, value=container_id.
+	known := make(map[string]string)
+
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			a.checkContainers(ctx, known)
+		}
+	}
+}
+
+// checkContainers compares the current nexus-* container list against the
+// previously-known running set and immediately reports any that have died.
+func (a *Agent) checkContainers(ctx context.Context, known map[string]string) {
+	// Query all nexus-* containers (any state).
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-a",
+		"--filter", "name=nexus-",
+		"--format", "{{.Names}}\t{{.ID}}\t{{.Status}}",
+	).Output()
+	if err != nil {
+		return
+	}
+
+	current := make(map[string]string) // name → id of RUNNING containers
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		name, id, status := parts[0], parts[1], parts[2]
+		if strings.HasPrefix(status, "Up") {
+			current[name] = id
+			if _, seen := known[name]; !seen {
+				// Newly-seen running container — record it.
+				known[name] = id
+			}
+		}
+	}
+
+	// Any container we knew about that is no longer running has died.
+	for name, id := range known {
+		if _, alive := current[name]; !alive {
+			a.log.Warn("container died — reporting to control plane",
+				zap.String("container", name),
+				zap.String("container_id", id),
+			)
+			a.reportContainerDeath(ctx, name, id)
+			delete(known, name)
+		}
+	}
+}
+
+// reportContainerDeath finds the agent_runtime row for the dead container and
+// marks it 'failed' so the control plane can trigger recovery immediately.
+func (a *Agent) reportContainerDeath(ctx context.Context, containerName, containerID string) {
+	_ = a.post(ctx, "/agent/v1/container-died", map[string]interface{}{
+		"container_name": containerName,
+		"container_id":   containerID,
+		"node_id":        a.nodeID,
+		"reason":         "container exited unexpectedly",
+	}, nil)
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
