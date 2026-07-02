@@ -140,7 +140,7 @@ docker-push: docker-build
 	docker push $(REGISTRY)/gateway:$(VERSION)
 	docker push $(REGISTRY)/admin:$(VERSION)
 	docker push $(REGISTRY)/scheduler:$(VERSION)
-	docker push $(REGISTRY)/nodeagent:$(VERSION)
+# 	docker push $(REGISTRY)/nodeagent:$(VERSION)
 	docker push $(REGISTRY)/web:$(VERSION)
 
 # ─────────────────────────────────────────────────────────────────────────────
