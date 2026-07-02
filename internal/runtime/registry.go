@@ -300,11 +300,9 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		-- Includes both healthy (ready/active/warm/idle) and still-starting
 		-- (loading_model/waiting_ready) runtimes so the health watcher can
 		-- probe them and transition them to healthy as soon as they are ready.
-		-- This is the critical path for HA failover: reconciler-created runtimes
-		-- always have endpoint_id=NULL and only appear via this branch. They
-		-- must enter the pool while starting so the watcher can promote them
-		-- to healthy — without this they would be stuck in loading_model forever
-		-- because the watcher only checks endpoints already in the pool.
+		-- EXCLUDED: unhealthy and draining runtimes — they must not receive
+		-- new requests. The rolling reconciler keeps them alive for in-flight
+		-- requests and tears them down after the replacement is READY.
 		SELECT
 		    ar.id                                    AS id,
 		    ar.model_id,

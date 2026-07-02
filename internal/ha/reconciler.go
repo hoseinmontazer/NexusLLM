@@ -17,6 +17,7 @@ package ha
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
@@ -65,10 +67,16 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 // sweep runs one full reconciliation cycle.
 func (r *Reconciler) sweep(ctx context.Context) {
-	// Clean up failed/stuck containers before checking replica counts.
-	// This ensures failed replicas don't block new healthy ones from spawning.
+	// ── Phase 1: rolling-replacement lifecycle management ─────────────────
+	// Drive the UNHEALTHY → replacement → DRAINING → STOPPED state machine
+	// before the regular under-replication check runs.
+	r.rollingReplacementSweep(ctx)
+
+	// ── Phase 2: clean up failed/stuck containers ─────────────────────────
+	// This ensures failed replicas don't inflate the non-terminal count.
 	r.sweepFailedContainers(ctx)
 
+	// ── Phase 3: under-replication recovery ──────────────────────────────
 	statuses, err := r.loadReplicaStatuses(ctx)
 	if err != nil {
 		r.log.Warn("reconciler: failed to load replica statuses", zap.Error(err))
@@ -396,8 +404,50 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		nGPULayers = 0
 	}
 
-	// ── 5. Insert agent_runtimes row FIRST (task FK requires it) ─────────────
-	res, dbErr := r.db.ExecContext(ctx, `
+	// ── 5. Atomically claim replica slot + insert agent_runtimes row ─────────
+	// The claim_replica_slot() DB function acquires a per-model advisory lock,
+	// re-counts non-terminal rows inside that lock, and returns TRUE only when
+	// count < desired.  By doing the INSERT in the same transaction we guarantee
+	// no other concurrent caller can also claim a slot between the check and the
+	// insert — eliminating the TOCTOU race that causes N×desired containers.
+	tx, txErr := r.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if txErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.recordLog(ctx, logID, action, "", "failed", "begin tx: "+txErr.Error())
+		return fmt.Errorf("begin transaction: %w", txErr)
+	}
+	// Always rollback on error paths; committed tx ignores this.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Re-check capacity inside the transaction with the advisory lock held.
+	// Pass max_surge so the slot guard allows surge replicas during rolling replacement.
+	maxSurge := status.MaxSurge
+	if maxSurge < 1 {
+		maxSurge = 1
+	}
+	slotAvailable, slotErr := replicaguard.ClaimSlot(ctx, tx, action.ModelID, status.DesiredReplicas, maxSurge)
+	if slotErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.recordLog(ctx, logID, action, "", "skipped", "claim_replica_slot error: "+slotErr.Error())
+		return fmt.Errorf("claim_replica_slot: %w", slotErr)
+	}
+	if !slotAvailable {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.recordLog(ctx, logID, action, "", "skipped",
+			fmt.Sprintf("at capacity: desired=%d — slot claimed by concurrent caller", status.DesiredReplicas))
+		r.log.Info("HA reconciler: replica slot already taken by concurrent caller — skipping",
+			zap.String("model", action.ModelName),
+			zap.Int("desired", status.DesiredReplicas),
+		)
+		return nil // not an error — another process already handled it
+	}
+
+	res, dbErr := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
@@ -412,7 +462,6 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		action.ReplicaIdx,
 	)
 	if dbErr != nil {
-		// Release port since we won't use it
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "insert agent_runtime: "+dbErr.Error())
 		return fmt.Errorf("insert runtime row: %w", dbErr)
@@ -421,6 +470,15 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		return fmt.Errorf("insert runtime row: 0 rows affected")
 	}
+
+	// Commit while the advisory lock is still held — the lock releases on commit,
+	// making the new row visible to other transactions atomically.
+	if commitErr := tx.Commit(); commitErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.recordLog(ctx, logID, action, runtimeID, "failed", "commit tx: "+commitErr.Error())
+		return fmt.Errorf("commit runtime row: %w", commitErr)
+	}
+	committed = true
 
 	// Link the port lease to the runtime row
 	_, _ = r.db.ExecContext(ctx, `
@@ -617,7 +675,10 @@ func (r *Reconciler) loadReplicaStatuses(ctx context.Context) ([]ReplicaStatus, 
 	err := r.db.SelectContext(ctx, &rows, `
 		SELECT model_id, model_name, desired_replicas, min_available,
 		       placement_policy, auto_recover,
+		       max_surge, health_retry_interval_s, replacement_start_timeout_s,
+		       drain_timeout_s, termination_grace_s,
 		       active_replicas, starting_replicas, idle_replicas,
+		       unhealthy_replicas, draining_replicas,
 		       lost_replicas, node_count, ha_status
 		FROM runtime_replica_status WHERE desired_replicas > 0`)
 	return rows, err
@@ -677,7 +738,475 @@ func sanitize(s string) string {
 	}, s)
 }
 
-// sweepFailedContainers marks old failed agent_runtimes as 'stopped' once
+// ─────────────────────────────────────────────────────────────────────────────
+// Rolling replacement sweep
+//
+// This is the Kubernetes-style self-healing loop. It runs every reconcile cycle
+// and drives the following state machine for each unhealthy/draining replica:
+//
+//	READY ──(3 consecutive health fails)──► UNHEALTHY
+//	  │
+//	  └──► (replacement already started? wait)
+//	       (no replacement? spawn new replica via execute())
+//
+//	UNHEALTHY ──(replacement reaches READY)──► DRAINING
+//	  │
+//	  └──(replacement timed out)──► FAILED (retry on next sweep)
+//
+//	DRAINING ──(active_conns==0 OR drain_timeout expired)──► STOP
+//
+// Key invariant (large-model protection):
+//   Never terminate the last READY replica of a model until a replacement
+//   replica reaches READY state. Models > 30GB can take several minutes to
+//   load; the old container keeps serving during that entire period.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (r *Reconciler) rollingReplacementSweep(ctx context.Context) {
+	r.stepUnhealthyReplicas(ctx)
+	r.stepDrainingReplicas(ctx)
+}
+
+// stepUnhealthyReplicas handles the UNHEALTHY → spawn replacement → DRAINING leg.
+func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
+	type unhealthyRow struct {
+		ID                  string    `db:"id"`
+		ModelID             string    `db:"model_id"`
+		ModelName           string    `db:"model_name"`
+		NodeID              string    `db:"node_id"`
+		ReplacedBy          *string   `db:"replaced_by"`
+		UpdatedAt           time.Time `db:"updated_at"`
+		DesiredReplicas     int       `db:"desired_replicas"`
+		MaxSurge            int       `db:"max_surge"`
+		ReplacementTimeoutS int       `db:"replacement_start_timeout_s"`
+		ActiveReadyCount    int       `db:"active_ready_count"`
+	}
+
+	var rows []unhealthyRow
+	_ = r.db.SelectContext(ctx, &rows, `
+		SELECT
+		    ar.id,
+		    ar.model_id,
+		    m.name                                            AS model_name,
+		    ar.node_id::text                                  AS node_id,
+		    ar.replaced_by::text                             AS replaced_by,
+		    ar.updated_at,
+		    COALESCE(rs.desired_replicas, 1)                 AS desired_replicas,
+		    COALESCE(rs.max_surge, 1)                        AS max_surge,
+		    COALESCE(rs.replacement_start_timeout_s, 900)    AS replacement_start_timeout_s,
+		    (SELECT COUNT(*) FROM agent_runtimes ar2
+		     WHERE ar2.model_id = ar.model_id
+		       AND ar2.state IN ('ready','active','warm','idle')
+		       AND ar2.id != ar.id)                          AS active_ready_count
+		FROM agent_runtimes ar
+		JOIN models m ON m.id = ar.model_id
+		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
+		WHERE ar.state = 'unhealthy'
+		  AND m.enabled = TRUE`)
+
+	for _, row := range rows {
+		r.handleUnhealthyReplica(ctx, row.ID, row.ModelID, row.ModelName,
+			row.NodeID, row.ReplacedBy, row.UpdatedAt,
+			row.DesiredReplicas, row.MaxSurge, row.ReplacementTimeoutS,
+			row.ActiveReadyCount)
+	}
+}
+
+func (r *Reconciler) handleUnhealthyReplica(
+	ctx context.Context,
+	runtimeID, modelID, modelName, nodeID string,
+	replacedBy *string,
+	unhealthySince time.Time,
+	desiredReplicas, maxSurge, replacementTimeoutS int,
+	activeReadyCount int,
+) {
+	replacementTimeout := time.Duration(replacementTimeoutS) * time.Second
+
+	// ── Case 1: replacement already started — check its progress ─────────
+	if replacedBy != nil && *replacedBy != "" {
+		var replacementState string
+		err := r.db.QueryRowContext(ctx,
+			`SELECT state FROM agent_runtimes WHERE id = $1`, *replacedBy,
+		).Scan(&replacementState)
+		if err != nil {
+			// Replacement row gone — clear the pointer and retry.
+			_, _ = r.db.ExecContext(ctx,
+				`UPDATE agent_runtimes SET replaced_by = NULL, updated_at = NOW() WHERE id = $1`, runtimeID)
+			return
+		}
+
+		switch replacementState {
+		case "ready", "active", "warm", "idle":
+			// Replacement is READY. Transition the old runtime to DRAINING.
+			// Gateway routing will exclude it immediately because 'draining'
+			// is not in IsAvailable(). In-flight requests finish naturally.
+			_, _ = r.db.ExecContext(ctx, `
+				UPDATE agent_runtimes
+				SET state = 'draining', updated_at = NOW()
+				WHERE id = $1 AND state = 'unhealthy'`, runtimeID)
+			r.log.Info("rolling replacement: replacement READY → old replica now DRAINING",
+				zap.String("model", modelName),
+				zap.String("old_runtime", runtimeID),
+				zap.String("new_runtime", *replacedBy),
+			)
+
+		case "failed", "stopped", "deleted":
+			// Replacement failed. Clear the pointer so we try again next sweep.
+			_, _ = r.db.ExecContext(ctx,
+				`UPDATE agent_runtimes SET replaced_by = NULL, updated_at = NOW() WHERE id = $1`, runtimeID)
+			r.log.Warn("rolling replacement: replacement FAILED — will retry",
+				zap.String("model", modelName),
+				zap.String("old_runtime", runtimeID),
+				zap.String("failed_replacement", *replacedBy),
+			)
+
+		default:
+			// Replacement still starting. Check for overall timeout.
+			if time.Since(unhealthySince) > replacementTimeout {
+				r.log.Warn("rolling replacement: replacement timed out",
+					zap.String("model", modelName),
+					zap.String("old_runtime", runtimeID),
+					zap.String("replacement", *replacedBy),
+					zap.Duration("waited", time.Since(unhealthySince)),
+				)
+				// Mark replacement failed; clear pointer; retry next sweep.
+				_, _ = r.db.ExecContext(ctx,
+					`UPDATE agent_runtimes SET state='failed',
+					    error_msg='rolling replacement: startup timeout exceeded',
+					    updated_at=NOW() WHERE id=$1`, *replacedBy)
+				_, _ = r.db.ExecContext(ctx,
+					`UPDATE agent_runtimes SET replaced_by=NULL, updated_at=NOW() WHERE id=$1`, runtimeID)
+			}
+			// Still in progress — wait.
+		}
+		return
+	}
+
+	// ── Case 2: no replacement started yet — spawn one ────────────────────
+	//
+	// Large-model protection: if this is the LAST ready replica, do not
+	// terminate it prematurely. Spawn the replacement, but leave the
+	// unhealthy replica alive until the replacement is READY.
+	// (This is the core zero-downtime guarantee.)
+	if activeReadyCount == 0 {
+		r.log.Info("rolling replacement: last ready replica is unhealthy — spawning replacement before draining",
+			zap.String("model", modelName),
+			zap.String("runtime_id", runtimeID),
+		)
+	}
+
+	// Load status needed for selectNode and execute.
+	status := ReplicaStatus{
+		ModelID:         modelID,
+		ModelName:       modelName,
+		DesiredReplicas: desiredReplicas,
+		MaxSurge:        maxSurge,
+		PlacementPolicy: r.loadPlacementPolicy(ctx, modelID),
+		AutoRecover:     true,
+	}
+
+	targetNode, err := r.selectNode(ctx, status)
+	if err != nil {
+		r.log.Warn("rolling replacement: no suitable node for replacement",
+			zap.String("model", modelName),
+			zap.Error(err),
+		)
+		return
+	}
+
+	action := ReconcileAction{
+		ModelID:    modelID,
+		ModelName:  modelName,
+		Action:     "start_replica",
+		TargetNode: targetNode,
+		ReplicaIdx: desiredReplicas, // surge slot — one beyond desired
+		Reason:     fmt.Sprintf("rolling_replacement: old=%s unhealthy_since=%s", runtimeID, unhealthySince.Format(time.RFC3339)),
+	}
+
+	newRuntimeID, err := r.executeReturningID(ctx, status, action)
+	if err != nil {
+		r.log.Warn("rolling replacement: failed to start replacement",
+			zap.String("model", modelName),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Link the old runtime to its replacement.
+	_, _ = r.db.ExecContext(ctx,
+		`UPDATE agent_runtimes SET replaced_by = $1, updated_at = NOW() WHERE id = $2`,
+		newRuntimeID, runtimeID)
+
+	r.log.Info("rolling replacement: replacement spawned",
+		zap.String("model", modelName),
+		zap.String("old_runtime", runtimeID),
+		zap.String("new_runtime", newRuntimeID),
+		zap.String("node", targetNode),
+	)
+}
+
+// stepDrainingReplicas handles the DRAINING → STOPPED leg.
+func (r *Reconciler) stepDrainingReplicas(ctx context.Context) {
+	type drainingRow struct {
+		ID            string    `db:"id"`
+		ModelID       string    `db:"model_id"`
+		ModelName     string    `db:"model_name"`
+		NodeID        string    `db:"node_id"`
+		ContainerID   string    `db:"container_id"`
+		ActiveConns   int64     `db:"active_conns"`
+		DrainStartAt  time.Time `db:"drain_start_at"`
+		DrainTimeoutS int       `db:"drain_timeout_s"`
+		TermGraceS    int       `db:"termination_grace_s"`
+	}
+
+	var rows []drainingRow
+	// active_conns is tracked in-process in the pool's Endpoint.ActiveConns;
+	// the DB doesn't have it. We use updated_at as proxy for "drain started at".
+	_ = r.db.SelectContext(ctx, &rows, `
+		SELECT
+		    ar.id,
+		    ar.model_id,
+		    m.name                                      AS model_name,
+		    ar.node_id::text                            AS node_id,
+		    COALESCE(ar.container_id, '')               AS container_id,
+		    0::bigint                                   AS active_conns,
+		    ar.updated_at                               AS drain_start_at,
+		    COALESCE(rs.drain_timeout_s, 30)            AS drain_timeout_s,
+		    COALESCE(rs.termination_grace_s, 15)        AS termination_grace_s
+		FROM agent_runtimes ar
+		JOIN models m ON m.id = ar.model_id
+		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
+		WHERE ar.state = 'draining'
+		  AND m.enabled = TRUE`)
+
+	for _, row := range rows {
+		drainTimeout := time.Duration(row.DrainTimeoutS) * time.Second
+		timeInDrain := time.Since(row.DrainStartAt)
+
+		// Stop the draining runtime when:
+		//   a) The drain timeout has elapsed (force stop).
+		//   b) ActiveConns is 0 AND at least 2 seconds have passed
+		//      (small buffer to avoid racing a request that just arrived).
+		shouldStop := timeInDrain >= drainTimeout || row.ActiveConns == 0 && timeInDrain >= 2*time.Second
+
+		if !shouldStop {
+			continue
+		}
+
+		r.log.Info("rolling replacement: drain complete — stopping old runtime",
+			zap.String("model", row.ModelName),
+			zap.String("runtime_id", row.ID),
+			zap.Duration("in_drain", timeInDrain),
+			zap.Int64("active_conns", row.ActiveConns),
+		)
+
+		r.stopDrainedRuntime(ctx, row.ID, row.ModelID, row.NodeID, row.ContainerID, row.TermGraceS)
+	}
+}
+
+// stopDrainedRuntime transitions a draining runtime to 'stopping' and
+// dispatches an UNLOAD_RUNTIME task.
+func (r *Reconciler) stopDrainedRuntime(ctx context.Context, runtimeID, modelID, nodeID, containerID string, termGraceS int) {
+	_, _ = r.db.ExecContext(ctx, `
+		UPDATE agent_runtimes
+		SET state = 'stopping', updated_at = NOW()
+		WHERE id = $1 AND state = 'draining'`, runtimeID)
+
+	payload := taskmanager.StopRuntimePayload{
+		RuntimeID:   runtimeID,
+		ContainerID: containerID,
+		DrainSecs:   termGraceS,
+	}
+	_, err := r.taskMgr.Enqueue(ctx, nodeID,
+		taskmanager.TaskUnloadRuntime, payload,
+		taskmanager.WithPriority(70),
+		taskmanager.WithActor("ha-reconciler-drain"),
+		taskmanager.WithRuntimeID(runtimeID),
+		taskmanager.WithIdempotencyKey(fmt.Sprintf("drain-stop:%s", runtimeID)),
+	)
+	if err != nil {
+		r.log.Warn("rolling replacement: failed to enqueue UNLOAD_RUNTIME for drained replica",
+			zap.String("runtime_id", runtimeID),
+			zap.Error(err),
+		)
+		// Rollback to draining so we retry next sweep.
+		_, _ = r.db.ExecContext(ctx, `
+			UPDATE agent_runtimes SET state = 'draining', updated_at = NOW()
+			WHERE id = $1 AND state = 'stopping'`, runtimeID)
+	}
+}
+
+// loadPlacementPolicy fetches the model's placement policy from DB.
+func (r *Reconciler) loadPlacementPolicy(ctx context.Context, modelID string) string {
+	var policy string
+	_ = r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(placement_policy, 'spread') FROM model_replica_specs WHERE model_id = $1`,
+		modelID,
+	).Scan(&policy)
+	if policy == "" {
+		return "spread"
+	}
+	return policy
+}
+
+// executeReturningID is like execute() but returns the new runtime's UUID.
+// Used by rolling replacement to link old→new runtime via replaced_by.
+func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatus, action ReconcileAction) (string, error) {
+	logID := uuid.New().String()
+
+	cfg, err := r.loadRuntimeConfig(ctx, action.ModelID)
+	if err != nil {
+		r.recordLog(ctx, logID, action, "", "failed", "loadRuntimeConfig: "+err.Error())
+		return "", err
+	}
+	if cfg.Image == "" {
+		r.recordLog(ctx, logID, action, "", "failed", "model has no runtime_image configured")
+		return "", fmt.Errorf("model %s has no runtime_image", action.ModelName)
+	}
+
+	port, err := r.allocatePort(ctx, action.TargetNode, action.ModelID)
+	if err != nil {
+		r.recordLog(ctx, logID, action, "", "failed", err.Error())
+		return "", err
+	}
+	bindHost := r.nodeIP(ctx, action.TargetNode)
+
+	runtimeID := uuid.New().String()
+	suffix := strings.Replace(runtimeID, "-", "", -1)[:6]
+	containerName := fmt.Sprintf("nexus-%s-r%d-%s", sanitize(cfg.ModelName), action.ReplicaIdx, suffix)
+
+	effectiveMode := r.resolveExecutionMode(ctx, action.TargetNode, cfg)
+	gpuDevicesJSON := "[]"
+	nGPULayers := cfg.NGPULayers
+	if effectiveMode == "cpu" {
+		nGPULayers = 0
+	}
+
+	tx, txErr := r.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if txErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		return "", fmt.Errorf("begin transaction: %w", txErr)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	maxSurge := status.MaxSurge
+	if maxSurge < 1 {
+		maxSurge = 1
+	}
+	slotAvailable, slotErr := replicaguard.ClaimSlot(ctx, tx, action.ModelID, status.DesiredReplicas, maxSurge)
+	if slotErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		return "", fmt.Errorf("claim_replica_slot: %w", slotErr)
+	}
+	if !slotAvailable {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.log.Info("rolling replacement: slot not available (surge limit reached)",
+			zap.String("model", action.ModelName),
+		)
+		return "", fmt.Errorf("surge limit reached for model %s", action.ModelName)
+	}
+
+	_, dbErr := tx.ExecContext(ctx, `
+		INSERT INTO agent_runtimes
+		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
+		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
+		   requested_mode, effective_mode, workload_policy,
+		   replica_index, recovery_attempt)
+		VALUES ($1,$2,NULL,$3,$4,$5,'pending',
+		        $6::jsonb,$7,$8,'',-1,
+		        $9,$10,$11,$12,1)`,
+		runtimeID, action.TargetNode, action.ModelID, containerName, cfg.Backend,
+		gpuDevicesJSON, bindHost, port,
+		cfg.ExecutionMode, effectiveMode, cfg.WorkloadPolicy,
+		action.ReplicaIdx,
+	)
+	if dbErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		return "", fmt.Errorf("insert runtime row: %w", dbErr)
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		return "", fmt.Errorf("commit runtime row: %w", commitErr)
+	}
+	committed = true
+
+	_, _ = r.db.ExecContext(ctx, `
+		UPDATE node_port_leases SET runtime_id = $1
+		WHERE node_id = $2 AND port = $3 AND released_at IS NULL`,
+		runtimeID, action.TargetNode, port,
+	)
+
+	modelsVolume := cfg.ModelsVolume
+	if modelsVolume == "" {
+		modelsVolume = "llamacpp_models"
+	}
+	ctxSize := cfg.CtxSize
+	if ctxSize == 0 {
+		ctxSize = 4096
+	}
+
+	payload := taskmanager.StartModelPayload{
+		RuntimeID:      runtimeID,
+		ModelID:        cfg.ModelID,
+		RuntimeName:    containerName,
+		Backend:        cfg.Backend,
+		Image:          cfg.Image,
+		ModelName:      cfg.ModelName,
+		ServedAs:       cfg.ModelName,
+		BindHost:       bindHost,
+		BindPort:       port,
+		GPUDevices:     nil,
+		MemoryLimit:    cfg.MemoryLimit,
+		CPULimit:       cfg.CPUThreads,
+		GGUFPath:       cfg.GGUFPath,
+		HFRepo:         cfg.HFRepo,
+		HFFile:         cfg.HFFile,
+		HFToken:        cfg.HFToken,
+		ModelsVolume:   modelsVolume,
+		CtxSize:        ctxSize,
+		NGPULayers:     nGPULayers,
+		TensorParallel: cfg.TensorParallel,
+		GPUMemoryUtil:  cfg.GPUMemoryUtil,
+		MaxModelLen:    cfg.MaxModelLen,
+		Dtype:          cfg.Dtype,
+		Quantization:   cfg.Quantization,
+		ExtraArgs:      cfg.ExtraArgs,
+		ExecutionMode:  effectiveMode,
+		WorkloadPolicy: cfg.WorkloadPolicy,
+		Env:            map[string]string{},
+	}
+	if cfg.HFToken != "" {
+		payload.Env["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
+	}
+
+	taskID, taskErr := r.taskMgr.Enqueue(ctx, action.TargetNode,
+		taskmanager.TaskStartModel, payload,
+		taskmanager.WithPriority(85),
+		taskmanager.WithActor("ha-reconciler-rolling"),
+		taskmanager.WithRuntimeID(runtimeID),
+		taskmanager.WithIdempotencyKey(fmt.Sprintf("ha-rolling:%s:%s:%s", action.ModelID, action.TargetNode, runtimeID)),
+	)
+	if taskErr != nil {
+		_, _ = r.db.ExecContext(ctx, `UPDATE agent_runtimes SET state='failed' WHERE id=$1`, runtimeID)
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		return "", fmt.Errorf("enqueue START_MODEL: %w", taskErr)
+	}
+
+	r.recordLog(ctx, logID, action, runtimeID, "success", action.Reason)
+	r.log.Info("rolling replacement: new replica started",
+		zap.String("model", action.ModelName),
+		zap.String("runtime_id", runtimeID),
+		zap.String("task_id", taskID),
+		zap.Int("port", port),
+	)
+	return runtimeID, nil
+}
+
 // their container has been running for more than the failure grace period.
 // This prevents the non-terminal count from being inflated by failed rows
 // and allows the reconciler to spawn fresh replacements.

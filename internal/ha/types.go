@@ -52,18 +52,29 @@ type ReplicaSpec struct {
 // ReplicaStatus is the live view of a model's replica health.
 // Read from the runtime_replica_status view.
 type ReplicaStatus struct {
-	ModelID          string `db:"model_id"          json:"model_id"`
-	ModelName        string `db:"model_name"         json:"model_name"`
-	DesiredReplicas  int    `db:"desired_replicas"   json:"desired_replicas"`
-	MinAvailable     int    `db:"min_available"      json:"min_available"`
-	PlacementPolicy  string `db:"placement_policy"   json:"placement_policy"`
-	AutoRecover      bool   `db:"auto_recover"       json:"auto_recover"`
-	ActiveReplicas   int    `db:"active_replicas"    json:"active_replicas"`
-	StartingReplicas int    `db:"starting_replicas"  json:"starting_replicas"`
-	IdleReplicas     int    `db:"idle_replicas"      json:"idle_replicas"`
-	LostReplicas     int    `db:"lost_replicas"      json:"lost_replicas"`
-	NodeCount        int    `db:"node_count"         json:"node_count"`
-	HAStatus         string `db:"ha_status"          json:"ha_status"` // healthy|degraded|unavailable
+	ModelID         string `db:"model_id"          json:"model_id"`
+	ModelName       string `db:"model_name"         json:"model_name"`
+	DesiredReplicas int    `db:"desired_replicas"   json:"desired_replicas"`
+	MinAvailable    int    `db:"min_available"      json:"min_available"`
+	PlacementPolicy string `db:"placement_policy"   json:"placement_policy"`
+	AutoRecover     bool   `db:"auto_recover"       json:"auto_recover"`
+
+	// Rolling replacement config (from model_replica_specs via view).
+	MaxSurge                 int `db:"max_surge"                     json:"max_surge"`
+	HealthRetryIntervalS     int `db:"health_retry_interval_s"       json:"health_retry_interval_s"`
+	ReplacementStartTimeoutS int `db:"replacement_start_timeout_s"   json:"replacement_start_timeout_s"`
+	DrainTimeoutS            int `db:"drain_timeout_s"               json:"drain_timeout_s"`
+	TerminationGraceS        int `db:"termination_grace_s"           json:"termination_grace_s"`
+
+	// Live counts from agent_runtimes.
+	ActiveReplicas    int    `db:"active_replicas"    json:"active_replicas"`
+	StartingReplicas  int    `db:"starting_replicas"  json:"starting_replicas"`
+	IdleReplicas      int    `db:"idle_replicas"      json:"idle_replicas"`
+	UnhealthyReplicas int    `db:"unhealthy_replicas" json:"unhealthy_replicas"`
+	DrainingReplicas  int    `db:"draining_replicas"  json:"draining_replicas"`
+	LostReplicas      int    `db:"lost_replicas"      json:"lost_replicas"`
+	NodeCount         int    `db:"node_count"         json:"node_count"`
+	HAStatus          string `db:"ha_status"        json:"ha_status"` // healthy|degraded|unavailable
 }
 
 // RecoveryLogEntry records a single recovery action.

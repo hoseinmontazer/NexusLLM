@@ -170,27 +170,36 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	}
 
 	// ── Immediately disable and remove DOWN endpoints from routing ─────────
-	// When an endpoint is definitively down (circuit breaker fired), set
-	// is_enabled=FALSE in DB so the next registry.Reload() drops it entirely.
-	// This is faster than waiting for the node health monitor's 5-min timeout.
-	// Also mark the agent_runtime row as 'failed' so the stuck-runtime sweeper
-	// and the lazy-load activator know to restart the container.
+	// When an endpoint is definitively down (circuit breaker fired), mark the
+	// runtime as 'unhealthy' so the reconciler can start a rolling replacement
+	// instead of immediately stopping the container.
 	//
-	// IMPORTANT: only update agent_runtimes rows that EXPLICITLY reference this
-	// endpoint_id. Never use model_id to fan-out. HA replicas have endpoint_id=NULL
-	// and their liveness is determined by container health, not by endpoint rows.
+	// Critical distinction:
+	//   - 'unhealthy' = health check failed; container may still be running and
+	//     serving in-flight requests. The reconciler will spawn a replacement
+	//     and only drain+stop this runtime AFTER the replacement is READY.
+	//   - 'failed'    = terminal; container has definitely exited or timed out.
+	//
+	// Gateway routing: the pool's IsAvailable() returns false for StatusDown,
+	// so the unhealthy endpoint stops receiving NEW requests immediately.
+	// In-flight requests that already started will complete (connection is not
+	// torn down — the proxy holds a long-lived response stream).
+	//
+	// Only update model_endpoints rows (not HA agent_runtime replicas with NULL
+	// endpoint_id — those are managed exclusively by the rolling reconciler).
 	if result.Status == StatusDown {
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE model_endpoints
 			SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
 			WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
 
-		// Only mark runtimes explicitly linked to this endpoint via endpoint_id.
-		// HA replicas (endpoint_id IS NULL) are intentionally excluded here.
+		// Transition to 'unhealthy' so the reconciler can perform a safe rolling
+		// replacement. Only update runtimes explicitly linked to this endpoint.
+		// HA replicas (endpoint_id IS NULL) are handled separately.
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE agent_runtimes
-			SET state     = 'failed',
-			    error_msg = 'health check failed 3 consecutive times — container may be gone',
+			SET state     = 'unhealthy',
+			    error_msg = 'health check failed 3 consecutive times',
 			    updated_at = NOW()
 			WHERE endpoint_id = $1
 			  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,

@@ -29,6 +29,7 @@ package runtimemgr
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
@@ -197,6 +199,17 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 		}
 		// Registry stale — fall through to wait.
 
+	case StateUnhealthy, StateDraining:
+		// Rolling replacement is in progress.
+		// Don't spawn another container — the reconciler is already handling it.
+		// Just wait for the replacement to become READY.
+		a.log.Info("model runtime is unhealthy/draining — rolling replacement in progress, waiting",
+			zap.String("model", modelName),
+			zap.String("state", string(state)),
+		)
+		// Fall through to waitForReady — it will pick up the replacement replica
+		// once the reconciler promotes it to 'ready'.
+
 	case StateCreated, StateLoadingModel, StateStarting, StateValidating, StateDownloading, StateWaitingReady:
 		// A START_MODEL task is already in flight.
 		// Stale detection: check how long ago the runtime entered its CURRENT state.
@@ -231,7 +244,7 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 			)
 			_, _ = a.db.ExecContext(ctx,
 				`UPDATE agent_runtimes SET state='failed', error_msg='startup stalled — gateway reset', container_id='', updated_at=NOW() WHERE id=$1`, rt.ID)
-			if err := a.enqueueStartModel(ctx, cfg); err != nil {
+			if err := a.enqueueStartModel(ctx, cfg); err != nil && err != replicaguard.ErrAtCapacity {
 				return nil, err
 			}
 		} else {
@@ -250,7 +263,9 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 		// StateUnknown, StateNotRegistered, StateStopped, StateFailed, StateLost —
 		// all trigger a fresh START_MODEL.  The node agent handles downloading
 		// if needed and always recreates the container from scratch.
-		if err := a.enqueueStartModel(ctx, cfg); err != nil {
+		// ErrAtCapacity means a concurrent caller already holds the slot — fall
+		// through to waitForReady to pick up that runtime instead.
+		if err := a.enqueueStartModel(ctx, cfg); err != nil && err != replicaguard.ErrAtCapacity {
 			return nil, err
 		}
 	}
@@ -265,7 +280,7 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 				zap.String("model", modelName),
 				zap.Error(waitErr),
 			)
-			if startErr := a.enqueueStartModel(ctx, cfg); startErr != nil {
+			if startErr := a.enqueueStartModel(ctx, cfg); startErr != nil && startErr != replicaguard.ErrAtCapacity {
 				return nil, startErr
 			}
 			return a.waitForReady(ctx, cfg, startTime)
@@ -300,7 +315,13 @@ func (a *RuntimeActivator) StartModel(ctx context.Context, modelName string) err
 			modelName,
 		)
 	}
-	return a.enqueueStartModel(ctx, cfg)
+	err = a.enqueueStartModel(ctx, cfg)
+	if err == replicaguard.ErrAtCapacity {
+		// Another process already holds the slot — this is not an error for
+		// callers like the idle manager that don't wait for readiness.
+		return nil
+	}
+	return err
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,16 +392,63 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		  )`,
 		cfg.ModelID, cfg.NodeID)
 
+	workloadPolicy := cfg.WorkloadPolicy
+	if workloadPolicy == "" {
+		workloadPolicy = "lazy_load" // default for LLMs
+	}
+
+	gpuIDsJSON := func() string {
+		b, _ := json.Marshal(gpuDevices)
+		return string(b)
+	}()
+
+	// ── Atomic replica-slot guard ──────────────────────────────────────────
+	// Wrap the INSERT in a transaction that holds a per-model advisory lock
+	// (via claim_replica_slot) so concurrent activator/reconciler calls cannot
+	// both insert a row when the model is already at capacity.
+	//
+	// desired_replicas defaults to 1 so single-instance models (the common
+	// case) are also protected — a second EnsureRunning call arriving while the
+	// first is in LOADING_MODEL will see count=1 >= desired=1 and abort,
+	// instead of creating a second container.
+	desired, err := replicaguard.DesiredReplicas(ctx, a.db, cfg.ModelID)
+	if err != nil {
+		a.log.Warn("enqueueStartModel: could not fetch desired_replicas — defaulting to 1",
+			zap.String("model", cfg.ModelName), zap.Error(err))
+		desired = 1
+	}
+
+	tx, err := a.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin tx for replica guard: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	slotOK, slotErr := replicaguard.ClaimSlot(ctx, tx, cfg.ModelID, desired)
+	if slotErr != nil {
+		return fmt.Errorf("claim_replica_slot: %w", slotErr)
+	}
+	if !slotOK {
+		a.log.Info("enqueueStartModel: model already at capacity — skipping new row",
+			zap.String("model", cfg.ModelName),
+			zap.Int("desired", desired),
+		)
+		// Return nil — a concurrent caller already has the slot; doStartModel's
+		// waitForReady will pick up the existing runtime.
+		return replicaguard.ErrAtCapacity
+	}
+
 	// Insert new runtime row starting at state="pending".
 	// We do NOT use ON CONFLICT DO NOTHING here — if the insert produces zero
 	// rows (e.g. no matching model_endpoints row) we must detect that and fail
 	// with a clear error rather than silently orphaning runtimeID (which would
 	// cause an FK violation when the task references it).
-	workloadPolicy := cfg.WorkloadPolicy
-	if workloadPolicy == "" {
-		workloadPolicy = "lazy_load" // default for LLMs
-	}
-	res, err := a.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
@@ -395,10 +463,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		LIMIT 1`,
 		runtimeID, cfg.NodeID, cfg.ModelID, containerName,
 		cfg.CPUSetCPUs, cfg.NUMANode,
-		func() string {
-			b, _ := json.Marshal(gpuDevices)
-			return string(b)
-		}(),
+		gpuIDsJSON,
 		backend,
 		requestedMode,
 		effectiveMode,
@@ -418,6 +483,11 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 			cfg.ModelName, cfg.ModelID,
 		)
 	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		return fmt.Errorf("commit runtime row: %w", commitErr)
+	}
+	committed = true
 
 	payload := taskmanager.StartModelPayload{
 		RuntimeID:      runtimeID,
@@ -759,6 +829,8 @@ func (a *RuntimeActivator) loadRuntime(ctx context.Context, modelID, nodeID stri
 		    WHEN 'waiting_ready' THEN 3
 		    WHEN 'starting'      THEN 4
 		    WHEN 'pending'       THEN 5
+		    WHEN 'unhealthy'     THEN 8
+		    WHEN 'draining'      THEN 8
 		    ELSE 9
 		  END ASC,
 		  ar.updated_at DESC
@@ -997,6 +1069,10 @@ func (a *RuntimeActivator) deriveState(rt *agentRuntime) State {
 			return StateUnknown
 		}
 		return StateStopped
+	case "unhealthy":
+		return StateUnhealthy
+	case "draining":
+		return StateDraining
 	case "failed":
 		return StateFailed
 	case "lost":

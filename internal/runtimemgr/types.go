@@ -95,6 +95,18 @@ const (
 	// timeout exceeded, or fatal runtime error detected in logs.
 	StateFailed State = "failed"
 
+	// StateUnhealthy — health check failed repeatedly; rolling replacement
+	// has been (or is about to be) triggered by the HA reconciler.
+	// The container may still be running and serving in-flight requests.
+	// Gateway will not route NEW requests to an unhealthy endpoint.
+	StateUnhealthy State = "unhealthy"
+
+	// StateDraining — rolling replacement is READY; this runtime is finishing
+	// in-flight requests and will be stopped after the drain timeout expires
+	// or active connections drop to zero.
+	// Gateway does not route any new requests to a draining endpoint.
+	StateDraining State = "draining"
+
 	// StateLost — node went offline while container was running.  Transitions to
 	// StateCreated when the node comes back online and StartModel() is retried.
 	StateLost State = "lost"

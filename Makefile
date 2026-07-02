@@ -2,7 +2,7 @@
         run-gateway run-admin run-scheduler run-nodeagent run-web web-install \
         docker-build docker-push docker-build-web \
         test lint \
-        migrate migrate-external migrate-dry \
+        migrate migrate-external migrate-dry _check-dsn _run-migration-external \
         dev-up dev-up-gpu dev-down \
         generate-key \
         placement-simulate node-status \
@@ -15,10 +15,26 @@ REGISTRY   ?= registry.internal/nexusllm
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GO_FLAGS   := -ldflags="-w -s -X main.Version=$(VERSION)"
 
-# Helper: run a migration file inside the running postgres container
+# Helper: run one migration inside the running postgres container.
+# Suppresses routine DDL noise but shows real errors.
 define run_migration
-	docker compose exec -T postgres psql -U nexus -d nexusllm -f /migrations/$(1) 2>&1 | \
-	  grep -vE "^(COMMIT|BEGIN|ALTER TABLE|CREATE INDEX|DO|INSERT 0|$$)" || true
+	docker compose exec -T postgres psql -U nexus -d nexusllm \
+	  -v ON_ERROR_STOP=1 \
+	  -f /migrations/$(1) 2>&1 | \
+	  grep -vE "^(COMMIT|BEGIN|ALTER TABLE|ALTER|CREATE INDEX|CREATE|DROP|DO|INSERT 0|NOTICE|SET|$$)" || true
+endef
+
+# Internal: run one SQL file against an external DB using a Docker psql client.
+# Avoids requiring psql to be installed on the build machine.
+define run_migration_external
+	@echo "  → migrations/$(1)"
+	@docker run --rm \
+	  --network host \
+	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  -v "$(CURDIR)/migrations:/migrations:ro" \
+	  postgres:15-alpine \
+	  psql "$(DB_DSN)" -f /migrations/$(1) -v ON_ERROR_STOP=1 \
+	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|$$)" || true
 endef
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,59 +146,23 @@ docker-push: docker-build
 # ─────────────────────────────────────────────────────────────────────────────
 # Database migrations
 # All migration files are idempotent — safe to re-run at any time.
+# Files are applied in lexicographic sort order (the same order ls -1 returns).
+# Adding a new migration file is all that's needed — the Makefile picks it up
+# automatically on the next run.
 # ─────────────────────────────────────────────────────────────────────────────
 migrate:
 	@echo "→ Waiting for postgres..."
 	@until docker compose exec -T postgres pg_isready -U nexus -d nexusllm > /dev/null 2>&1; \
-	  do echo "  waiting..."; sleep 2; done
-	@echo "→ 001 initial schema"
-	$(call run_migration,001_initial.sql)
-	@echo "→ 002 seed data"
-	$(call run_migration,002_seed_data.sql)
-	@echo "→ 003 runtime layer"
-	$(call run_migration,003_runtime_layer.sql)
-	@echo "→ 004 single-GPU runtime seed"
-	$(call run_migration,004_single_gpu_runtime_seed.sql)
-	@echo "→ 005 AI platform schema"
-	$(call run_migration,005_ai_platform.sql)
-	@echo "→ 006 H200 platform seed"
-	$(call run_migration,006_h200_platform_seed.sql)
-	@echo "→ 007 agent tasks + runtimes"
-	$(call run_migration,007_agent_tasks.sql)
-	@echo "→ 008 node model cache"
-	$(call run_migration,008_node_model_cache.sql)
-	@echo "→ 009 resilience & lifecycle"
-	$(call run_migration,009_resilience.sql)
-	@echo "→ 010 lazy-load runtime manager"
-	$(call run_migration,010_lazy_runtime.sql)
-	@echo "→ 011 projects, preemption, deployment queue"
-	$(call run_migration,011_projects.sql)
-	@echo "→ 011b runtime config GPU"
-	$(call run_migration,011_runtime_config_gpu.sql)
-	@echo "→ 012 unified startup states"
-	$(call run_migration,012_unified_startup_states.sql)
-	@echo "→ 013 START_MODEL task type"
-	$(call run_migration,013_start_model_task_type.sql)
-	@echo "→ 014 execution mode"
-	$(call run_migration,014_execution_mode.sql)
-	@echo "→ 015 catchup schema"
-	$(call run_migration,015_catchup_schema.sql)
-	@echo "→ 016 workload policy"
-	$(call run_migration,016_workload_policy.sql)
-	@echo "→ 017 scheduler tables"
-	$(call run_migration,017_scheduler.sql)
-	@echo "→ 018 weighted priority"
-	$(call run_migration,018_weighted_priority.sql)
-	@echo "→ 019 HA replicas"
-	$(call run_migration,019_ha_replicas.sql)
-	@echo "→ 020 port allocator"
-	$(call run_migration,020_port_allocator.sql)
-	@echo "→ 021 missing columns"
-	$(call run_migration,021_missing_columns.sql)
-	@echo "→ 022 project API keys"
-	$(call run_migration,022_project_api_keys.sql)
-	@echo "→ 023 project policies & usage rollups"
-	$(call run_migration,023_project_policies.sql)
+	  do printf '.'; sleep 2; done; echo ""
+	@echo "→ Copying migrations into container..."
+	@docker compose cp migrations/. postgres:/migrations/
+	@echo "→ Applying all migrations in order..."
+	@for f in $$(ls migrations/*.sql | sort -V | xargs -n1 basename); do \
+	  echo "  → $$f"; \
+	  docker compose exec -T postgres psql -U nexus -d nexusllm \
+	    -v ON_ERROR_STOP=1 -f /migrations/$$f \
+	    2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|$$)" || true; \
+	done
 	@echo "✓ All migrations complete"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,79 +181,74 @@ migrate:
 #   make migrate-external DB_DSN="postgres://nexus:nexus@192.168.0.200:5540/nexusllm"
 #   make migrate-dry   # list files without connecting
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# External DB migrations
+# Use when postgres is NOT running in docker-compose (e.g. RDS, CloudSQL,
+# managed Postgres, or a separate server).
+#
+# Required env var:
+#   DB_DSN — full Postgres connection string
+#            postgres://user:pass@host:5432/nexusllm?sslmode=require
+#
+# Works without a local psql install — uses the Docker postgres image as the
+# psql client. All migration files in migrations/ are applied in sort order.
+#
+# Usage:
+#   make migrate-external DB_DSN="postgres://nexus:secret@10.0.0.5:5432/nexusllm"
+#   make migrate-dry                          # list files without connecting
+# ─────────────────────────────────────────────────────────────────────────────
 DB_DSN ?=
 
-# Internal: run one SQL file against external DB using Docker psql client.
-# Avoids requiring psql to be installed on the build machine.
-define run_migration_external
-	@echo "  → migrations/$(1)"
+_check-dsn:
+	@test -n "$(DB_DSN)" || { \
+	  echo ""; \
+	  echo "ERROR: DB_DSN is required."; \
+	  echo ""; \
+	  echo "  Usage: make migrate-external DB_DSN=\"postgres://user:pass@host:5432/db\""; \
+	  echo ""; \
+	  exit 1; }
+
+migrate-external: _check-dsn
+	@echo "→ Migrating external DB: $(DB_DSN)"
+	@echo "  Using Docker postgres:15-alpine client (no local psql required)"
+	@echo "  Testing connection..."
+	@docker run --rm --network host \
+	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  postgres:15-alpine \
+	  psql "$(DB_DSN)" -c "SELECT version();" -t 2>&1 | grep -q "PostgreSQL" \
+	  || { echo "ERROR: Cannot connect. Check DB_DSN and network access."; exit 1; }
+	@echo "  ✓ Connected"
+	@for f in $$(ls migrations/*.sql | sort -V | xargs -n1 basename); do \
+	  $(MAKE) --no-print-directory _run-migration-external FILE=$$f DB_DSN="$(DB_DSN)"; \
+	done
+	@echo "✓ All migrations complete on external DB"
+
+# Internal target — run a single file against external DB.
+# Called by the loop in migrate-external; not intended for direct use.
+_run-migration-external:
+	@echo "  → migrations/$(FILE)"
 	@docker run --rm \
 	  --network host \
 	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
 	  -v "$(CURDIR)/migrations:/migrations:ro" \
 	  postgres:15-alpine \
-	  psql "$(DB_DSN)" -f /migrations/$(1) -v ON_ERROR_STOP=1 \
-	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|$$)" || true
-endef
-
-_check-dsn:
-	@test -n "$(DB_DSN)" || { echo ""; echo "ERROR: DB_DSN is required."; echo ""; echo "  Usage: make migrate-external DB_DSN=\"postgres://user:pass@host:5432/db\""; echo ""; exit 1; }
-
-migrate-external: _check-dsn
-	@echo "→ Migrating external DB: $(DB_DSN)"
-	@echo "  Using Docker postgres client (no local psql required)"
-	@echo "  Testing connection..."
-	@docker run --rm \
-	  --network host \
-	  postgres:15-alpine \
-	  psql "$(DB_DSN)" -c "SELECT version();" -t 2>&1 | grep -q "PostgreSQL" \
-	  || { echo "ERROR: Cannot connect to database. Check DB_DSN and network access."; exit 1; }
-	@echo "  ✓ Connected"
-	$(call run_migration_external,001_initial.sql)
-	$(call run_migration_external,002_seed_data.sql)
-	$(call run_migration_external,003_runtime_layer.sql)
-	$(call run_migration_external,004_single_gpu_runtime_seed.sql)
-	$(call run_migration_external,005_ai_platform.sql)
-	$(call run_migration_external,005_enterprise_platform.sql)
-	$(call run_migration_external,006_controller_columns.sql)
-	$(call run_migration_external,006_h200_platform_seed.sql)
-	$(call run_migration_external,007_agent_tasks.sql)
-	$(call run_migration_external,008_node_model_cache.sql)
-	$(call run_migration_external,009_resilience.sql)
-	$(call run_migration_external,010_lazy_runtime.sql)
-	$(call run_migration_external,011_projects.sql)
-	$(call run_migration_external,011_runtime_config_gpu.sql)
-	$(call run_migration_external,012_unified_startup_states.sql)
-	$(call run_migration_external,013_start_model_task_type.sql)
-	$(call run_migration_external,014_execution_mode.sql)
-	$(call run_migration_external,015_catchup_schema.sql)
-	$(call run_migration_external,016_workload_policy.sql)
-	$(call run_migration_external,017_scheduler.sql)
-	$(call run_migration_external,018_weighted_priority.sql)
-	$(call run_migration_external,018b_catchup_weighted.sql)
-	$(call run_migration_external,018b_weighted_priority_fixup.sql)
-	$(call run_migration_external,019_ha_replicas.sql)
-	$(call run_migration_external,020_port_allocator.sql)
-	$(call run_migration_external,021_missing_columns.sql)
-	$(call run_migration_external,022_project_api_keys.sql)
-	$(call run_migration_external,023_project_policies.sql)
-	$(call run_migration_external,024_placement_v2.sql)
-	$(call run_migration_external,025_placement_labels.sql)
-	$(call run_migration_external,026_extra_args.sql)
-	$(call run_migration_external,027_thinking_mode.sql)
-	@echo "✓ All migrations complete on external DB"
+	  psql "$(DB_DSN)" -f /migrations/$(FILE) -v ON_ERROR_STOP=1 \
+	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|$$)" || true
 
 # Dry-run: print the SQL files that would be applied without connecting
 migrate-dry:
-	@echo "→ Migrations that would be applied (dry-run):"
-	@for f in $$(ls migrations/*.sql | sort); do echo "  $$f"; done
+	@echo "→ Migrations that would be applied (in order):"
+	@for f in $$(ls migrations/*.sql | sort -V); do echo "  $$f"; done
 	@echo ""
 	@echo "To run against an external DB:"
 	@echo "  make migrate-external DB_DSN=\"postgres://user:pass@host:5432/nexusllm\""
 	@echo ""
+	@echo "To run against local docker-compose postgres:"
+	@echo "  make migrate"
+	@echo ""
 	@echo "To run a single migration manually:"
 	@echo "  docker run --rm --network host -v \$$(pwd)/migrations:/m postgres:15-alpine \\"
-	@echo "    psql \"\$$DB_DSN\" -f /m/023_project_policies.sql"
+	@echo "    psql \"\$$DB_DSN\" -f /m/029_rolling_replacement.sql"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local dev stack
