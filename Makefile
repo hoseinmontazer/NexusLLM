@@ -133,7 +133,7 @@ docker-build:
 	docker build -f Dockerfile.gateway  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/gateway:$(VERSION)   .
 	docker build -f Dockerfile.admin    --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/admin:$(VERSION)     .
 	docker build -f Dockerfile.scheduler  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000 -t $(REGISTRY)/scheduler:$(VERSION) .
-	docker build -f Dockerfile.nodeagent  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000-t $(REGISTRY)/nodeagent:$(VERSION) .
+# 	docker build -f Dockerfile.nodeagent  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000-t $(REGISTRY)/nodeagent:$(VERSION) .
 	docker build -f Dockerfile.web      --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/web:$(VERSION)       .
 
 docker-push: docker-build
