@@ -78,21 +78,16 @@ CREATE INDEX IF NOT EXISTS idx_node_health_node_time
 ALTER TABLE agent_runtimes DROP CONSTRAINT IF EXISTS agent_runtimes_state_check;
 ALTER TABLE agent_runtimes ADD CONSTRAINT agent_runtimes_state_check
     CHECK (state IN (
-        'pending',    -- task dispatched, not yet started
-        'pulling',    -- pulling model weights
-        'starting',   -- container starting
-        'loading',    -- model loading into VRAM
-        'warm',       -- loaded, ready
-        'active',     -- actively serving requests
-        'idle',       -- loaded but no recent traffic
-        'unhealthy',  -- health check failed but container running
-        'stopping',   -- drain in progress
-        'stopped',    -- container stopped cleanly
-        'unloaded',   -- weights evicted
-        'failed',     -- error during start/load
-        'lost',       -- node went OFFLINE while runtime was running
-        'archived',   -- administratively archived
-        'deleted'     -- fully removed
+        -- original / legacy states
+        'pending', 'pulling', 'starting', 'loading', 'warm', 'active', 'idle',
+        'stopping', 'stopped', 'unloaded', 'failed', 'lost', 'archived', 'deleted',
+        -- unified startup pipeline states (added by later migrations — included here
+        -- so the constraint never rejects rows written by newer code paths)
+        'created', 'validating', 'downloading', 'loading_model', 'waiting_ready', 'ready',
+        -- HA recovery
+        'recovering',
+        -- rolling replacement
+        'unhealthy', 'draining'
     ));
 
 -- ─────────────────────────────────────────────────────────────────────────────

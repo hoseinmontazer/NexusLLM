@@ -50,14 +50,22 @@ CREATE INDEX IF NOT EXISTS idx_agent_runtimes_state_last_used
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. Extend agent_runtimes state constraint to include lazy-load states
 -- ─────────────────────────────────────────────────────────────────────────────
--- Migration 009 already extended this; we add 'downloading' for the
--- runtimemgr's PULL_MODEL-in-progress state.
+-- Uses the full cumulative list so re-running on an already-migrated database
+-- never rejects existing rows written by later migrations.
 ALTER TABLE agent_runtimes DROP CONSTRAINT IF EXISTS agent_runtimes_state_check;
 ALTER TABLE agent_runtimes ADD CONSTRAINT agent_runtimes_state_check
     CHECK (state IN (
-        'pending','pulling','starting','loading','warm','active','idle',
-        'unhealthy','stopping','stopped','unloaded','failed',
-        'lost','archived','deleted','downloading'
+        -- original / legacy
+        'pending', 'pulling', 'starting', 'loading', 'warm', 'active', 'idle',
+        'unhealthy', 'stopping', 'stopped', 'unloaded', 'failed', 'lost', 'archived', 'deleted',
+        -- lazy-load (this migration)
+        'downloading',
+        -- unified startup pipeline (012)
+        'created', 'validating', 'loading_model', 'waiting_ready', 'ready',
+        -- HA recovery (019)
+        'recovering',
+        -- rolling replacement (029)
+        'draining'
     ));
 
 COMMIT;

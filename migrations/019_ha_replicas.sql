@@ -58,8 +58,9 @@ ALTER TABLE agent_runtimes ADD CONSTRAINT agent_runtimes_state_check
         'loading_model', 'waiting_ready', 'ready',
         'idle', 'stopping', 'stopped',
         'pending', 'pulling', 'loading', 'warm', 'active',
-        'unhealthy', 'failed', 'unloaded', 'lost', 'archived', 'deleted',
-        'recovering'   -- replica lost and recovery has been triggered
+        'unhealthy', 'draining',
+        'failed', 'unloaded', 'lost', 'archived', 'deleted',
+        'recovering'
     ));
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -102,8 +103,12 @@ INSERT INTO reconciler_state (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 6. REPLICA STATUS VIEW (live desired vs actual reconciliation view)
+-- DROP first: migration 029 extended this view with extra columns. When
+-- migrations are re-run on an existing DB, CREATE OR REPLACE fails with
+-- "cannot drop columns from view" if the existing view has more columns.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW runtime_replica_status AS
+DROP VIEW IF EXISTS runtime_replica_status CASCADE;
+CREATE VIEW runtime_replica_status AS
 SELECT
     m.id                                                    AS model_id,
     m.name                                                  AS model_name,

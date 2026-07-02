@@ -157,7 +157,7 @@ migrate:
 	@echo "→ Copying migrations into container..."
 	@docker compose cp migrations/. postgres:/migrations/
 	@echo "→ Applying all migrations in order..."
-	@for f in $$(ls migrations/*.sql | sort -V | xargs -n1 basename); do \
+	@for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort | xargs -n1 basename); do \
 	  echo "  → $$f"; \
 	  docker compose exec -T postgres psql -U nexus -d nexusllm \
 	    -v ON_ERROR_STOP=1 -f /migrations/$$f \
@@ -165,22 +165,6 @@ migrate:
 	done
 	@echo "✓ All migrations complete"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# External DB migrations
-# Use these when postgres is NOT running in docker-compose (e.g. RDS, CloudSQL,
-# managed Postgres, or a separate server).
-#
-# Required env var:
-#   DB_DSN  — full Postgres connection string
-#             postgres://user:pass@host:5432/nexusllm?sslmode=require
-#
-# Works even without local psql — uses Docker postgres image as psql client.
-#
-# Usage:
-#   make migrate-external DB_DSN="postgres://nexus:secret@10.0.0.5:5432/nexusllm"
-#   make migrate-external DB_DSN="postgres://nexus:nexus@192.168.0.200:5540/nexusllm"
-#   make migrate-dry   # list files without connecting
-# ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # External DB migrations
 # Use when postgres is NOT running in docker-compose (e.g. RDS, CloudSQL,
@@ -210,35 +194,55 @@ _check-dsn:
 
 migrate-external: _check-dsn
 	@echo "→ Migrating external DB: $(DB_DSN)"
-	@echo "  Using Docker postgres:15-alpine client (no local psql required)"
-	@echo "  Testing connection..."
+	@echo "  Using Docker postgres:15-alpine psql client (no local psql required)"
+	@echo ""
+	@echo "  Testing connection (10s timeout)..."
 	@docker run --rm --network host \
-	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  -e PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  -e PGCONNECT_TIMEOUT=10 \
 	  postgres:15-alpine \
-	  psql "$(DB_DSN)" -c "SELECT version();" -t 2>&1 | grep -q "PostgreSQL" \
-	  || { echo "ERROR: Cannot connect. Check DB_DSN and network access."; exit 1; }
+	  psql "$(DB_DSN)" \
+	    --no-password \
+	    -c "SELECT 1;" \
+	    -t -q \
+	  > /dev/null 2>&1 \
+	  || { echo ""; echo "ERROR: Cannot connect to $(DB_DSN)"; echo "       Check DB_DSN, network, and credentials."; echo ""; exit 1; }
 	@echo "  ✓ Connected"
-	@for f in $$(ls migrations/*.sql | sort -V | xargs -n1 basename); do \
-	  $(MAKE) --no-print-directory _run-migration-external FILE=$$f DB_DSN="$(DB_DSN)"; \
+	@echo ""
+	@PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')"; \
+	for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort | xargs -n1 basename); do \
+	  echo "  → $$f"; \
+	  docker run --rm \
+	    --network host \
+	    -e PGPASSWORD="$$PGPASSWORD" \
+	    -e PGCONNECT_TIMEOUT=10 \
+	    -v "$(CURDIR)/migrations:/migrations:ro" \
+	    postgres:15-alpine \
+	    psql "$(DB_DSN)" \
+	      --no-password \
+	      -v ON_ERROR_STOP=1 \
+	      -f /migrations/$$f \
+	    2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true; \
 	done
+	@echo ""
 	@echo "✓ All migrations complete on external DB"
 
-# Internal target — run a single file against external DB.
-# Called by the loop in migrate-external; not intended for direct use.
+# Internal target kept for backward compat but no longer used by the loop above.
 _run-migration-external:
-	@echo "  → migrations/$(FILE)"
-	@docker run --rm \
+	@PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')"; \
+	docker run --rm \
 	  --network host \
-	  -e PGPASSWORD="$$(echo $(DB_DSN) | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')" \
+	  -e PGPASSWORD="$$PGPASSWORD" \
+	  -e PGCONNECT_TIMEOUT=10 \
 	  -v "$(CURDIR)/migrations:/migrations:ro" \
 	  postgres:15-alpine \
-	  psql "$(DB_DSN)" -f /migrations/$(FILE) -v ON_ERROR_STOP=1 \
-	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|$$)" || true
+	  psql "$(DB_DSN)" --no-password -v ON_ERROR_STOP=1 -f /migrations/$(FILE) \
+	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true
 
 # Dry-run: print the SQL files that would be applied without connecting
 migrate-dry:
 	@echo "→ Migrations that would be applied (in order):"
-	@for f in $$(ls migrations/*.sql | sort -V); do echo "  $$f"; done
+	@for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort); do echo "  $$f"; done
 	@echo ""
 	@echo "To run against an external DB:"
 	@echo "  make migrate-external DB_DSN=\"postgres://user:pass@host:5432/nexusllm\""

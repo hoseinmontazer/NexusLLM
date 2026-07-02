@@ -58,11 +58,17 @@ ALTER TABLE model_replica_specs
     ADD COLUMN IF NOT EXISTS termination_grace_s      INTEGER NOT NULL DEFAULT 15;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 4. Update runtime_replica_status view
---    Add:  draining_replicas, unhealthy_replicas
---    Expose: max_surge, drain_timeout_s, health_retry_interval_s
+-- 4. Rebuild runtime_replica_status view
+--    Adds: draining_replicas, unhealthy_replicas, max_surge, drain_timeout_s,
+--          health_retry_interval_s, replacement_start_timeout_s, termination_grace_s
+--
+--    PostgreSQL's CREATE OR REPLACE VIEW cannot reorder or insert columns before
+--    existing ones. We must DROP and recreate. The view is SELECT-only (no rules,
+--    triggers, or other views depend on it), so DROP ... CASCADE is safe.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW runtime_replica_status AS
+DROP VIEW IF EXISTS runtime_replica_status CASCADE;
+
+CREATE VIEW runtime_replica_status AS
 SELECT
     m.id                                                    AS model_id,
     m.name                                                  AS model_name,

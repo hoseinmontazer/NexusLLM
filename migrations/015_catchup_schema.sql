@@ -46,7 +46,9 @@ ALTER TABLE agent_runtimes ADD CONSTRAINT agent_runtimes_state_check
         'loading_model', 'waiting_ready', 'ready',
         'idle', 'stopping', 'stopped',
         'pending', 'pulling', 'loading', 'warm', 'active',
-        'unhealthy', 'failed', 'unloaded', 'lost', 'archived', 'deleted'
+        'unhealthy', 'draining',
+        'failed', 'unloaded', 'lost', 'archived', 'deleted',
+        'recovering'
     ));
 
 -- ── agent_tasks task_type constraint — include START_MODEL ────────────────────

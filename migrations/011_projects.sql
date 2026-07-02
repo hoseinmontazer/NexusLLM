@@ -170,8 +170,11 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 9. PROJECT ANALYTICS VIEW
 -- Convenience view for the analytics API — joins preemption + usage counts.
+-- DROP first: CREATE OR REPLACE cannot change the column list when the view
+-- was previously created with a different set of columns.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW project_runtime_summary AS
+DROP VIEW IF EXISTS project_runtime_summary CASCADE;
+CREATE VIEW project_runtime_summary AS
 SELECT
     p.id                                                 AS project_id,
     p.name                                               AS project_name,

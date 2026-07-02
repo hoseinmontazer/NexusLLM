@@ -36,13 +36,17 @@ ALTER TABLE agent_runtimes ADD CONSTRAINT agent_runtimes_state_check
         'loading',       -- old "loading_model" equivalent
         'warm',          -- old "ready/idle" equivalent
         'active',        -- old "ready" equivalent
-        -- Error / terminal states
+        -- Rolling replacement (029)
         'unhealthy',
+        'draining',
+        -- Error / terminal states
         'failed',
         'unloaded',
         'lost',
         'archived',
-        'deleted'
+        'deleted',
+        -- HA recovery (019)
+        'recovering'
     ));
 
 -- ─────────────────────────────────────────────────────────────────────────────
