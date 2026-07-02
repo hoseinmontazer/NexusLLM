@@ -166,6 +166,37 @@ type InferenceRequest struct {
 	// store: OpenAI storage API flag. Stripped for local backends.
 	Store *bool `json:"store,omitempty"`
 
+	// ── Newer OpenAI SDK fields (2024-2025) ───────────────────────────────
+	// These are sent by Kilo Code, Cline, Continue via the official OpenAI SDK.
+	// Local backends (llama.cpp, vLLM, Ollama) return 400 for unknown fields.
+	// All are captured here and stripped by sanitizeForBackend.
+
+	// max_completion_tokens: newer name for max_tokens (openai >=1.26).
+	// sanitizeForBackend translates this to max_tokens for local backends.
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
+
+	// logprobs / top_logprobs: log-probability output. llama.cpp server rejects these.
+	Logprobs    *bool `json:"logprobs,omitempty"`
+	TopLogprobs *int  `json:"top_logprobs,omitempty"`
+
+	// metadata: OpenAI storage metadata. Stripped for local backends.
+	Metadata interface{} `json:"metadata,omitempty"`
+
+	// modalities: multimodal output types e.g. ["text","audio"]. Stripped for local backends.
+	Modalities interface{} `json:"modalities,omitempty"`
+
+	// prediction: predicted output for speculative decoding (OpenAI-only). Stripped.
+	Prediction interface{} `json:"prediction,omitempty"`
+
+	// audio: audio output config (OpenAI-only). Stripped for local backends.
+	Audio interface{} `json:"audio,omitempty"`
+
+	// web_search_options: Responses API web search (OpenAI-only). Stripped.
+	WebSearchOptions interface{} `json:"web_search_options,omitempty"`
+
+	// reasoning_effort: o-series model reasoning budget ("low","medium","high"). Stripped for local backends.
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+
 	// Thinking/reasoning mode control.
 	// When non-nil, overrides the model's deployment default.
 	// Supported by llama.cpp (via chat_template_kwargs) and vLLM (via thinking field).

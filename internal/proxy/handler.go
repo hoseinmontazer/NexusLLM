@@ -151,18 +151,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Read body once so we can both log it and parse it.
+	// Read body once so we can both parse it and have it available for logging.
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		abortErr(c, http.StatusBadRequest, "read_error", "Failed to read request body")
 		return
 	}
-	// Log the raw request at DEBUG level so we can diagnose client compatibility issues.
-	h.log.Debug("incoming chat request",
-		zap.String("body", string(rawBody)),
-		zap.String("content_type", c.GetHeader("Content-Type")),
-		zap.String("user_agent", c.GetHeader("User-Agent")),
-	)
 	// Restore body for binding.
 	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
 
@@ -668,6 +662,23 @@ func (h *Handler) syncChat(
 		return true, false
 	}
 
+	// Check for non-2xx BEFORE trying to unmarshal as a completion response.
+	// A 400 body is a JSON error object, not a ChatCompletionResponse.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.log.Warn("upstream returned non-2xx (sync)",
+			zap.Int("status", resp.StatusCode),
+			zap.String("model", req.Model),
+			zap.String("body", string(resp.Body)),
+		)
+		if len(resp.Body) > 0 {
+			c.Data(resp.StatusCode, "application/json", resp.Body)
+		} else {
+			abortErr(c, resp.StatusCode, "upstream_error",
+				fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode))
+		}
+		return true, false
+	}
+
 	var chatResp models.ChatCompletionResponse
 	if err := json.Unmarshal(resp.Body, &chatResp); err != nil {
 		abortErr(c, http.StatusBadGateway, "parse_error", "Failed to parse upstream response")
@@ -763,30 +774,43 @@ func (h *Handler) streamChat(
 	}
 
 	// Check for non-2xx from the upstream BEFORE setting SSE headers.
-	// If the upstream returns 400/500, the stream body contains an error
-	// message, not SSE events. Forward the status and body directly.
+	// If the upstream returns 400/500, the body contains a JSON error,
+	// not SSE events. Read and forward it directly so the client gets the
+	// actual error message rather than "upstream returned HTTP 400 with no body".
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var bodyBytes []byte
 		if resp.Stream != nil {
-			// Read the error body from the stream and forward it as JSON.
-			var errBody strings.Builder
+			// The stream reader wraps the raw response body. Drain it fully.
+			var buf strings.Builder
 			for {
 				line, readErr := resp.Stream.ReadLine()
+				if line != "" {
+					buf.WriteString(line)
+					buf.WriteString("\n")
+				}
 				if readErr != nil {
 					break
 				}
-				errBody.WriteString(line)
 			}
 			resp.Stream.Close()
-			bodyStr := strings.TrimSpace(errBody.String())
-			if bodyStr == "" {
-				abortErr(c, resp.StatusCode, "upstream_error",
-					fmt.Sprintf("upstream returned HTTP %d with no body", resp.StatusCode))
-			} else {
-				c.Data(resp.StatusCode, "application/json", []byte(bodyStr))
-			}
-		} else {
+			bodyBytes = []byte(strings.TrimSpace(buf.String()))
+		}
+		if len(bodyBytes) == 0 {
+			// Log at warn so operators can see what the backend actually sent.
+			h.log.Warn("upstream returned non-2xx with empty body",
+				zap.Int("status", resp.StatusCode),
+				zap.String("model", req.Model),
+				zap.String("endpoint", ep.URL),
+			)
 			abortErr(c, resp.StatusCode, "upstream_error",
-				fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode))
+				fmt.Sprintf("upstream returned HTTP %d with no body", resp.StatusCode))
+		} else {
+			h.log.Warn("upstream returned non-2xx",
+				zap.Int("status", resp.StatusCode),
+				zap.String("model", req.Model),
+				zap.String("body", string(bodyBytes)),
+			)
+			c.Data(resp.StatusCode, "application/json", bodyBytes)
 		}
 		return true
 	}
@@ -1035,18 +1059,18 @@ func (h *Handler) coldStartTimeout() time.Duration {
 }
 
 // sanitizeForBackend removes fields that are valid in the OpenAI API spec but
-// cause local backends (llama.cpp, Ollama, TGI) to return 400 errors because
-// they don't recognise them. Called on a copy of the request so the original
-// is untouched for logging and retry purposes.
+// cause local backends (llama.cpp, Ollama, TGI, vLLM) to return 400 errors
+// because they don't recognise them. Called on a copy of the request so the
+// original is untouched for logging and retry purposes.
 //
-// Confirmed fields that cause llama.cpp to return 400:
-//   - stream_options        (OpenAI SDK adds this automatically; llama.cpp rejects it)
-//   - parallel_tool_calls   (OpenAI-only extension)
-//   - service_tier          (OpenAI routing hint, meaningless for local servers)
-//   - store                 (OpenAI storage API)
+// Also performs field translation:
+//   - max_completion_tokens (new OpenAI SDK name) → max_tokens (understood by all backends)
 //
-// Fields that are safe to forward even if not used:
-//   - user, seed, logit_bias, response_format, stop — all handled or ignored
+// Fields stripped for local backends (confirmed to cause 400):
+//
+//	stream_options, parallel_tool_calls, service_tier, store,
+//	max_completion_tokens (translated then cleared), logprobs, top_logprobs,
+//	metadata, modalities, prediction, audio, web_search_options, reasoning_effort
 func sanitizeForBackend(req models.InferenceRequest, backendType runtime.BackendType) models.InferenceRequest {
 	switch backendType {
 	case runtime.BackendOpenAICompat:
@@ -1054,11 +1078,30 @@ func sanitizeForBackend(req models.InferenceRequest, backendType runtime.Backend
 		return req
 	default:
 		// Local backends: llama.cpp, vllm, ollama, tgi, cpu_native.
-		// Strip fields that cause 400 "unknown parameter" errors.
+
+		// Translate max_completion_tokens → max_tokens.
+		// The newer OpenAI SDK (>=1.26) sends max_completion_tokens; local backends
+		// only understand max_tokens. Prefer max_completion_tokens when both are set.
+		if req.MaxCompletionTokens != nil {
+			if req.MaxTokens == nil || *req.MaxCompletionTokens > *req.MaxTokens {
+				req.MaxTokens = req.MaxCompletionTokens
+			}
+			req.MaxCompletionTokens = nil
+		}
+
+		// Strip all OpenAI-only fields that local backends reject.
 		req.StreamOptions = nil
 		req.ParallelToolCalls = nil
 		req.ServiceTier = nil
 		req.Store = nil
+		req.Logprobs = nil
+		req.TopLogprobs = nil
+		req.Metadata = nil
+		req.Modalities = nil
+		req.Prediction = nil
+		req.Audio = nil
+		req.WebSearchOptions = nil
+		req.ReasoningEffort = nil
 		return req
 	}
 }
