@@ -160,8 +160,8 @@ function OrgFilter({ value, onChange }: { value: string; onChange: (v: string) =
   )
 }
 
-// ── Main page ─────────────────────────────────────────────────────────────────
-export default function ProjectsPage() {
+// ── Main page content (needs Suspense because of useSearchParams) ─────────────
+function ProjectsContent() {
   const searchParams = useSearchParams()
   const orgIdFromUrl = searchParams.get('org_id') ?? ''
 
@@ -298,5 +298,14 @@ export default function ProjectsPage() {
         ))}
       </div>
     </div>
+  )
+}
+
+// ── Page export — wraps content in Suspense so useSearchParams works ──────────
+export default function ProjectsPage() {
+  return (
+    <Suspense fallback={<p className="text-muted-foreground text-sm p-8">Loading…</p>}>
+      <ProjectsContent />
+    </Suspense>
   )
 }
