@@ -28,11 +28,13 @@ func NewProjectHandler(db *sqlx.DB) *ProjectHandler {
 // ─── Create ──────────────────────────────────────────────────────────────────
 
 // CreateProject handles POST /admin/v1/projects
+// team_id is optional — a project belongs to an organization directly.
+// team_id may be provided to assign the project to a team for RBAC grouping.
 func (h *ProjectHandler) CreateProject(c *gin.Context) {
 	var input struct {
 		OrganizationID string `json:"organization_id" binding:"required"`
-		TeamID         string `json:"team_id"         binding:"required"`
-		Name           string `json:"name"            binding:"required"`
+		TeamID         string `json:"team_id"` // optional — RBAC grouping only
+		Name           string `json:"name"     binding:"required"`
 		Description    string `json:"description"`
 		PriorityWeight *int   `json:"priority_weight"` // 0–1000; default 500
 		Status         string `json:"status"`
@@ -75,19 +77,38 @@ func (h *ProjectHandler) CreateProject(c *gin.Context) {
 		return
 	}
 
-	var teamCount int
-	if err := h.db.GetContext(c.Request.Context(), &teamCount,
-		`SELECT COUNT(*) FROM teams WHERE id=$1 AND org_id=$2 AND active=TRUE`,
-		input.TeamID, input.OrganizationID); err != nil || teamCount == 0 {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "team not found or not active in the specified organization"})
+	// Verify org exists
+	var orgExists bool
+	if err := h.db.GetContext(c.Request.Context(), &orgExists,
+		`SELECT EXISTS(SELECT 1 FROM organizations WHERE id=$1 AND active=TRUE)`,
+		input.OrganizationID); err != nil || !orgExists {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "organization not found or not active"})
 		return
 	}
 
+	// If team_id provided, verify it belongs to the org
+	if input.TeamID != "" {
+		var teamCount int
+		if err := h.db.GetContext(c.Request.Context(), &teamCount,
+			`SELECT COUNT(*) FROM teams WHERE id=$1 AND org_id=$2 AND active=TRUE`,
+			input.TeamID, input.OrganizationID); err != nil || teamCount == 0 {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "team not found or not active in the specified organization"})
+			return
+		}
+	}
+
 	id := uuid.New().String()
+
+	// team_id is nullable in the new domain model
+	var teamIDVal interface{}
+	if input.TeamID != "" {
+		teamIDVal = input.TeamID
+	}
+
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO projects (id, organization_id, team_id, name, description, priority_weight, preemptible, status)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		id, input.OrganizationID, input.TeamID, input.Name, input.Description,
+		id, input.OrganizationID, teamIDVal, input.Name, input.Description,
 		weight, preemptible, input.Status,
 	)
 	if err != nil {

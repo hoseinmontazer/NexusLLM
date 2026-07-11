@@ -223,6 +223,9 @@ func (h *TeamHandler) GetTeamPolicy(c *gin.Context) {
 }
 
 // UpdateTeamPolicy handles PUT /admin/v1/teams/:id/policy
+// Team policy is Layer-2 governance only. These limits act as org-wide
+// guardrails and are NOT applied to project-scoped requests. For per-project
+// rate limits, use PUT /admin/v1/projects/:id/policy instead.
 func (h *TeamHandler) UpdateTeamPolicy(c *gin.Context) {
 	teamID := c.Param("id")
 	var input struct {

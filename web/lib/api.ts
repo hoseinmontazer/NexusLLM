@@ -582,6 +582,8 @@ export const api = {
       req<{ data: UsageSummary[] }>('GET', `/usage/teams/${teamId}?from=${from}&to=${to}`),
     orgMonthlySpend: (orgId: string) =>
       req<{ monthly_spend_usd: number }>('GET', `/usage/orgs/${orgId}/monthly-spend`),
+    orgDailyUsage: (orgId: string, from: string, to: string) =>
+      req<{ data: UsageSummary[] }>('GET', `/usage/orgs/${orgId}/daily?from=${from}&to=${to}`),
   },
 
   services: {
@@ -648,8 +650,13 @@ export const api = {
     },
     get: (id: string) => req<Project>('GET', `/projects/${id}`),
     create: (b: {
-      organization_id: string; team_id: string; name: string
-      description?: string; priority_weight?: number; preemptible?: boolean; status?: ProjectStatus
+      organization_id: string
+      team_id?: string          // optional — RBAC grouping only (migration 031)
+      name: string
+      description?: string
+      priority_weight?: number
+      preemptible?: boolean
+      status?: ProjectStatus
     }) => req<{ id: string; name: string; priority_weight: number; priority_label: string; status: string }>('POST', '/projects', b),
     update: (id: string, b: { name?: string; description?: string; priority_weight?: number; preemptible?: boolean; status?: ProjectStatus }) =>
       req<{ message: string }>('PUT', `/projects/${id}`, b),

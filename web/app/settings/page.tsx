@@ -4,7 +4,7 @@ import { Settings, ExternalLink } from 'lucide-react'
 export default function SettingsPage() {
   const links = [
     { label: 'Gateway API',     url: 'http://localhost:8080', desc: 'OpenAI-compatible inference API — all /v1/* routes' },
-    { label: 'Admin API',       url: 'http://localhost:8081', desc: 'Management REST API — models, teams, nodes, placement' },
+    { label: 'Admin API',       url: 'http://localhost:8081', desc: 'Management REST API — models, projects, orgs, teams (RBAC), nodes, placement' },
     { label: 'Gateway Metrics', url: 'http://localhost:9090/metrics', desc: 'Prometheus metrics (gateway)' },
     { label: 'Admin Metrics',   url: 'http://localhost:9091/metrics', desc: 'Prometheus metrics (admin)' },
     { label: 'Grafana',         url: 'http://localhost:3000', desc: 'Dashboards (admin/admin)' },
@@ -32,16 +32,22 @@ export default function SettingsPage() {
   ]
 
   const adminRoutes = [
-    ['POST',   '/admin/v1/models/deploy',            'Register + auto-place + start container'],
-    ['POST',   '/admin/v1/models/import-ollama',     'Bulk-import all models from a running Ollama'],
-    ['POST',   '/admin/v1/models/:id/reset-health',  'Reset failed health state (triggers re-check)'],
-    ['POST',   '/admin/v1/services/deploy',          'Deploy any AI service with auto-placement'],
-    ['GET',    '/admin/v1/services[?type=]',         'List all AI services by type'],
-    ['POST',   '/admin/v1/placement/simulate',       'Dry-run placement (no resources committed)'],
-    ['GET',    '/admin/v1/placement/decisions',      'Placement audit log'],
-    ['GET',    '/admin/v1/nodes',                    'List cluster nodes'],
-    ['POST',   '/admin/v1/nodes/:id/heartbeat',      'Agent heartbeat'],
-    ['GET',    '/admin/v1/nodes/:id/telemetry',      'Last 60 telemetry snapshots'],
+    ['POST',   '/admin/v1/projects',                     'Create project (execution unit: rate limits, quota, priority)'],
+    ['GET',    '/admin/v1/projects/:id/policy',          'Get per-project rate limits & token budgets'],
+    ['PUT',    '/admin/v1/projects/:id/policy',          'Update project policy — pushed to gateway Redis immediately'],
+    ['GET',    '/admin/v1/projects/:id/quota',           'Live quota counters (Redis: RPM, TPM, inflight, tokens)'],
+    ['GET',    '/admin/v1/projects/:id/usage/summary',   'Project usage totals for a date range'],
+    ['POST',   '/admin/v1/projects/:id/priority',        'Change project scheduling priority weight (0–1000)'],
+    ['POST',   '/admin/v1/models/deploy',                'Register + auto-place + start container'],
+    ['POST',   '/admin/v1/models/import-ollama',         'Bulk-import all models from a running Ollama'],
+    ['POST',   '/admin/v1/models/:id/reset-health',      'Reset failed health state (triggers re-check)'],
+    ['POST',   '/admin/v1/services/deploy',              'Deploy any AI service with auto-placement'],
+    ['GET',    '/admin/v1/services[?type=]',             'List all AI services by type'],
+    ['POST',   '/admin/v1/placement/simulate',           'Dry-run placement (no resources committed)'],
+    ['GET',    '/admin/v1/nodes',                        'List cluster nodes'],
+    ['GET',    '/admin/v1/nodes/:id/telemetry',          'Last 60 telemetry snapshots'],
+    ['GET',    '/admin/v1/teams/:id/models',             'RBAC: models this team can access'],
+    ['GET',    '/admin/v1/usage/orgs/:id/monthly-spend', 'Org billing: monthly total spend'],
   ]
 
   return (
@@ -149,7 +155,7 @@ export default function SettingsPage() {
       <Card>
         <CardHeader><CardTitle>Quick Start</CardTitle></CardHeader>
         <CardContent>
-          <pre className="bg-gray-900 text-green-400 p-4 rounded-md text-xs overflow-x-auto">{`# 1. Start postgres + redis + run all migrations (001-006)
+          <pre className="bg-gray-900 text-green-400 p-4 rounded-md text-xs overflow-x-auto">{`# 1. Start postgres + redis + run all migrations
 make dev-up
 
 # 2. Run services (3 terminals)
@@ -160,17 +166,22 @@ make run-scheduler  # queue dispatcher
 # 3. Start this UI
 cd web && npm run dev    # :3001
 
-# 4. Import Ollama models (if Ollama is running)
+# 4. Create an Organization and Project (execution unit)
+# → Organizations → New Org
+# → Projects → New Project  (set priority, rate limits, quota)
+
+# 5. Create an API Key scoped to your project
+# → API Keys → select org → select team → select project → Create
+
+# 6. Import Ollama models (if Ollama is running)
 # → Models → Import from Ollama
 
-# 5. Deploy GPU model (vLLM, requires Docker + GPU)
+# 7. Deploy GPU model (vLLM, requires Docker + GPU)
 # → Models → Deploy vLLM Model → set auto_place: true
 
-# 6. Deploy CPU service (embeddings, STT, etc.)
-# → AI Services → Register Service
-
-# 7. Simulate placement before deploying
-# → Placement → Run Placement Simulation`}</pre>
+# 8. Send requests using your project-scoped key
+# Authorization: Bearer <your-api-key>
+# POST /v1/chat/completions`}</pre>
         </CardContent>
       </Card>
     </div>

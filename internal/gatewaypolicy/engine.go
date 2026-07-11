@@ -15,17 +15,17 @@ import (
 
 // GatewayPolicy is the Go representation of a gateway_policies row.
 type GatewayPolicy struct {
-	Scope                string   `db:"scope"`
-	MaxTemperature       *float64 `db:"max_temperature"`
-	MaxContextTokens     *int     `db:"max_context_tokens"`
-	MaxOutputTokens      *int     `db:"max_output_tokens"`
-	StreamAllowed        bool     `db:"stream_allowed"`
-	FunctionCallAllowed  bool     `db:"function_call_allowed"`
-	AllowedModels        []string `db:"-"`
-	DeniedModels         []string `db:"-"`
-	AllowedToolNames     []string `db:"-"`
-	DeniedToolNames      []string `db:"-"`
-	Enabled              bool     `db:"enabled"`
+	Scope               string   `db:"scope"`
+	MaxTemperature      *float64 `db:"max_temperature"`
+	MaxContextTokens    *int     `db:"max_context_tokens"`
+	MaxOutputTokens     *int     `db:"max_output_tokens"`
+	StreamAllowed       bool     `db:"stream_allowed"`
+	FunctionCallAllowed bool     `db:"function_call_allowed"`
+	AllowedModels       []string `db:"-"`
+	DeniedModels        []string `db:"-"`
+	AllowedToolNames    []string `db:"-"`
+	DeniedToolNames     []string `db:"-"`
+	Enabled             bool     `db:"enabled"`
 }
 
 // Violation is a policy breach with a machine-readable code.
@@ -51,13 +51,16 @@ func NewEngine(db *sqlx.DB, rdb *redis.Client, log *zap.Logger) *Engine {
 // Enforce checks the request against all applicable gateway policies and
 // either passes (returning nil) or returns a Violation.
 // It also mutates the request to clamp parameters within allowed bounds.
+//
+// Policy evaluation order: org → project → team → api_key
+// More specific scopes take precedence over broader ones.
 func (e *Engine) Enforce(
 	ctx context.Context,
-	orgID, teamID, apiKeyID string,
+	orgID, projectID, teamID, apiKeyID string,
 	req *models.InferenceRequest,
 	inputTokenEstimate int,
 ) *Violation {
-	policies := e.loadPolicies(ctx, orgID, teamID, apiKeyID)
+	policies := e.loadPolicies(ctx, orgID, projectID, teamID, apiKeyID)
 
 	for _, p := range policies {
 		if !p.Enabled {
@@ -124,7 +127,7 @@ func (e *Engine) Enforce(
 
 // ─── private ──────────────────────────────────────────────────────────────────
 
-func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, apiKeyID string) []GatewayPolicy {
+func (e *Engine) loadPolicies(ctx context.Context, orgID, projectID, teamID, apiKeyID string) []GatewayPolicy {
 	var rows []struct {
 		Scope               string   `db:"scope"`
 		MaxTemperature      *float64 `db:"max_temperature"`
@@ -142,11 +145,17 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, apiKeyID strin
 		WHERE enabled = TRUE
 		  AND (
 		        (scope = 'org'     AND scope_id = $1)
-		     OR (scope = 'team'    AND scope_id = $2)
-		     OR (scope = 'api_key' AND scope_id = $3)
+		     OR (scope = 'project' AND scope_id = $2)
+		     OR (scope = 'team'    AND scope_id = $3)
+		     OR (scope = 'api_key' AND scope_id = $4)
 		      )
-		ORDER BY CASE scope WHEN 'org' THEN 1 WHEN 'team' THEN 2 ELSE 3 END`,
-		orgID, teamID, apiKeyID)
+		ORDER BY CASE scope
+		           WHEN 'org'     THEN 1
+		           WHEN 'project' THEN 2
+		           WHEN 'team'    THEN 3
+		           ELSE 4
+		         END`,
+		orgID, nilIfEmpty(projectID), nilIfEmpty(teamID), nilIfEmpty(apiKeyID))
 
 	out := make([]GatewayPolicy, len(rows))
 	for i, r := range rows {
@@ -184,4 +193,12 @@ func extractToolName(tool interface{}) string {
 		}
 	}
 	return ""
+}
+
+// nilIfEmpty returns nil for empty strings so they match no UUID in Postgres.
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }

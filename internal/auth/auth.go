@@ -1,3 +1,15 @@
+// Package auth provides API key validation, JWT issuance, and request identity.
+//
+// Domain model (Organisation as root):
+//
+//	Organization
+//	  └── Project          ← execution root (rate limits, priority, quota)
+//	  └── Team (optional)  ← RBAC/membership only
+//
+// RequestClaims carries only stable identifiers. No mutable display strings
+// participate in runtime decisions. TeamID is kept for RBAC/ACL lookups that
+// are still team-scoped (model permissions, prompt policies) but it must never
+// drive scheduling, rate limiting, or quota decisions.
 package auth
 
 import (
@@ -21,24 +33,40 @@ const (
 	apiKeyCacheTTL    = 5 * time.Minute
 )
 
-// TeamClaims holds identity and policy metadata extracted from an API key or JWT.
-type TeamClaims struct {
-	OrgID        string   `json:"org_id"`
-	TeamID       string   `json:"team_id"`
-	TeamName     string   `json:"team_name"`
-	TeamPriority int      `json:"team_priority"`
-	Permissions  []string `json:"permissions"`
-	// Project context — populated when the API key is scoped to a project,
-	// or when the client sends X-Nexus-Project header / project_id in request body.
-	// Falls back to team-level priority when empty.
-	ProjectID             string `json:"project_id,omitempty"`
-	ProjectName           string `json:"project_name,omitempty"`
-	ProjectPriorityWeight int    `json:"project_priority_weight,omitempty"`
+// RequestClaims is the canonical identity context attached to every request
+// after authentication. It contains only stable, immutable identifiers.
+//
+// Execution root:  OrgID → ProjectID
+// RBAC/ACL root:   TeamID (optional — empty when key is project-scoped only)
+// Display-only:    TeamName, ProjectName  (never used in runtime decisions)
+type RequestClaims struct {
+	// Stable identifiers — the only fields that may drive runtime logic.
+	OrgID     string `json:"org_id"`
+	ProjectID string `json:"project_id,omitempty"`
+	APIKeyID  string `json:"api_key_id,omitempty"`
+
+	// RBAC/membership — used only for model ACL and prompt-policy lookups.
+	// Must never be used for rate limiting, scheduling, or quota evaluation.
+	TeamID string `json:"team_id,omitempty"`
+
+	// Scheduling weight — derived from the project, not the team.
+	ProjectPriorityWeight int `json:"project_priority_weight,omitempty"`
+
+	// Model permissions resolved at auth time (model names this key may use).
+	Permissions []string `json:"permissions"`
+
+	// Display-only — do not use in any runtime decision.
+	TeamName    string `json:"team_name,omitempty"`    // display only
+	ProjectName string `json:"project_name,omitempty"` // display only
 }
 
-// jwtClaims wraps TeamClaims for use inside a JWT.
+// TeamClaims is a backward-compatibility alias for RequestClaims.
+// New code should use RequestClaims directly.
+type TeamClaims = RequestClaims
+
+// jwtClaims wraps RequestClaims for JWT signing.
 type jwtClaims struct {
-	TeamClaims
+	RequestClaims
 	jwt.RegisteredClaims
 }
 
@@ -67,7 +95,7 @@ func HashAPIKey(key string) string {
 }
 
 // GenerateAPIKey creates a cryptographically random API key with "nxs_" prefix.
-// It returns the raw (plaintext) key and its SHA-256 hash.
+// Returns the raw (plaintext) key and its SHA-256 hash.
 func GenerateAPIKey() (raw, hash string, err error) {
 	b := make([]byte, 32)
 	if _, err = rand.Read(b); err != nil {
@@ -78,9 +106,16 @@ func GenerateAPIKey() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
-// ValidateAPIKey looks up the SHA-256 hash of key first in Redis, then in PostgreSQL.
+// ValidateAPIKey looks up the SHA-256 hash first in Redis, then in PostgreSQL.
 // On a DB hit it populates the Redis cache for future requests.
-func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, error) {
+//
+// Resolution order for project context:
+//  1. api_keys.project_id  — key is directly scoped to a project
+//  2. No project context  — legacy team-only key (TeamID set, ProjectID empty)
+//
+// The org is always resolved via the team → org JOIN so that the org-disabled
+// governance check always has a valid OrgID.
+func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*RequestClaims, error) {
 	if !strings.HasPrefix(key, "nxs_") {
 		return nil, errors.New("invalid api key format")
 	}
@@ -88,27 +123,27 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 	hash := HashAPIKey(key)
 	cacheKey := apiKeyCachePrefix + hash
 
-	// 1. Redis cache lookup
-	cached, err := s.rdb.Get(ctx, cacheKey).Bytes()
-	if err == nil {
-		var claims TeamClaims
+	// 1. Redis cache — fast path
+	if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+		var claims RequestClaims
 		if jsonErr := json.Unmarshal(cached, &claims); jsonErr == nil {
 			return &claims, nil
 		}
 	}
 
-	// 2. PostgreSQL fallback
-	query := `
+	// 2. PostgreSQL — resolve org via team membership
+	// org_id is the execution root; team_id is kept for RBAC only.
+	const query = `
 		SELECT
-			o.id          AS org_id,
-			t.id          AS team_id,
-			t.name        AS team_name,
-			t.priority    AS team_priority,
-			COALESCE(ak.project_id::text, '')              AS project_id,
-			COALESCE(ak.project_name,     '')              AS project_name,
-			COALESCE(ak.project_priority_weight, t.priority) AS project_priority_weight
+			ak.id                                                  AS api_key_id,
+			o.id                                                   AS org_id,
+			t.id                                                   AS team_id,
+			t.name                                                 AS team_name,
+			COALESCE(ak.project_id::text, '')                     AS project_id,
+			COALESCE(ak.project_name,     '')                     AS project_name,
+			COALESCE(ak.project_priority_weight, 500)             AS project_priority_weight
 		FROM api_keys ak
-		JOIN teams   t ON t.id = ak.team_id
+		JOIN teams        t ON t.id  = ak.team_id
 		JOIN organizations o ON o.id = t.org_id
 		WHERE ak.key_hash = $1
 		  AND ak.active   = TRUE
@@ -116,52 +151,39 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 		  AND o.active    = TRUE
 		  AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
 	`
-
 	type row struct {
+		APIKeyID              string `db:"api_key_id"`
 		OrgID                 string `db:"org_id"`
 		TeamID                string `db:"team_id"`
 		TeamName              string `db:"team_name"`
-		TeamPriority          int    `db:"team_priority"`
 		ProjectID             string `db:"project_id"`
 		ProjectName           string `db:"project_name"`
 		ProjectPriorityWeight int    `db:"project_priority_weight"`
 	}
-
 	var r row
 	if err := s.db.GetContext(ctx, &r, query, hash); err != nil {
-		// Migration 022 may not have been applied yet — fall back to team-only query.
-		if strings.Contains(err.Error(), "project_id") ||
-			strings.Contains(err.Error(), "project_name") ||
-			strings.Contains(err.Error(), "project_priority_weight") ||
-			strings.Contains(err.Error(), "42703") {
+		// Fallback: pre-022 schema without project columns
+		if isColumnMissing(err) {
 			return s.validateAPIKeyLegacy(ctx, hash)
 		}
 		return nil, fmt.Errorf("api key not found or inactive: %w", err)
 	}
 
-	// Load permissions from DB
+	// Load model permissions (team-scoped ACL; empty for project-only keys)
 	perms, err := s.loadPermissions(ctx, r.TeamID)
 	if err != nil {
 		return nil, fmt.Errorf("load permissions: %w", err)
 	}
 
-	// If the project_priority_weight column doesn't exist yet (migration 022 not applied),
-	// fall back to team priority. The COALESCE in the query handles the missing column case
-	// only if it returns a value; if the query itself fails we catch it here.
-	ppw := r.ProjectPriorityWeight
-	if ppw == 0 {
-		ppw = r.TeamPriority
-	}
-
-	claims := &TeamClaims{
+	claims := &RequestClaims{
+		APIKeyID:              r.APIKeyID,
 		OrgID:                 r.OrgID,
 		TeamID:                r.TeamID,
 		TeamName:              r.TeamName,
-		TeamPriority:          r.TeamPriority,
-		Permissions:           perms,
 		ProjectID:             r.ProjectID,
 		ProjectName:           r.ProjectName,
-		ProjectPriorityWeight: ppw,
+		ProjectPriorityWeight: r.ProjectPriorityWeight,
+		Permissions:           perms,
 	}
 
 	// Update last-used timestamp (best-effort, non-blocking)
@@ -171,7 +193,7 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 			"UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1", hash)
 	}()
 
-	// Populate Redis cache
+	// Cache the resolved claims
 	if data, marshalErr := json.Marshal(claims); marshalErr == nil {
 		_ = s.rdb.Set(ctx, cacheKey, data, s.cacheTTL).Err()
 	}
@@ -179,9 +201,9 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*TeamClaims, 
 	return claims, nil
 }
 
-// ValidateJWT parses and validates a JWT string, returning the embedded TeamClaims.
-func (s *Service) ValidateJWT(ctx context.Context, tokenStr string) (*TeamClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &jwtClaims{}, func(t *jwt.Token) (interface{}, error) {
+// ValidateJWT parses and validates a JWT, returning the embedded RequestClaims.
+func (s *Service) ValidateJWT(ctx context.Context, tokenStr string) (*RequestClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenStr, &jwtClaims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
@@ -190,20 +212,18 @@ func (s *Service) ValidateJWT(ctx context.Context, tokenStr string) (*TeamClaims
 	if err != nil {
 		return nil, fmt.Errorf("invalid jwt: %w", err)
 	}
-
-	claims, ok := token.Claims.(*jwtClaims)
+	c, ok := token.Claims.(*jwtClaims)
 	if !ok || !token.Valid {
 		return nil, errors.New("invalid jwt claims")
 	}
-
-	tc := &claims.TeamClaims
+	tc := &c.RequestClaims
 	return tc, nil
 }
 
-// IssueJWT creates a signed JWT embedding the given TeamClaims with a 24 h expiry.
-func (s *Service) IssueJWT(claims *TeamClaims, ttl time.Duration) (string, error) {
+// IssueJWT creates a signed JWT embedding the given RequestClaims.
+func (s *Service) IssueJWT(claims *RequestClaims, ttl time.Duration) (string, error) {
 	jc := jwtClaims{
-		TeamClaims: *claims,
+		RequestClaims: *claims,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
@@ -219,34 +239,39 @@ func (s *Service) InvalidateAPIKeyCache(ctx context.Context, keyHash string) err
 	return s.rdb.Del(ctx, apiKeyCachePrefix+keyHash).Err()
 }
 
-// loadPermissions fetches the list of allowed model names for a team.
+// loadPermissions fetches the list of allowed model names for a team (RBAC).
 func (s *Service) loadPermissions(ctx context.Context, teamID string) ([]string, error) {
-	var models []string
-	query := `
+	if teamID == "" {
+		return []string{}, nil
+	}
+	var names []string
+	err := s.db.SelectContext(ctx, &names, `
 		SELECT m.name
 		FROM team_model_permissions tmp
 		JOIN models m ON m.id = tmp.model_id
-		WHERE tmp.team_id = $1 AND m.active = TRUE
-	`
-	if err := s.db.SelectContext(ctx, &models, query, teamID); err != nil {
+		WHERE tmp.team_id = $1 AND m.active = TRUE`, teamID)
+	if err != nil {
 		return nil, err
 	}
-	return models, nil
+	return names, nil
 }
 
-// validateAPIKeyLegacy is the pre-migration-022 fallback that doesn't join project columns.
-func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*TeamClaims, error) {
+// validateAPIKeyLegacy handles the pre-migration-022 schema (no project columns).
+func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*RequestClaims, error) {
 	type row struct {
-		OrgID        string `db:"org_id"`
-		TeamID       string `db:"team_id"`
-		TeamName     string `db:"team_name"`
-		TeamPriority int    `db:"team_priority"`
+		APIKeyID string `db:"api_key_id"`
+		OrgID    string `db:"org_id"`
+		TeamID   string `db:"team_id"`
+		TeamName string `db:"team_name"`
 	}
 	var r row
 	if err := s.db.GetContext(ctx, &r, `
-		SELECT o.id AS org_id, t.id AS team_id, t.name AS team_name, t.priority AS team_priority
+		SELECT ak.id AS api_key_id,
+		       o.id  AS org_id,
+		       t.id  AS team_id,
+		       t.name AS team_name
 		FROM api_keys ak
-		JOIN teams t ON t.id = ak.team_id
+		JOIN teams t        ON t.id  = ak.team_id
 		JOIN organizations o ON o.id = t.org_id
 		WHERE ak.key_hash = $1
 		  AND ak.active = TRUE AND t.active = TRUE AND o.active = TRUE
@@ -257,17 +282,28 @@ func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*TeamC
 	if err != nil {
 		return nil, fmt.Errorf("load permissions: %w", err)
 	}
-	claims := &TeamClaims{
-		OrgID:                 r.OrgID,
-		TeamID:                r.TeamID,
-		TeamName:              r.TeamName,
-		TeamPriority:          r.TeamPriority,
-		Permissions:           perms,
-		ProjectPriorityWeight: r.TeamPriority, // fall back to team priority
+	claims := &RequestClaims{
+		APIKeyID:    r.APIKeyID,
+		OrgID:       r.OrgID,
+		TeamID:      r.TeamID,
+		TeamName:    r.TeamName,
+		Permissions: perms,
 	}
-	cacheKey := apiKeyCachePrefix + hash
 	if data, err := json.Marshal(claims); err == nil {
-		_ = s.rdb.Set(ctx, cacheKey, data, s.cacheTTL).Err()
+		_ = s.rdb.Set(ctx, apiKeyCachePrefix+hash, data, s.cacheTTL).Err()
 	}
 	return claims, nil
+}
+
+// isColumnMissing returns true when the Postgres error indicates a missing column (42703).
+func isColumnMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "project_id") ||
+		strings.Contains(s, "project_name") ||
+		strings.Contains(s, "project_priority_weight") ||
+		strings.Contains(s, "api_key_id") ||
+		strings.Contains(s, "42703")
 }

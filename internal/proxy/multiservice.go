@@ -64,10 +64,12 @@ func (h *Handler) Rerank(c *gin.Context) {
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
 		Model:                req.Model,
 		EstimatedInputTokens: len(req.Documents) * 50, // rough estimate
+		OrgID:                claims.OrgID,
 		TeamID:               claims.TeamID,
-	}, claims.TeamPriority, tp)
+		ProjectID:            claims.ProjectID,
+	}, func() int { if claims.ProjectPriorityWeight > 0 { return claims.ProjectPriorityWeight }; return 500 }(), tp)
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected")
 		return
 	}
@@ -152,11 +154,13 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 
 	tp := h.teamPolicy(claims.TeamID)
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
-		Model:  realModel,
-		TeamID: claims.TeamID,
-	}, claims.TeamPriority, tp)
+		Model:     realModel,
+		OrgID:     claims.OrgID,
+		TeamID:    claims.TeamID,
+		ProjectID: claims.ProjectID,
+	}, func() int { if claims.ProjectPriorityWeight > 0 { return claims.ProjectPriorityWeight }; return 500 }(), tp)
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected")
 		return
 	}
@@ -218,10 +222,12 @@ func (h *Handler) Speech(c *gin.Context) {
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
 		Model:                realModel,
 		EstimatedInputTokens: len(req.Input) / 4,
+		OrgID:                claims.OrgID,
 		TeamID:               claims.TeamID,
-	}, claims.TeamPriority, tp)
+		ProjectID:            claims.ProjectID,
+	}, func() int { if claims.ProjectPriorityWeight > 0 { return claims.ProjectPriorityWeight }; return 500 }(), tp)
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected")
 		return
 	}
@@ -302,11 +308,13 @@ func (h *Handler) OCR(c *gin.Context) {
 
 	tp := h.teamPolicy(claims.TeamID)
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
-		Model:  realModel,
-		TeamID: claims.TeamID,
-	}, claims.TeamPriority, tp)
+		Model:     realModel,
+		OrgID:     claims.OrgID,
+		TeamID:    claims.TeamID,
+		ProjectID: claims.ProjectID,
+	}, func() int { if claims.ProjectPriorityWeight > 0 { return claims.ProjectPriorityWeight }; return 500 }(), tp)
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected")
 		return
 	}

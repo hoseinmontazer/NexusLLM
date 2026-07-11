@@ -191,8 +191,42 @@ func nilIfEmpty(s string) interface{} {
 func (t *Tracker) Aggregate(ctx context.Context) {
 	t.aggregateHourly(ctx)
 	t.aggregateDaily(ctx)
+	t.aggregateOrgDaily(ctx)
 	t.aggregateProjectDaily(ctx)
 	t.aggregateProjectMonthly(ctx)
+}
+
+// aggregateOrgDaily rolls up org-level billing data into org_usage_daily.
+// This is the canonical billing/governance rollup — org is the root entity.
+func (t *Tracker) aggregateOrgDaily(ctx context.Context) {
+	_, _ = t.db.ExecContext(ctx, `
+		INSERT INTO org_usage_daily
+		  (org_id, model_name, day,
+		   request_count, error_count,
+		   prompt_tokens, completion_tokens, total_tokens, cost_usd, avg_latency_ms)
+		SELECT
+		  org_id,
+		  COALESCE(model_name, '') AS model_name,
+		  created_at::date         AS day,
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE status != 'success'),
+		  COALESCE(SUM(prompt_tokens), 0),
+		  COALESCE(SUM(completion_tokens), 0),
+		  COALESCE(SUM(total_tokens), 0),
+		  COALESCE(SUM(cost_usd), 0),
+		  COALESCE(AVG(latency_ms), 0)
+		FROM usage_events
+		WHERE org_id IS NOT NULL
+		  AND created_at::date = CURRENT_DATE
+		GROUP BY org_id, COALESCE(model_name, ''), created_at::date
+		ON CONFLICT (org_id, model_name, day) DO UPDATE SET
+		  request_count     = EXCLUDED.request_count,
+		  error_count       = EXCLUDED.error_count,
+		  prompt_tokens     = EXCLUDED.prompt_tokens,
+		  completion_tokens = EXCLUDED.completion_tokens,
+		  total_tokens      = EXCLUDED.total_tokens,
+		  cost_usd          = EXCLUDED.cost_usd,
+		  avg_latency_ms    = EXCLUDED.avg_latency_ms`)
 }
 
 func (t *Tracker) aggregateHourly(ctx context.Context) {
@@ -365,6 +399,44 @@ func (t *Tracker) GetProjectSummary(ctx context.Context, projectID, from, to str
 		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz`,
 		projectID, from, to)
 	return row, err
+}
+
+// OrgDailySummary holds per-org per-day usage for billing.
+type OrgDailySummary struct {
+	OrgID            string  `db:"org_id"           json:"org_id"`
+	ModelName        string  `db:"model_name"       json:"model_name"`
+	Day              string  `db:"day"              json:"day"`
+	RequestCount     int64   `db:"request_count"    json:"request_count"`
+	ErrorCount       int64   `db:"error_count"      json:"error_count"`
+	PromptTokens     int64   `db:"prompt_tokens"    json:"prompt_tokens"`
+	CompletionTokens int64   `db:"completion_tokens" json:"completion_tokens"`
+	TotalTokens      int64   `db:"total_tokens"     json:"total_tokens"`
+	CostUSD          float64 `db:"cost_usd"         json:"cost_usd"`
+	AvgLatencyMs     float64 `db:"avg_latency_ms"   json:"avg_latency_ms"`
+}
+
+// GetOrgDailyUsage returns daily per-model usage for an org in a date range.
+// This is the canonical billing/quota view — it is org-scoped, not team-scoped.
+func (t *Tracker) GetOrgDailyUsage(ctx context.Context, orgID, from, to string) ([]OrgDailySummary, error) {
+	rows := []OrgDailySummary{}
+	err := t.db.SelectContext(ctx, &rows, `
+		SELECT org_id,
+		       COALESCE(model_name, '') AS model_name,
+		       created_at::date::text   AS day,
+		       COUNT(*)                                              AS request_count,
+		       COUNT(*) FILTER (WHERE status != 'success')          AS error_count,
+		       COALESCE(SUM(prompt_tokens), 0)                      AS prompt_tokens,
+		       COALESCE(SUM(completion_tokens), 0)                  AS completion_tokens,
+		       COALESCE(SUM(total_tokens), 0)                       AS total_tokens,
+		       COALESCE(SUM(cost_usd), 0)                           AS cost_usd,
+		       COALESCE(AVG(latency_ms), 0)                         AS avg_latency_ms
+		FROM usage_events
+		WHERE org_id = $1::uuid
+		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz
+		GROUP BY org_id, COALESCE(model_name, ''), created_at::date
+		ORDER BY day DESC, model_name`,
+		orgID, from, to)
+	return rows, err
 }
 
 // TeamSummary holds aggregated usage for a team.

@@ -33,6 +33,21 @@ func (h *UsageHandler) GetTeamUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"team_id": teamID, "from": from, "to": to, "data": rows})
 }
 
+// GetOrgUsage handles GET /admin/v1/usage/orgs/:id/daily
+// Returns per-day, per-model usage for an org — the canonical billing view.
+func (h *UsageHandler) GetOrgUsage(c *gin.Context) {
+	orgID := c.Param("id")
+	from := c.DefaultQuery("from", "2026-01-01")
+	to := c.DefaultQuery("to", "2026-12-31")
+
+	rows, err := h.tracker.GetOrgDailyUsage(c.Request.Context(), orgID, from+"T00:00:00Z", to+"T23:59:59Z")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"org_id": orgID, "from": from, "to": to, "data": rows})
+}
+
 // GetOrgSpend handles GET /admin/v1/usage/orgs/:id/monthly-spend
 func (h *UsageHandler) GetOrgSpend(c *gin.Context) {
 	orgID := c.Param("id")

@@ -1,0 +1,20 @@
+# Git history — not needed in image
+.git
+.gitignore
+
+# Frontend build artifacts — not part of Go services
+web/node_modules
+web/.next
+
+# Local env files — never bake secrets into images
+.env
+.env.*
+
+# Editor / IDE artifacts
+.vscode
+.kiro
+*.swp
+*.swo
+
+# Test artifacts
+**/*_test.go

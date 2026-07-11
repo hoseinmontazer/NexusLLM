@@ -9,7 +9,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, Trash2, Building2, AlertTriangle } from 'lucide-react'
+import { Plus, Trash2, Building2, AlertTriangle, FolderKanban, Users } from 'lucide-react'
+import Link from 'next/link'
 
 export default function OrgsPage() {
   const qc = useQueryClient()
@@ -56,7 +57,7 @@ export default function OrgsPage() {
         <div>
           <h1 className="text-2xl font-bold">Organizations</h1>
           <p className="text-sm text-muted-foreground mt-0.5">
-            {orgs.length} organization{orgs.length !== 1 ? 's' : ''}
+            {orgs.length} organization{orgs.length !== 1 ? 's' : ''} — governance root · billing boundary
           </p>
         </div>
         <Dialog open={open} onOpenChange={setOpen}>
@@ -130,14 +131,24 @@ export default function OrgsPage() {
                         {org.active ? 'active' : 'inactive'}
                       </span>
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="text-red-400 hover:text-red-600 hover:bg-red-50"
-                      onClick={() => setConfirmDelete(org.id)}
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      <Link href={`/projects?org_id=${org.id}`}
+                        className="text-xs text-blue-600 hover:underline flex items-center gap-1">
+                        <FolderKanban className="w-3.5 h-3.5" />Projects
+                      </Link>
+                      <Link href={`/teams?org_id=${org.id}`}
+                        className="text-xs text-muted-foreground hover:underline flex items-center gap-1">
+                        <Users className="w-3.5 h-3.5" />Teams
+                      </Link>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-red-400 hover:text-red-600 hover:bg-red-50"
+                        onClick={() => setConfirmDelete(org.id)}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
                   </div>
                 )}
               </CardContent>

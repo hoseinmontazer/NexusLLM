@@ -47,12 +47,17 @@ func AccessLog(log *zap.Logger) gin.HandlerFunc {
 		model := c.GetString("model")
 		endpointID := c.GetHeader("X-Nexus-Endpoint") // set by proxy handler on response
 
+		// Use only stable identifiers in log fields. TeamName is a mutable
+		// display string and must not appear in structured log output used
+		// for querying, alerting, or correlation.
 		claims := GetClaims(c)
-		team := ""
 		teamID := ""
+		projectID := ""
+		orgID := ""
 		if claims != nil {
-			team = claims.TeamName
 			teamID = claims.TeamID
+			projectID = claims.ProjectID
+			orgID = claims.OrgID
 		}
 
 		status := c.Writer.Status()
@@ -71,11 +76,14 @@ func AccessLog(log *zap.Logger) gin.HandlerFunc {
 			zap.String("user_agent", c.Request.UserAgent()),
 			zap.Int("bytes_out", bytesOut),
 		}
-		if team != "" {
-			fields = append(fields, zap.String("team", team))
+		if orgID != "" {
+			fields = append(fields, zap.String("org_id", orgID))
 		}
 		if teamID != "" {
 			fields = append(fields, zap.String("team_id", teamID))
+		}
+		if projectID != "" {
+			fields = append(fields, zap.String("project_id", projectID))
 		}
 		if model != "" {
 			fields = append(fields, zap.String("model", model))

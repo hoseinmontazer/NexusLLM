@@ -170,6 +170,7 @@ func main() {
 	orgH := handlers.NewOrgHandler(db)
 	teamH := handlers.NewTeamHandler(db, rdb, policyEngine)
 	apikeyH := handlers.NewAPIKeyHandler(db, rdb)
+	orgGovH := handlers.NewOrgGovernanceHandler(db, rdb, policyEngine)
 	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithPlacement(placementEng).WithTaskManager(taskMgr)
 	controllerH := handlers.NewControllerHandler(modelCtrl)
 	gpuH := handlers.NewGPUHandler(gpuInventory)
@@ -200,6 +201,13 @@ func main() {
 	a.GET("/orgs", orgH.ListOrgs)
 	a.GET("/orgs/:id", orgH.GetOrg)
 	a.DELETE("/orgs/:id", orgH.DeactivateOrg)
+
+	// ── Org Governance (Layer-2 guardrails: billing, compliance, budget caps) ─
+	// These do NOT affect per-project rate limits. Use /projects/:id/policy for that.
+	a.GET("/orgs/:id/governance", orgGovH.GetGovernance)
+	a.PUT("/orgs/:id/governance", orgGovH.UpdateGovernance)
+	a.POST("/orgs/:id/governance/disable", orgGovH.DisableOrg)
+	a.POST("/orgs/:id/governance/enable", orgGovH.EnableOrg)
 
 	// ── Teams (flat — no nesting under /orgs to avoid Gin wildcard conflicts) ─
 	// Create: pass org_id in the request body.
@@ -256,8 +264,9 @@ func main() {
 	a.POST("/gpu/pack", gpuH.PackModels)
 
 	// ── Usage & Billing ───────────────────────────────────────────────────────
-	a.GET("/usage/teams/:id", usageH.GetTeamUsage)
-	a.GET("/usage/orgs/:id/monthly-spend", usageH.GetOrgSpend)
+	a.GET("/usage/orgs/:id/daily", usageH.GetOrgUsage)         // org-level billing (canonical)
+	a.GET("/usage/orgs/:id/monthly-spend", usageH.GetOrgSpend) // org monthly total spend
+	a.GET("/usage/teams/:id", usageH.GetTeamUsage)             // team usage (legacy, for admin UI)
 	a.POST("/usage/aggregate", usageH.TriggerAggregation)
 
 	// ── Model Aliases ─────────────────────────────────────────────────────────

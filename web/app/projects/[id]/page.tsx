@@ -772,7 +772,7 @@ export default function ProjectDetailPage() {
               <CardHeader><CardTitle className="text-base">Metadata</CardTitle></CardHeader>
               <CardContent className="text-sm grid grid-cols-2 gap-2 text-muted-foreground">
                 <div><span className="font-medium text-foreground">ID:</span> <span className="font-mono text-xs">{project.id}</span></div>
-                <div><span className="font-medium text-foreground">Team:</span> {project.team_id}</div>
+                <div><span className="font-medium text-foreground">Team:</span> {project.team_id || <span className="italic text-muted-foreground text-xs">No team (org-direct)</span>}</div>
                 <div><span className="font-medium text-foreground">Org:</span> {project.organization_id}</div>
                 <div><span className="font-medium text-foreground">Admission:</span> {project.admission_policy}</div>
                 <div><span className="font-medium text-foreground">Created:</span> {new Date(project.created_at).toLocaleString()}</div>

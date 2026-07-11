@@ -182,26 +182,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	req.Model = realModel
 	c.Set("model", realModel)
 
-	// ── 1b. Project override via header or request body ────────────────────
-	// X-Nexus-Project: <project-name-or-id> allows callers to specify which
-	// project this request belongs to, overriding the API key's project scope.
-	// This is useful when a team key is shared across projects.
+	// ── 1b. Project override via X-Nexus-Project header ──────────────────
+	// Allows callers to specify which project this request belongs to,
+	// overriding the API key's project scope.
+	// Project is looked up within the authenticated org (not team) so that
+	// org-level projects are reachable regardless of which team the key belongs to.
 	if projectHdr := c.GetHeader("X-Nexus-Project"); projectHdr != "" && h.db != nil {
 		var projRow struct {
 			ID             string `db:"id"`
 			Name           string `db:"name"`
 			PriorityWeight int    `db:"priority_weight"`
 		}
-		// Resolve by name (within team) or by UUID
 		lookupErr := h.db.GetContext(c.Request.Context(), &projRow, `
 			SELECT id::text, name, priority_weight
 			FROM projects
 			WHERE (name = $1 OR id::text = $1)
-			  AND team_id = $2
+			  AND organization_id = $2
 			  AND status = 'active'
-			LIMIT 1`, projectHdr, claims.TeamID)
+			LIMIT 1`, projectHdr, claims.OrgID)
 		if lookupErr == nil {
-			// Shallow-copy claims with project override so we don't mutate shared state.
 			overriddenClaims := *claims
 			overriddenClaims.ProjectID = projRow.ID
 			overriddenClaims.ProjectName = projRow.Name
@@ -212,16 +211,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	// ── 2. Gateway policy (temperature cap, tool restrictions, etc.) ───────
 	inputEst := estimateTokens(req.Messages)
-	if v := h.gwPolicy.Enforce(c.Request.Context(), claims.OrgID, claims.TeamID, "", &req, inputEst); v != nil {
+	if v := h.gwPolicy.Enforce(c.Request.Context(), claims.OrgID, claims.ProjectID, claims.TeamID, claims.APIKeyID, &req, inputEst); v != nil {
 		abortErr(c, http.StatusForbidden, v.Code, v.Message)
 		return
 	}
 
 	// ── 3. Infrastructure policy (rate limit, quota, ACL) ─────────────────
-	// Use project priority weight when available; fall back to team priority.
-	// This ensures high-priority projects are served before low-priority ones
-	// when the concurrency limit is reached.
-	effectivePriority := claims.TeamPriority
+	// Priority is derived from the project (org → project → priority_weight).
+	// If no project context, default to standard weight (500).
+	effectivePriority := 500 // default: standard business workload
 	if claims.ProjectPriorityWeight > 0 {
 		effectivePriority = claims.ProjectPriorityWeight
 	}
@@ -229,19 +227,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
 		Model:                req.Model,
 		EstimatedInputTokens: inputEst,
+		OrgID:                claims.OrgID,
 		TeamID:               claims.TeamID,
-		ProjectID:            claims.ProjectID, // project-level limits when scoped
+		ProjectID:            claims.ProjectID,
 	}, effectivePriority, tp)
 
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		if decision.QueueInstead {
 			c.Header("Retry-After", "5")
 			abortErr(c, http.StatusTooManyRequests, decision.RejectReason, "Request queued — retry shortly")
 			return
 		}
 		status := http.StatusForbidden
-		if decision.RejectReason == "rate_limit_exceeded" || decision.RejectReason == "daily_quota_exceeded" {
+		switch decision.RejectReason {
+		case "project_rate_limit_exceeded", "project_token_rate_exceeded",
+			"project_daily_budget_exceeded", "project_monthly_budget_exceeded",
+			"rate_limit_exceeded", "daily_quota_exceeded",
+			"org_monthly_budget_exceeded":
 			status = http.StatusTooManyRequests
 		}
 		abortErr(c, status, decision.RejectReason, "Request rejected by policy engine")
@@ -313,9 +316,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	// ── 6. Track inflight ─────────────────────────────────────────────────
-	_ = h.policy.IncrementInflight(c.Request.Context(), claims.TeamID)
-	_ = h.policy.IncrementProjectInflight(c.Request.Context(), claims.ProjectID)
-	middleware.ActiveRequests.WithLabelValues(claims.TeamName, req.Model).Inc()
+	// Project-scoped requests: only increment project inflight counter (Layer-1).
+	// Legacy team-only requests: increment team inflight counter.
+	// This ensures Team policy never throttles project-scoped requests.
+	if claims.ProjectID != "" {
+		_ = h.policy.IncrementProjectInflight(c.Request.Context(), claims.ProjectID)
+	} else {
+		_ = h.policy.IncrementInflight(c.Request.Context(), claims.TeamID)
+	}
+	middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, req.Model).Inc()
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
 	if h.activator != nil {
@@ -323,14 +332,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	start := time.Now()
 	defer func() {
-		_ = h.policy.DecrementInflight(context.Background(), claims.TeamID)
-		_ = h.policy.DecrementProjectInflight(context.Background(), claims.ProjectID)
-		middleware.ActiveRequests.WithLabelValues(claims.TeamName, req.Model).Dec()
+		if claims.ProjectID != "" {
+			_ = h.policy.DecrementProjectInflight(context.Background(), claims.ProjectID)
+		} else {
+			_ = h.policy.DecrementInflight(context.Background(), claims.TeamID)
+		}
+		middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, req.Model).Dec()
 		atomic.AddInt64(&ep.ActiveConns, -1)
 	}()
 
 	c.Header("X-Nexus-Request-ID", c.GetString(middleware.RequestIDKey))
-	c.Header("X-Nexus-Team-ID", claims.TeamID)
+	c.Header("X-Nexus-Org-ID", claims.OrgID)
 	c.Header("X-Nexus-Model", req.Model)
 	c.Header("X-Nexus-Endpoint", ep.ID)
 
@@ -358,7 +370,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				mode = "thinking"
 			}
 			middleware.ThinkingRequestsTotal.WithLabelValues(
-				claims.TeamName, req.Model, mode).Inc()
+				claims.TeamID, claims.ProjectID, req.Model, mode).Inc()
 		} else {
 			thinkingOn = thinking.ResolveMode(&req, thinkingCaps) // always false when !SupportsThinking
 			_ = thinkingOn
@@ -417,7 +429,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: ep.URL}
 				c.Header("X-Nexus-Thinking-Retry", "1")
 				middleware.ThinkingRequestsTotal.WithLabelValues(
-					claims.TeamName, req.Model, "fast_retry").Inc()
+					claims.TeamID, claims.ProjectID, req.Model, "fast_retry").Inc()
 				h.syncChat(c, claims, req, retryReq, backend, ep, start, thinkingCaps)
 				return
 			}
@@ -460,11 +472,18 @@ func (h *Handler) Embeddings(c *gin.Context) {
 
 	tp := h.teamPolicy(claims.TeamID)
 	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
-		Model:  req.Model,
-		TeamID: claims.TeamID,
-	}, claims.TeamPriority, tp)
+		Model:     req.Model,
+		OrgID:     claims.OrgID,
+		TeamID:    claims.TeamID,
+		ProjectID: claims.ProjectID,
+	}, func() int {
+		if claims.ProjectPriorityWeight > 0 {
+			return claims.ProjectPriorityWeight
+		}
+		return 500
+	}(), tp)
 	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamName, decision.RejectReason)
+		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
 		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected by policy engine")
 		return
 	}
@@ -487,8 +506,12 @@ func (h *Handler) Embeddings(c *gin.Context) {
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
-	_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, resp.Usage.TotalTokens, 0)
-	middleware.RecordTokens(claims.TeamName, req.Model, resp.Usage.TotalTokens, 0)
+	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID, resp.Usage.TotalTokens, 0)
+	_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID, resp.Usage.TotalTokens, 0)
+	if claims.ProjectID == "" {
+		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, resp.Usage.TotalTokens, 0)
+	}
+	middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model, resp.Usage.TotalTokens, 0)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: resp.Usage.TotalTokens,
@@ -717,7 +740,7 @@ func (h *Handler) syncChat(
 				thinkTok, _ := thinking.EstimateThinkingTokens(s)
 				if thinkTok > 0 {
 					middleware.ThinkingTokensTotal.WithLabelValues(
-						claims.TeamName, req.Model).Add(float64(thinkTok))
+						claims.TeamID, claims.ProjectID, req.Model).Add(float64(thinkTok))
 					chatResp.Usage.ThinkingTokens = thinkTok
 				}
 				contentEmpty = thinking.IsEmptyVisible(s)
@@ -725,11 +748,19 @@ func (h *Handler) syncChat(
 		}
 	}
 
-	_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
-		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	// ── Token usage recording ─────────────────────────────────────────────
+	// Layer-1: project token counters (RPM/TPM/daily/monthly budget tracking)
 	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
-	middleware.RecordTokens(claims.TeamName, req.Model,
+	// Layer-2: org monthly governance counter
+	_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID,
+		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	// Legacy: team daily quota counter (only meaningful for team-only keys)
+	if claims.ProjectID == "" {
+		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
+			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	}
+	middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model,
 		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 
 	visibleTok := chatResp.Usage.CompletionTokens - chatResp.Usage.ThinkingTokens
@@ -738,7 +769,7 @@ func (h *Handler) syncChat(
 	}
 	if thinkingCaps.SupportsThinking {
 		middleware.VisibleCompletionTokensTotal.WithLabelValues(
-			claims.TeamName, req.Model).Add(float64(visibleTok))
+			claims.TeamID, claims.ProjectID, req.Model).Add(float64(visibleTok))
 	}
 
 	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
@@ -910,7 +941,7 @@ func (h *Handler) streamChat(
 		}
 
 		if !firstToken {
-			middleware.ObserveTTFT(claims.TeamName, req.Model, time.Since(start))
+			middleware.ObserveTTFT(claims.TeamID, claims.ProjectID, req.Model, time.Since(start))
 			firstToken = true
 		}
 
@@ -951,9 +982,15 @@ func (h *Handler) streamChat(
 
 	latencyMs := int(time.Since(start).Milliseconds())
 	if promptTokens+completionTokens > 0 {
-		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, promptTokens, completionTokens)
+		// Layer-1: project token counters
 		_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID, promptTokens, completionTokens)
-		middleware.RecordTokens(claims.TeamName, req.Model, promptTokens, completionTokens)
+		// Layer-2: org monthly governance counter
+		_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID, promptTokens, completionTokens)
+		// Legacy: team daily quota (only for team-only keys)
+		if claims.ProjectID == "" {
+			_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, promptTokens, completionTokens)
+		}
+		middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model, promptTokens, completionTokens)
 	}
 	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
 	h.usageTracker.Record(context.Background(), usage.Event{

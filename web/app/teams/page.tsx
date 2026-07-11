@@ -9,404 +9,19 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, KeyRound, ChevronDown, ChevronUp, Pencil, Trash2, ShieldCheck, Cpu } from 'lucide-react'
-
-// ── Full policy editor (all 4 fields) ────────────────────────────────────────
-function PolicyCard({ team }: { team: Team }) {
-  const qc = useQueryClient()
-  const { data: policy } = useQuery({
-    queryKey: ['policy', team.id],
-    queryFn:  () => api.teams.getPolicy(team.id),
-  })
-
-  const [form, setForm] = useState({
-    rpm: '', tpd: '', max_concurrent: '', max_context_tokens: '',
-  })
-
-  const mut = useMutation({
-    mutationFn: () => api.teams.updatePolicy(team.id, {
-      ...(form.rpm               ? { rpm:                parseInt(form.rpm)               } : {}),
-      ...(form.tpd               ? { tpd:                parseInt(form.tpd)               } : {}),
-      ...(form.max_concurrent    ? { max_concurrent:     parseInt(form.max_concurrent)    } : {}),
-      ...(form.max_context_tokens? { max_context_tokens: parseInt(form.max_context_tokens)} : {}),
-    }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['policy', team.id] })
-      setForm({ rpm: '', tpd: '', max_concurrent: '', max_context_tokens: '' })
-      toast({ title: 'Policy updated — takes effect immediately' })
-    },
-    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
-  })
-
-  if (!policy) return <p className="text-sm text-muted-foreground py-2">Loading policy…</p>
-
-  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
-    setForm(p => ({ ...p, [k]: e.target.value }))
-
-  return (
-    <div className="mt-3 border-t pt-3 space-y-3">
-      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
-        <ShieldCheck className="w-3.5 h-3.5" />Rate Limits & Quotas
-      </p>
-
-      {/* Current values */}
-      <div className="grid grid-cols-2 gap-2 text-sm bg-gray-50 rounded-lg p-3">
-        <div>
-          <span className="text-muted-foreground text-xs">RPM</span>
-          <div className="font-semibold">{policy.rpm.toLocaleString()}</div>
-          <div className="text-xs text-muted-foreground">requests/min</div>
-        </div>
-        <div>
-          <span className="text-muted-foreground text-xs">TPD</span>
-          <div className="font-semibold">{policy.tpd.toLocaleString()}</div>
-          <div className="text-xs text-muted-foreground">tokens/day</div>
-        </div>
-        <div>
-          <span className="text-muted-foreground text-xs">Max concurrent</span>
-          <div className="font-semibold">{policy.max_concurrent}</div>
-          <div className="text-xs text-muted-foreground">parallel requests</div>
-        </div>
-        <div>
-          <span className="text-muted-foreground text-xs">Max context</span>
-          <div className="font-semibold">{policy.max_context_tokens.toLocaleString()}</div>
-          <div className="text-xs text-muted-foreground">tokens/request</div>
-        </div>
-      </div>
-
-      {/* Edit fields — leave blank to keep current value */}
-      <p className="text-xs text-muted-foreground">Leave a field blank to keep its current value.</p>
-      <div className="grid grid-cols-2 gap-2">
-        <div>
-          <Label className="text-xs">RPM</Label>
-          <Input className="h-8 text-sm" type="number" min={0}
-            value={form.rpm} onChange={set('rpm')} placeholder={String(policy.rpm)} />
-        </div>
-        <div>
-          <Label className="text-xs">TPD (tokens/day)</Label>
-          <Input className="h-8 text-sm" type="number" min={0}
-            value={form.tpd} onChange={set('tpd')} placeholder={String(policy.tpd)} />
-        </div>
-        <div>
-          <Label className="text-xs">Max concurrent</Label>
-          <Input className="h-8 text-sm" type="number" min={0}
-            value={form.max_concurrent} onChange={set('max_concurrent')}
-            placeholder={String(policy.max_concurrent)} />
-        </div>
-        <div>
-          <Label className="text-xs">Max context tokens</Label>
-          <Input className="h-8 text-sm" type="number" min={0}
-            value={form.max_context_tokens} onChange={set('max_context_tokens')}
-            placeholder={String(policy.max_context_tokens)} />
-        </div>
-      </div>
-      <Button size="sm" onClick={() => mut.mutate()} disabled={mut.isPending}>
-        {mut.isPending ? 'Saving…' : 'Update Policy'}
-      </Button>
-    </div>
-  )
-}
-
-// ── Model access management ───────────────────────────────────────────────────
-function ModelAccessSection({ team }: { team: Team }) {
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [revokeTarget, setRevokeTarget] = useState<string | null>(null)
-
-  const { data: allModels } = useQuery({
-    queryKey: ['models'],
-    queryFn:  () => api.models.list(),
-  })
-
-  const { data: grantedData, refetch: refetchGranted } = useQuery({
-    queryKey: ['team-models', team.id],
-    queryFn:  () => api.teams.listModels(team.id),
-  })
-
-  const grantedModels: string[] = grantedData?.models ?? []
-  const allModelNames = (allModels?.data ?? []).map(m => m.name)
-  const notGranted = allModelNames.filter(n => !grantedModels.includes(n))
-
-  const grantMut = useMutation({
-    // Grant all selected models in parallel
-    mutationFn: async (names: string[]) => {
-      await Promise.all(names.map(n => api.teams.addModel(team.id, n)))
-    },
-    onSuccess: () => {
-      toast({ title: `Access granted to ${selected.size} model${selected.size > 1 ? 's' : ''}` })
-      setSelected(new Set())
-      refetchGranted()
-    },
-    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
-  })
-
-  const revokeMut = useMutation({
-    mutationFn: (name: string) => api.teams.removeModel(team.id, name),
-    onSuccess: (_, name) => {
-      toast({ title: 'Access removed', description: name })
-      setRevokeTarget(null)
-      refetchGranted()
-    },
-    onError: (e: any) => {
-      toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' })
-      setRevokeTarget(null)
-    },
-  })
-
-  const toggleSelect = (name: string) => {
-    setSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(name)) next.delete(name)
-      else next.add(name)
-      return next
-    })
-  }
-
-  return (
-    <div className="mt-3 border-t pt-3 space-y-4">
-      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
-        <Cpu className="w-3.5 h-3.5" />Model Access
-      </p>
-
-      {/* Currently granted */}
-      <div>
-        <p className="text-xs text-muted-foreground mb-2">
-          Granted ({grantedModels.length}):
-        </p>
-        {grantedModels.length === 0 ? (
-          <p className="text-xs text-muted-foreground italic">No models granted yet.</p>
-        ) : (
-          <div className="space-y-1">
-            {grantedModels.map(name => (
-              <div key={name} className="flex items-center justify-between border rounded px-2 py-1.5 bg-green-50">
-                {revokeTarget === name ? (
-                  <>
-                    <span className="text-xs text-red-700">Remove <strong>{name}</strong>?</span>
-                    <div className="flex gap-1">
-                      <Button size="sm" variant="destructive" className="h-6 text-xs"
-                        disabled={revokeMut.isPending}
-                        onClick={() => revokeMut.mutate(name)}>
-                        {revokeMut.isPending ? '…' : 'Remove'}
-                      </Button>
-                      <Button size="sm" variant="outline" className="h-6 text-xs"
-                        onClick={() => setRevokeTarget(null)}>Cancel</Button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <span className="text-sm font-medium text-green-800">{name}</span>
-                    <Button variant="ghost" size="sm"
-                      className="h-6 text-xs text-red-400 hover:text-red-600 hover:bg-red-50"
-                      onClick={() => setRevokeTarget(name)}>
-                      Revoke
-                    </Button>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Grant multiple via checkboxes */}
-      {notGranted.length > 0 && (
-        <div>
-          <p className="text-xs text-muted-foreground mb-2">
-            Grant access — tick models then click Grant:
-          </p>
-          <div className="border rounded-md divide-y max-h-48 overflow-y-auto">
-            {notGranted.map(name => (
-              <label key={name}
-                className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-gray-50 text-sm">
-                <input
-                  type="checkbox"
-                  checked={selected.has(name)}
-                  onChange={() => toggleSelect(name)}
-                  className="w-4 h-4 accent-blue-600"
-                />
-                {name}
-              </label>
-            ))}
-          </div>
-          <div className="flex items-center justify-between mt-2">
-            <span className="text-xs text-muted-foreground">
-              {selected.size > 0 ? `${selected.size} selected` : 'None selected'}
-            </span>
-            <div className="flex gap-2">
-              {selected.size > 0 && (
-                <Button size="sm" variant="ghost" className="h-7 text-xs"
-                  onClick={() => setSelected(new Set())}>
-                  Clear
-                </Button>
-              )}
-              <Button size="sm" className="h-7"
-                disabled={selected.size === 0 || grantMut.isPending}
-                onClick={() => grantMut.mutate(Array.from(selected))}>
-                {grantMut.isPending ? 'Granting…' : `Grant ${selected.size > 0 ? `(${selected.size})` : ''}`}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {notGranted.length === 0 && allModelNames.length > 0 && (
-        <p className="text-xs text-green-700">All platform models are already granted to this team.</p>
-      )}
-      {allModelNames.length === 0 && (
-        <p className="text-xs text-muted-foreground">No models registered on this platform yet.</p>
-      )}
-    </div>
-  )
-}
-
-// Separate component so it can query independently
-function TeamModelList({ teamId, onRevoke, revoking }: {
-  teamId: string
-  onRevoke: (name: string) => void
-  revoking: boolean
-}) {
-  const [revokeTarget, setRevokeTarget] = useState<string | null>(null)
-
-  // Fetch via the models list + filter by team permissions via a proxy endpoint.
-  // Since we don't have a dedicated GET /teams/:id/models endpoint,
-  // we call GET /models and the backend returns only models allowed for the
-  // authenticated admin (all of them). We show them all with revoke buttons.
-  // Alternatively we use the /teams/:id/policy endpoint to detect what's loaded.
-  //
-  // For a correct list we use the models list and allow the admin to revoke any.
-  const { data } = useQuery({
-    queryKey: ['team-models', teamId],
-    queryFn:  () => api.models.list(),
-    refetchInterval: 30_000,
-  })
-  const models = data?.data ?? []
-
-  if (models.length === 0) {
-    return <p className="text-xs text-muted-foreground">No models registered on this platform yet.</p>
-  }
-
-  return (
-    <div className="space-y-1">
-      <p className="text-xs text-muted-foreground">Platform models — click × to revoke access for this team:</p>
-      <div className="flex flex-wrap gap-1.5">
-        {models.map(m => (
-          <div key={m.id}>
-            {revokeTarget === m.name ? (
-              <div className="flex items-center gap-1 border rounded px-2 py-0.5 bg-red-50 border-red-200">
-                <span className="text-xs text-red-700">Remove {m.name}?</span>
-                <Button size="sm" variant="destructive" className="h-5 text-xs px-1.5"
-                  disabled={revoking} onClick={() => { onRevoke(m.name); setRevokeTarget(null) }}>
-                  Yes
-                </Button>
-                <Button size="sm" variant="ghost" className="h-5 text-xs px-1"
-                  onClick={() => setRevokeTarget(null)}>No</Button>
-              </div>
-            ) : (
-              <span
-                className="inline-flex items-center gap-1 text-xs bg-blue-50 text-blue-700 border border-blue-200 rounded-full px-2.5 py-0.5 cursor-default group"
-              >
-                {m.name}
-                <button
-                  className="opacity-0 group-hover:opacity-100 transition-opacity text-blue-400 hover:text-red-500 ml-0.5"
-                  title={`Revoke ${m.name} for this team`}
-                  onClick={() => setRevokeTarget(m.name)}
-                >×</button>
-              </span>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// ── API Key section ────────────────────────────────────────────────────────────
-function ApiKeySection({ team }: { team: Team }) {
-  const qc = useQueryClient()
-  const [name, setName] = useState('')
-  const [newKey, setNewKey] = useState<string | null>(null)
-  const [revokeId, setRevokeId] = useState<string | null>(null)
-  const { data: keys } = useQuery({
-    queryKey: ['api-keys', team.id],
-    queryFn: () => api.apiKeys.list(team.id),
-  })
-  const create = useMutation({
-    mutationFn: () => api.apiKeys.create(team.id, name),
-    onSuccess: (data) => {
-      setNewKey(data.key); setName('')
-      qc.invalidateQueries({ queryKey: ['api-keys', team.id] })
-    },
-    onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
-  })
-  const revoke = useMutation({
-    mutationFn: (id: string) => api.apiKeys.revoke(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['api-keys', team.id] }); setRevokeId(null) },
-    onError: (e: any) => { toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }); setRevokeId(null) },
-  })
-  return (
-    <div className="mt-3 border-t pt-3">
-      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5 mb-2">
-        <KeyRound className="w-3.5 h-3.5" />API Keys
-      </p>
-      {newKey && (
-        <div className="mb-3 p-2 bg-green-50 border border-green-200 rounded text-xs">
-          <p className="font-semibold text-green-800 mb-1">Key created — save it now, shown once:</p>
-          <code className="break-all">{newKey}</code>
-          <Button variant="ghost" size="sm" className="ml-2 h-5 text-xs"
-            onClick={() => { navigator.clipboard.writeText(newKey); toast({ title: 'Copied!' }) }}>
-            Copy
-          </Button>
-        </div>
-      )}
-      <div className="flex gap-2 mb-3">
-        <Input className="h-7" placeholder="Key name" value={name} onChange={e => setName(e.target.value)} />
-        <Button size="sm" onClick={() => create.mutate()} disabled={!name || create.isPending}>
-          <KeyRound className="w-3.5 h-3.5 mr-1" />Create
-        </Button>
-      </div>
-      <div className="space-y-1">
-        {(keys?.data ?? []).map(k => (
-          <div key={k.id} className="flex items-center justify-between text-sm border rounded px-2 py-1">
-            {revokeId === k.id ? (
-              <>
-                <span className="text-xs text-red-700">Revoke <strong>{k.name}</strong>?</span>
-                <div className="flex gap-1">
-                  <Button size="sm" variant="destructive" className="h-6 text-xs"
-                    disabled={revoke.isPending} onClick={() => revoke.mutate(k.id)}>
-                    {revoke.isPending ? '…' : 'Revoke'}
-                  </Button>
-                  <Button size="sm" variant="outline" className="h-6 text-xs"
-                    onClick={() => setRevokeId(null)}>Cancel</Button>
-                </div>
-              </>
-            ) : (
-              <>
-                <span className="font-mono text-xs">{k.key_prefix}…</span>
-                <span className="text-muted-foreground text-xs">{k.name}</span>
-                <Button variant="ghost" size="sm" className="h-6 text-red-500 hover:text-red-700"
-                  onClick={() => setRevokeId(k.id)}>Revoke</Button>
-              </>
-            )}
-          </div>
-        ))}
-        {(keys?.data ?? []).length === 0 && (
-          <p className="text-xs text-muted-foreground">No API keys yet.</p>
-        )}
-      </div>
-    </div>
-  )
-}
+import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, Users, FolderKanban } from 'lucide-react'
+import Link from 'next/link'
 
 // ── Edit team form ─────────────────────────────────────────────────────────────
 function EditTeamForm({ team, onDone }: { team: Team; onDone: () => void }) {
   const qc = useQueryClient()
   const [name, setName] = useState(team.name)
   const [slug, setSlug] = useState(team.slug)
-  const [priority, setPriority] = useState(String(team.priority))
 
   const mut = useMutation({
     mutationFn: () => api.teams.update(team.id, {
-      name:     name !== team.name ? name : undefined,
-      slug:     slug !== team.slug ? slug : undefined,
-      priority: parseInt(priority) !== team.priority ? parseInt(priority) : undefined,
+      name: name !== team.name ? name : undefined,
+      slug: slug !== team.slug ? slug : undefined,
     }),
     onSuccess: () => {
       toast({ title: 'Team updated' })
@@ -420,10 +35,6 @@ function EditTeamForm({ team, onDone }: { team: Team; onDone: () => void }) {
     <form onSubmit={e => { e.preventDefault(); mut.mutate() }} className="space-y-3">
       <div><Label>Name</Label><Input value={name} onChange={e => setName(e.target.value)} required /></div>
       <div><Label>Slug</Label><Input value={slug} onChange={e => setSlug(e.target.value)} required /></div>
-      <div>
-        <Label>Priority (1–100)</Label>
-        <Input type="number" value={priority} onChange={e => setPriority(e.target.value)} min="1" max="100" />
-      </div>
       <div className="flex gap-2">
         <Button type="submit" disabled={mut.isPending}>{mut.isPending ? 'Saving…' : 'Save Changes'}</Button>
         <Button type="button" variant="outline" onClick={onDone}>Cancel</Button>
@@ -436,9 +47,23 @@ function EditTeamForm({ team, onDone }: { team: Team; onDone: () => void }) {
 function TeamCard({ team }: { team: Team }) {
   const qc = useQueryClient()
   const [expanded, setExpanded] = useState(false)
-  const [activeTab, setActiveTab] = useState<'policy' | 'models' | 'keys'>('policy')
   const [editOpen, setEditOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+
+  // Load projects for this team (RBAC assignment display)
+  const { data: projectsData } = useQuery({
+    queryKey: ['projects-for-team', team.id],
+    queryFn: () => api.projects.list({ team_id: team.id }),
+    enabled: expanded,
+  })
+  const teamProjects = projectsData?.data ?? []
+
+  // Load model access for this team
+  const { data: modelsData } = useQuery({
+    queryKey: ['team-models', team.id],
+    queryFn: () => api.teams.listModels(team.id),
+    enabled: expanded,
+  })
 
   const deleteMut = useMutation({
     mutationFn: () => api.teams.delete(team.id),
@@ -479,8 +104,11 @@ function TeamCard({ team }: { team: Team }) {
             {/* Header row */}
             <div className="flex items-center justify-between">
               <div>
-                <p className="font-semibold">{team.name}</p>
-                <p className="text-xs text-muted-foreground">{team.slug} · priority {team.priority}</p>
+                <div className="flex items-center gap-2">
+                  <p className="font-semibold">{team.name}</p>
+                  <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">RBAC only</span>
+                </div>
+                <p className="text-xs text-muted-foreground mt-0.5">{team.slug}</p>
               </div>
               <div className="flex items-center gap-1">
                 <Button variant="ghost" size="sm" onClick={() => setEditOpen(true)} title="Edit">
@@ -497,30 +125,69 @@ function TeamCard({ team }: { team: Team }) {
               </div>
             </div>
 
-            {/* Expanded content with tabs */}
+            {/* Expanded: membership info only */}
             {expanded && (
-              <div className="mt-3 border-t pt-3">
-                {/* Tab bar */}
-                <div className="flex gap-0.5 mb-3 border-b">
-                  {([
-                    { key: 'policy', label: 'Rate Limits' },
-                    { key: 'models', label: 'Model Access' },
-                    { key: 'keys',   label: 'API Keys' },
-                  ] as const).map(tab => (
-                    <button key={tab.key} onClick={() => setActiveTab(tab.key)}
-                      className={`px-3 py-1.5 text-sm font-medium border-b-2 transition-colors ${
-                        activeTab === tab.key
-                          ? 'border-blue-600 text-blue-600'
-                          : 'border-transparent text-muted-foreground hover:text-foreground'
-                      }`}>
-                      {tab.label}
-                    </button>
-                  ))}
+              <div className="mt-3 border-t pt-3 space-y-4">
+                {/* Project assignments (read-only view) */}
+                <div>
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5 mb-2">
+                    <FolderKanban className="w-3.5 h-3.5" />Project Assignments
+                  </p>
+                  <p className="text-xs text-muted-foreground mb-2">
+                    Projects using this team for RBAC grouping. Rate limits, quotas and scheduling belong to the Project, not the Team.
+                  </p>
+                  {teamProjects.length === 0 ? (
+                    <p className="text-xs text-muted-foreground italic">No projects assigned to this team yet.</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-1.5">
+                      {teamProjects.map(p => (
+                        <Link key={p.id} href={`/projects/${p.id}`}
+                          className="inline-flex items-center gap-1 text-xs bg-blue-50 text-blue-700 border border-blue-200 rounded-full px-2.5 py-0.5 hover:bg-blue-100 transition-colors">
+                          <FolderKanban className="w-3 h-3" />
+                          {p.name}
+                          <span className="text-blue-400 text-[10px]">(w:{p.priority_weight})</span>
+                        </Link>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-2">
+                    <Link href={`/projects`}
+                      className="text-xs text-blue-600 hover:underline">
+                      Manage project assignments in Projects →
+                    </Link>
+                  </div>
                 </div>
 
-                {activeTab === 'policy' && <PolicyCard team={team} />}
-                {activeTab === 'models' && <ModelAccessSection team={team} />}
-                {activeTab === 'keys'   && <ApiKeySection team={team} />}
+                {/* Model access (team-level model permissions for RBAC) */}
+                <div>
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5 mb-2">
+                    <Users className="w-3.5 h-3.5" />Allowed Models (RBAC)
+                  </p>
+                  <p className="text-xs text-muted-foreground mb-2">
+                    Models this team's members can access. Scheduling and quota is controlled per-project.
+                  </p>
+                  {(modelsData?.models ?? []).length === 0 ? (
+                    <p className="text-xs text-muted-foreground italic">No model permissions granted yet.</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-1.5">
+                      {(modelsData?.models ?? []).map(name => (
+                        <span key={name}
+                          className="inline-flex items-center text-xs bg-green-50 text-green-700 border border-green-200 rounded-full px-2.5 py-0.5">
+                          {name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Info notice */}
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                  <p className="font-semibold mb-1">Teams are RBAC/membership only</p>
+                  <p>Priority, rate limits, quotas, usage analytics and billing are all configured per Project. Teams only group members and grant model permissions.</p>
+                  <Link href="/projects" className="text-amber-700 underline mt-1 inline-block">
+                    Configure execution settings in Projects →
+                  </Link>
+                </div>
               </div>
             )}
           </>
@@ -533,10 +200,10 @@ function TeamCard({ team }: { team: Team }) {
 // ── Create team form ───────────────────────────────────────────────────────────
 function CreateTeamForm({ onDone }: { onDone: () => void }) {
   const { data: orgs } = useQuery({ queryKey: ['orgs'], queryFn: api.orgs.list })
-  const [form, setForm] = useState({ org_id: '', name: '', slug: '', priority: '5' })
+  const [form, setForm] = useState({ org_id: '', name: '', slug: '' })
   const mut = useMutation({
     mutationFn: () => api.teams.create({
-      org_id: form.org_id, name: form.name, slug: form.slug, priority: parseInt(form.priority),
+      org_id: form.org_id, name: form.name, slug: form.slug,
     }),
     onSuccess: () => { toast({ title: 'Team created', description: form.name }); onDone() },
     onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
@@ -556,11 +223,9 @@ function CreateTeamForm({ onDone }: { onDone: () => void }) {
       </div>
       <div><Label>Team name *</Label><Input value={form.name} onChange={set('name')} required /></div>
       <div><Label>Slug *</Label><Input value={form.slug} onChange={set('slug')} placeholder="my-team" required /></div>
-      <div>
-        <Label>Priority (1–100)</Label>
-        <Input type="number" value={form.priority} onChange={set('priority')} min="1" max="100" />
-        <p className="text-xs text-muted-foreground mt-1">Higher priority = served first under load</p>
-      </div>
+      <p className="text-xs text-muted-foreground">
+        Teams are for RBAC and membership grouping only. Rate limits, quotas and priority are configured per Project.
+      </p>
       <Button type="submit" disabled={mut.isPending} className="w-full">
         {mut.isPending ? 'Creating…' : 'Create Team'}
       </Button>
@@ -584,7 +249,7 @@ export default function TeamsPage() {
         <div>
           <h1 className="text-2xl font-bold">Teams</h1>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Manage teams, rate limits, model access, and API keys
+            Membership and RBAC grouping — rate limits and quotas belong to Projects
           </p>
         </div>
         <Dialog open={open} onOpenChange={setOpen}>
@@ -596,6 +261,15 @@ export default function TeamsPage() {
             <CreateTeamForm onDone={() => { setOpen(false); qc.invalidateQueries({ queryKey: ['teams'] }) }} />
           </DialogContent>
         </Dialog>
+      </div>
+
+      {/* Notice */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-800">
+        <p className="font-semibold mb-1">Teams are RBAC/membership only (migration 031)</p>
+        <p>All execution concepts (priority, rate limits, quotas, scheduling, usage, billing) have moved to <strong>Projects</strong>. Teams now manage members, roles and model access permissions.</p>
+        <Link href="/projects" className="text-blue-700 underline mt-1 inline-block">
+          Manage execution settings in Projects →
+        </Link>
       </div>
 
       {isLoading ? <p className="text-muted-foreground">Loading…</p> : (

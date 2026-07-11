@@ -24,11 +24,13 @@ const nav: NavItem[] = [
   { href: '/ha',        label: 'High Availability', icon: Shield },
   { href: '/services',  label: 'AI Services',    icon: Box },
 
-  { section: 'header',  label: 'ACCESS' },
-  { href: '/orgs',      label: 'Organizations',  icon: Building2 },
-  { href: '/teams',     label: 'Teams',          icon: Users },
+  { section: 'header',  label: 'EXECUTION' },
   { href: '/projects',  label: 'Projects',       icon: FolderKanban },
   { href: '/api-keys',  label: 'API Keys',       icon: KeyRound },
+
+  { section: 'header',  label: 'GOVERNANCE' },
+  { href: '/orgs',      label: 'Organizations',  icon: Building2 },
+  { href: '/teams',     label: 'Teams',          icon: Users },
 
   { section: 'header',  label: 'INFRASTRUCTURE' },
   { href: '/cluster',   label: 'Cluster',        icon: Network },

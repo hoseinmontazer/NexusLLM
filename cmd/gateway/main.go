@@ -144,6 +144,7 @@ func main() {
 	}()
 
 	seedModelPermissions(ctx, db, policyEngine, log)
+	seedProjectPolicies(ctx, db, policyEngine, log)
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
 	proxyHandler := proxy.NewHandler(
@@ -164,6 +165,7 @@ func main() {
 			case <-t.C:
 				fresh := loadTeamPolicies(watchCtx, db, log)
 				seedModelPermissions(watchCtx, db, policyEngine, log)
+				seedProjectPolicies(watchCtx, db, policyEngine, log)
 				proxyHandler.SwapTeamPolicies(fresh)
 			}
 		}
@@ -264,20 +266,64 @@ func loadTeamPolicies(ctx context.Context, db *sqlx.DB, log *zap.Logger) map[str
 }
 
 func seedModelPermissions(ctx context.Context, db *sqlx.DB, engine *policy.Engine, log *zap.Logger) {
+	// Seed org-level ACL sets (canonical — used by the policy engine Step 0).
+	// Also seeds the legacy team-level sets so that old behavior is preserved
+	// for any team-only API keys that haven't been migrated to project scope.
 	type row struct {
+		OrgID     string `db:"org_id"`
 		TeamID    string `db:"team_id"`
 		ModelName string `db:"model_name"`
 	}
 	var rows []row
 	_ = db.SelectContext(ctx, &rows, `
-		SELECT tmp.team_id, m.name AS model_name
+		SELECT t.org_id, tmp.team_id, m.name AS model_name
 		FROM team_model_permissions tmp
 		JOIN models m ON m.id = tmp.model_id
+		JOIN teams  t ON t.id  = tmp.team_id
 		WHERE m.enabled = TRUE`)
 	for _, r := range rows {
+		// Org-level (canonical)
+		if err := engine.SetOrgModelAllowed(ctx, r.OrgID, r.ModelName); err != nil {
+			log.Warn("failed to seed org model permission", zap.Error(err))
+		}
+		// Team-level (legacy fallback)
 		if err := engine.SetModelAllowed(ctx, r.TeamID, r.ModelName); err != nil {
-			log.Warn("failed to seed model permission", zap.Error(err))
+			log.Warn("failed to seed team model permission", zap.Error(err))
 		}
 	}
 	log.Info("model permissions seeded", zap.Int("count", len(rows)))
+}
+
+// seedProjectPolicies loads all project_policies rows and pushes them into the
+// Redis Layer-1 policy cache. Called at startup and on the 60s reload cycle so
+// the gateway hot path never needs a DB round-trip for policy evaluation.
+func seedProjectPolicies(ctx context.Context, db *sqlx.DB, engine *policy.Engine, log *zap.Logger) {
+	type row struct {
+		ProjectID          string `db:"project_id"`
+		RPM                int    `db:"rpm"`
+		TPM                int    `db:"tpm"`
+		MaxConcurrent      int    `db:"max_concurrent"`
+		MaxContextTokens   int    `db:"max_context_tokens"`
+		DailyTokenBudget   int64  `db:"daily_token_budget"`
+		MonthlyTokenBudget int64  `db:"monthly_token_budget"`
+	}
+	var rows []row
+	if err := db.SelectContext(ctx, &rows,
+		`SELECT project_id::text, rpm, tpm, max_concurrent, max_context_tokens,
+		        daily_token_budget, monthly_token_budget
+		 FROM project_policies`); err != nil {
+		log.Warn("could not seed project policies (table may not exist yet)", zap.Error(err))
+		return
+	}
+	for _, r := range rows {
+		_ = engine.SetProjectPolicy(ctx, r.ProjectID, policy.ProjectPolicy{
+			RPMLimit:           r.RPM,
+			TPMLimit:           r.TPM,
+			MaxConcurrent:      r.MaxConcurrent,
+			MaxContextTokens:   r.MaxContextTokens,
+			DailyTokenBudget:   r.DailyTokenBudget,
+			MonthlyTokenBudget: r.MonthlyTokenBudget,
+		})
+	}
+	log.Info("project policies seeded", zap.Int("count", len(rows)))
 }

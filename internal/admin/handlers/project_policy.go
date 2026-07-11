@@ -153,12 +153,12 @@ func (h *ProjectPolicyHandler) UpdatePolicy(c *gin.Context) {
 }
 
 // ─── GET /admin/v1/projects/:id/quota ────────────────────────────────────────
-// Returns live Redis counters — current RPM usage, inflight, daily tokens used.
+// Returns live Redis counters — current RPM usage, inflight, daily and monthly tokens used.
 
 func (h *ProjectPolicyHandler) GetQuotaStatus(c *gin.Context) {
 	id := c.Param("id")
 
-	// Live counters from Redis
+	// Live counters from Redis (Layer-1 project counters)
 	live := h.pEngine.GetProjectQuotaStatus(c.Request.Context(), id)
 
 	// DB policy limits
@@ -187,16 +187,27 @@ func (h *ProjectPolicyHandler) GetQuotaStatus(c *gin.Context) {
 		"monthly_token_budget": pr.MonthlyTokenBudget,
 		"daily_cost_budget":    pr.DailyCostBudget,
 		"monthly_cost_budget":  pr.MonthlyCostBudget,
-		// Live counters
-		"daily_tokens_used": live["daily_tokens_used"],
-		"tpm_current":       live["tpm_current"],
-		"inflight":          live["inflight"],
-		// Computed remaining (0 limit = unlimited → nil)
+		// Live counters (Layer-1 Redis state)
+		"daily_tokens_used":   live["daily_tokens_used"],
+		"monthly_tokens_used": live["monthly_tokens_used"],
+		"tpm_current":         live["tpm_current"],
+		"inflight":            live["inflight"],
+		// Computed remaining (nil = unlimited)
 		"daily_tokens_remaining": func() interface{} {
 			if pr.DailyTokenBudget <= 0 {
 				return nil
 			}
 			rem := pr.DailyTokenBudget - live["daily_tokens_used"]
+			if rem < 0 {
+				rem = 0
+			}
+			return rem
+		}(),
+		"monthly_tokens_remaining": func() interface{} {
+			if pr.MonthlyTokenBudget <= 0 {
+				return nil
+			}
+			rem := pr.MonthlyTokenBudget - live["monthly_tokens_used"]
 			if rem < 0 {
 				rem = 0
 			}

@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { api, type Project, type ProjectStatus, type PriorityPreset } from '@/lib/api'
 import { PriorityBadge, PriorityBar } from '@/components/projects/PriorityBadge'
@@ -77,7 +78,7 @@ function CreateProjectForm({ onDone, presets }: { onDone: () => void; presets: P
   const mut = useMutation({
     mutationFn: () => api.projects.create({
       organization_id: form.organization_id,
-      team_id: form.team_id,
+      team_id: form.team_id || undefined,
       name: form.name,
       description: form.description || undefined,
       priority_weight: form.priority_weight,
@@ -105,12 +106,13 @@ function CreateProjectForm({ onDone, presets }: { onDone: () => void; presets: P
           </select>
         </div>
         <div className="col-span-2">
-          <Label>Team *</Label>
+          <Label>Team <span className="text-muted-foreground font-normal text-xs">(optional — RBAC grouping only)</span></Label>
           <select className="w-full border rounded-md h-9 px-3 text-sm mt-1"
-            value={form.team_id} onChange={set('team_id')} required disabled={!form.organization_id}>
-            <option value="">Select team…</option>
+            value={form.team_id} onChange={set('team_id')} disabled={!form.organization_id}>
+            <option value="">No team (org-direct project)</option>
             {teamsData?.data?.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
+          <p className="text-xs text-muted-foreground mt-0.5">Teams are RBAC only. Rate limits, quota and priority belong to the project.</p>
         </div>
         <div className="col-span-2">
           <Label>Project name *</Label>
@@ -146,16 +148,33 @@ function CreateProjectForm({ onDone, presets }: { onDone: () => void; presets: P
   )
 }
 
+// ── Org filter ────────────────────────────────────────────────────────────────
+function OrgFilter({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { data: orgsData } = useQuery({ queryKey: ['orgs'], queryFn: api.orgs.list })
+  return (
+    <select className="border rounded-md h-8 px-2 text-sm"
+      value={value} onChange={e => onChange(e.target.value)}>
+      <option value="">All orgs</option>
+      {(orgsData?.data ?? []).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+    </select>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function ProjectsPage() {
+  const searchParams = useSearchParams()
+  const orgIdFromUrl = searchParams.get('org_id') ?? ''
+
   const [open, setOpen] = useState(false)
   const [filterStatus, setFilterStatus] = useState('active')
+  const [filterOrgId, setFilterOrgId]   = useState(orgIdFromUrl)
 
   const params: Record<string, string> = {}
-  if (filterStatus) params.status = filterStatus
+  if (filterStatus) params.status  = filterStatus
+  if (filterOrgId)  params.org_id  = filterOrgId
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['projects', filterStatus],
+    queryKey: ['projects', filterStatus, filterOrgId],
     queryFn: () => api.projects.list(params),
     refetchInterval: 15_000,
   })
@@ -175,7 +194,7 @@ export default function ProjectsPage() {
           <div>
             <h1 className="text-2xl font-bold">Projects</h1>
             <p className="text-sm text-muted-foreground">
-              {data?.total ?? 0} project{(data?.total ?? 0) !== 1 ? 's' : ''} — SLA enforcement units
+              {data?.total ?? 0} project{(data?.total ?? 0) !== 1 ? 's' : ''} — execution &amp; billing units
             </p>
           </div>
         </div>
@@ -191,14 +210,15 @@ export default function ProjectsPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex gap-3 items-center">
+      <div className="flex gap-3 items-center flex-wrap">
+        <OrgFilter value={filterOrgId} onChange={setFilterOrgId} />
         <select className="border rounded-md h-8 px-2 text-sm"
           value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>
           <option value="">All statuses</option>
           {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
-        {filterStatus !== 'active' && (
-          <Button variant="ghost" size="sm" onClick={() => setFilterStatus('active')}>
+        {(filterStatus !== 'active' || filterOrgId) && (
+          <Button variant="ghost" size="sm" onClick={() => { setFilterStatus('active'); setFilterOrgId('') }}>
             Reset
           </Button>
         )}

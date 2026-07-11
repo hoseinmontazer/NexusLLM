@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { toast } from '@/components/ui/toaster'
 import { PriorityBadge } from '@/components/projects/PriorityBadge'
-import { KeyRound, Copy, Trash2, FolderKanban, Users } from 'lucide-react'
+import { KeyRound, Copy, Trash2, FolderKanban, Building2 } from 'lucide-react'
 
 // ─── types ────────────────────────────────────────────────────────────────────
 interface ApiKeyRow {
@@ -29,21 +29,32 @@ interface ApiKeyRow {
 export default function ApiKeysPage() {
   const qc = useQueryClient()
 
-  // Selectors
+  // Project-first: select org → project → create key
+  const [selectedOrg, setSelectedOrg]         = useState('')
   const [selectedTeam, setSelectedTeam]       = useState('')
   const [selectedProject, setSelectedProject] = useState('')
-  const [scope, setScope]                     = useState<'team' | 'project'>('team')
   const [keyName, setKeyName]                 = useState('')
   const [newKey, setNewKey]                   = useState<string | null>(null)
   const [revokeConfirm, setRevokeConfirm]     = useState<string | null>(null)
+  const [expiresAt, setExpiresAt]             = useState('')
 
-  const { data: teams }    = useQuery({ queryKey: ['teams'],   queryFn: () => api.teams.list() })
-  const { data: projects } = useQuery({
-    queryKey: ['projects-for-team', selectedTeam],
-    queryFn:  () => api.projects.list({ team_id: selectedTeam, status: 'active' }),
-    enabled:  !!selectedTeam,
+  const { data: orgsData }  = useQuery({ queryKey: ['orgs'],  queryFn: () => api.orgs.list() })
+  const { data: teamsData } = useQuery({
+    queryKey: ['teams', selectedOrg],
+    queryFn:  () => api.teams.list(selectedOrg || undefined),
+    enabled: !!selectedOrg,
+  })
+  const { data: projectsData } = useQuery({
+    queryKey: ['projects-for-apikey', selectedOrg, selectedTeam],
+    queryFn: () => api.projects.list({
+      org_id: selectedOrg || undefined,
+      team_id: selectedTeam || undefined,
+      status: 'active',
+    }),
+    enabled: !!selectedOrg,
   })
 
+  // List keys scoped to selected team (backend still routes via team)
   const { data: keys, isLoading } = useQuery({
     queryKey: ['api-keys', selectedTeam],
     queryFn:  () => api.apiKeys.list(selectedTeam),
@@ -54,15 +65,18 @@ export default function ApiKeysPage() {
     mutationFn: () => api.apiKeys.create(
       selectedTeam,
       keyName,
-      undefined,
-      scope === 'project' && selectedProject ? selectedProject : undefined,
+      expiresAt || undefined,
+      selectedProject || undefined,
     ),
     onSuccess: (data: any) => {
       setNewKey(data.key)
       setKeyName('')
-      setSelectedProject('')
+      setExpiresAt('')
       qc.invalidateQueries({ queryKey: ['api-keys', selectedTeam] })
-      toast({ title: 'API key created', description: scope === 'project' ? `Scoped to project: ${data.project_name}` : 'Team-scoped key' })
+      const scopeDesc = data.project_name
+        ? `Scoped to project: ${data.project_name} (priority ${data.project_priority_weight})`
+        : 'Team-scoped key (inherits team defaults)'
+      toast({ title: 'API key created', description: scopeDesc })
     },
     onError: (e: any) => toast({ title: 'Error', description: e.message, variant: 'destructive' }),
   })
@@ -77,35 +91,60 @@ export default function ApiKeysPage() {
     onError: (e: any) => { toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }); setRevokeConfirm(null) },
   })
 
-  const projectList = projects?.data ?? []
+  const projectList       = projectsData?.data ?? []
   const keyList: ApiKeyRow[] = (keys?.data ?? []) as ApiKeyRow[]
-  const selectedProjectObj = projectList.find(p => p.id === selectedProject)
+  const selectedProjectObj  = projectList.find(p => p.id === selectedProject)
 
-  const canCreate = !!keyName && !!selectedTeam && (scope === 'team' || !!selectedProject)
+  const canCreate = !!keyName && !!selectedTeam
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">API Keys</h1>
         <p className="text-sm text-muted-foreground mt-0.5">
-          Keys can be scoped to a team or to a specific project for precise priority control
+          Keys are issued per project — each key inherits its project&apos;s priority, rate limits and quota.
         </p>
       </div>
 
-      {/* Team selector */}
+      {/* Notice */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800">
+        <p className="font-semibold mb-0.5">Projects are the execution unit</p>
+        <p>Scope each key to a Project to enforce that project&apos;s rate limits, token quotas and scheduling priority. Keys without a project scope fall back to team-level defaults.</p>
+      </div>
+
+      {/* Step 1: Select Org */}
       <Card>
-        <CardContent className="pt-4">
-          <Label>Team</Label>
-          <select
-            className="w-full border rounded-md h-9 px-3 text-sm mt-1"
-            value={selectedTeam}
-            onChange={e => { setSelectedTeam(e.target.value); setNewKey(null); setSelectedProject('') }}
-          >
-            <option value="">Choose a team…</option>
-            {(teams?.data ?? []).map(t => (
-              <option key={t.id} value={t.id}>{t.name}</option>
-            ))}
-          </select>
+        <CardContent className="pt-4 space-y-3">
+          <div>
+            <Label className="flex items-center gap-1.5"><Building2 className="w-3.5 h-3.5" />Organization *</Label>
+            <select
+              className="w-full border rounded-md h-9 px-3 text-sm mt-1"
+              value={selectedOrg}
+              onChange={e => { setSelectedOrg(e.target.value); setSelectedTeam(''); setSelectedProject(''); setNewKey(null) }}
+            >
+              <option value="">Choose an organization…</option>
+              {(orgsData?.data ?? []).map(o => (
+                <option key={o.id} value={o.id}>{o.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {selectedOrg && (
+            <div>
+              <Label>Team * <span className="text-muted-foreground font-normal">(for key ownership)</span></Label>
+              <select
+                className="w-full border rounded-md h-9 px-3 text-sm mt-1"
+                value={selectedTeam}
+                onChange={e => { setSelectedTeam(e.target.value); setSelectedProject(''); setNewKey(null) }}
+              >
+                <option value="">Choose a team…</option>
+                {(teamsData?.data ?? []).map(t => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground mt-1">Teams own API keys for RBAC purposes. Actual execution settings come from the Project.</p>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -114,7 +153,7 @@ export default function ApiKeysPage() {
           {/* Create new key */}
           <Card>
             <CardHeader><CardTitle className="text-base flex items-center gap-2">
-              <KeyRound className="w-4 h-4" />Create New Key
+              <KeyRound className="w-4 h-4" />Create New API Key
             </CardTitle></CardHeader>
             <CardContent className="space-y-4">
               {newKey && (
@@ -131,74 +170,63 @@ export default function ApiKeysPage() {
                 </div>
               )}
 
-              {/* Scope selector */}
+              {/* Project scope — primary selection */}
               <div>
-                <Label className="text-xs mb-1 block">Key Scope</Label>
-                <div className="flex gap-0 border rounded-md overflow-hidden text-sm">
-                  <button
-                    type="button"
-                    onClick={() => { setScope('team'); setSelectedProject('') }}
-                    className={`flex items-center gap-2 px-4 py-2 flex-1 justify-center transition-colors ${
-                      scope === 'team' ? 'bg-gray-900 text-white' : 'bg-white text-muted-foreground hover:bg-gray-50'
-                    }`}
-                  >
-                    <Users className="w-3.5 h-3.5" />Team
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setScope('project')}
-                    className={`flex items-center gap-2 px-4 py-2 flex-1 justify-center transition-colors ${
-                      scope === 'project' ? 'bg-gray-900 text-white' : 'bg-white text-muted-foreground hover:bg-gray-50'
-                    }`}
-                    disabled={projectList.length === 0}
-                  >
-                    <FolderKanban className="w-3.5 h-3.5" />Project
-                  </button>
-                </div>
-                {scope === 'team' && (
+                <Label className="flex items-center gap-1.5 mb-1">
+                  <FolderKanban className="w-3.5 h-3.5" />
+                  Project Scope <span className="text-muted-foreground font-normal text-xs">(recommended — inherits project priority &amp; quota)</span>
+                </Label>
+                <select
+                  className="w-full border rounded-md h-9 px-3 text-sm"
+                  value={selectedProject}
+                  onChange={e => setSelectedProject(e.target.value)}
+                >
+                  <option value="">No project scope (team defaults)</option>
+                  {projectList.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — priority {p.priority_weight} ({p.priority_label})
+                    </option>
+                  ))}
+                </select>
+                {selectedProjectObj ? (
+                  <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                    <FolderKanban className="w-3.5 h-3.5" />
+                    Requests will use priority
+                    <PriorityBadge weight={selectedProjectObj.priority_weight} label={selectedProjectObj.priority_label} showWeight />
+                    {' '}· rate limits from project policy
+                  </div>
+                ) : (
                   <p className="text-xs text-muted-foreground mt-1">
-                    Key inherits the team's default priority. Use project scope for fine-grained scheduling.
+                    Without a project scope, requests will use team-level defaults. Assign to a project for precise scheduling.
                   </p>
                 )}
               </div>
 
-              {/* Project picker */}
-              {scope === 'project' && (
+              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <Label className="text-xs">Project *</Label>
-                  <select
-                    className="w-full border rounded-md h-9 px-3 text-sm mt-1"
-                    value={selectedProject}
-                    onChange={e => setSelectedProject(e.target.value)}
-                  >
-                    <option value="">Select project…</option>
-                    {projectList.map(p => (
-                      <option key={p.id} value={p.id}>
-                        {p.name} — priority {p.priority_weight} ({p.priority_label})
-                      </option>
-                    ))}
-                  </select>
-                  {selectedProjectObj && (
-                    <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                      <FolderKanban className="w-3.5 h-3.5" />
-                      Requests will use priority
-                      <PriorityBadge weight={selectedProjectObj.priority_weight} label={selectedProjectObj.priority_label} showWeight />
-                    </div>
-                  )}
+                  <Label>Key Name *</Label>
+                  <Input
+                    placeholder="e.g. chatbot-prod"
+                    value={keyName}
+                    onChange={e => setKeyName(e.target.value)}
+                    className="mt-1"
+                  />
                 </div>
-              )}
-
-              <div className="flex gap-2">
-                <Input
-                  placeholder="Key name (e.g. chatbot-prod)"
-                  value={keyName}
-                  onChange={e => setKeyName(e.target.value)}
-                />
-                <Button onClick={() => create.mutate()} disabled={!canCreate || create.isPending}>
-                  <KeyRound className="w-4 h-4 mr-1" />
-                  {create.isPending ? 'Creating…' : 'Create'}
-                </Button>
+                <div>
+                  <Label>Expiration <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                  <Input
+                    type="date"
+                    value={expiresAt}
+                    onChange={e => setExpiresAt(e.target.value)}
+                    className="mt-1"
+                  />
+                </div>
               </div>
+
+              <Button onClick={() => create.mutate()} disabled={!canCreate || create.isPending}>
+                <KeyRound className="w-4 h-4 mr-1" />
+                {create.isPending ? 'Creating…' : 'Create API Key'}
+              </Button>
             </CardContent>
           </Card>
 
@@ -219,9 +247,10 @@ export default function ApiKeysPage() {
                       <tr className="border-b text-xs text-muted-foreground">
                         <th className="text-left pb-2 font-medium">Key Name</th>
                         <th className="text-left pb-2 font-medium">Prefix</th>
-                        <th className="text-left pb-2 font-medium">Scope</th>
+                        <th className="text-left pb-2 font-medium">Project Scope</th>
                         <th className="text-left pb-2 font-medium">Priority</th>
                         <th className="text-left pb-2 font-medium">Last Used</th>
+                        <th className="text-left pb-2 font-medium">Expires</th>
                         <th className="text-left pb-2 font-medium">Status</th>
                         <th className="pb-2"></th>
                       </tr>
@@ -238,9 +267,7 @@ export default function ApiKeysPage() {
                                 {k.project_name || k.project_id.slice(0, 8)}
                               </span>
                             ) : (
-                              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <Users className="w-3 h-3" />Team
-                              </span>
+                              <span className="text-xs text-muted-foreground italic">Team default</span>
                             )}
                           </td>
                           <td className="py-2">
@@ -252,6 +279,9 @@ export default function ApiKeysPage() {
                           </td>
                           <td className="py-2 text-xs text-muted-foreground">
                             {k.last_used_at ? new Date(k.last_used_at).toLocaleDateString() : 'never'}
+                          </td>
+                          <td className="py-2 text-xs text-muted-foreground">
+                            {k.expires_at ? new Date(k.expires_at).toLocaleDateString() : '—'}
                           </td>
                           <td className="py-2">
                             <span className={`text-xs px-2 py-0.5 rounded-full ${k.active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
