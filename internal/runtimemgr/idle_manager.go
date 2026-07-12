@@ -63,6 +63,7 @@ type idleRow struct {
 	ModelName      string     `db:"model_name"`
 	ContainerID    string     `db:"container_id"`
 	EndpointID     string     `db:"endpoint_id"`
+	RuntimeState   string     `db:"state"`
 	LastUsedAt     *time.Time `db:"last_used_at"`
 	IdleTimeout    *int       `db:"idle_timeout_secs"`
 	ProjectID      *string    `db:"project_id"`
@@ -79,6 +80,7 @@ func (m *IdleManager) evict(ctx context.Context) {
 		       mo.name AS model_name,
 		       COALESCE(ar.container_id,'') AS container_id,
 		       COALESCE(ar.endpoint_id::text,'') AS endpoint_id,
+		       ar.state,
 		       ar.last_used_at,
 		       mrc.idle_timeout_secs,
 		       ar.project_id,
@@ -126,6 +128,18 @@ func (m *IdleManager) evict(ctx context.Context) {
 		if row.LastUsedAt == nil {
 			continue
 		}
+
+		// Never evict a runtime that is still in startup states (loading_model,
+		// loading). These states indicate the container was just launched and the
+		// last_used_at value may be stale from a previous runtime row.  The idle
+		// clock only starts once the runtime reaches a stable operational state
+		// (ready, active, warm, idle).  Use the idle timeout as a grace period:
+		// if the row has been in a loading state for less than the configured
+		// timeout, skip it unconditionally.
+		if row.RuntimeState == "loading_model" || row.RuntimeState == "loading" {
+			continue
+		}
+
 		idleFor := time.Since(*row.LastUsedAt)
 		if idleFor < timeout {
 			continue
