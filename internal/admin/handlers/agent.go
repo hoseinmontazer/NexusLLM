@@ -617,9 +617,11 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			input.BindPort, runtimeID, claims.NodeID)
 		// Sync port to model_endpoints so the registry and health watcher
 		// use the correct address. Critical when port was 0 (agent-allocated).
+		// Reset consecutive_failures so the watcher circuit breaker doesn't
+		// re-disable the endpoint because it was briefly hitting the old port.
 		_, _ = h.db.ExecContext(c.Request.Context(), `
 			UPDATE model_endpoints
-			SET port = $1, updated_at = NOW()
+			SET port = $1, consecutive_failures = 0, updated_at = NOW()
 			WHERE id = (
 			    SELECT endpoint_id FROM agent_runtimes
 			    WHERE id = $2 AND endpoint_id IS NOT NULL
