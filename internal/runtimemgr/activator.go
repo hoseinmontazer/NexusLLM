@@ -741,8 +741,8 @@ func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string
 		      WHEN state IN ('loading_model','waiting_ready','loading') THEN 'ready'
 		      ELSE state
 		    END
-		WHERE (endpoint_id = $1::uuid OR id::text = $1)
-		  AND state NOT IN ('stopping','stopped','failed','deleted')`, endpointID)
+		WHERE (endpoint_id = $1::uuid OR id = $2::uuid)
+		  AND state NOT IN ('stopping','stopped','failed','deleted')`, endpointID, endpointID)
 	if err != nil {
 		a.log.Warn("RecordActivity: failed to update last_used_at",
 			zap.String("endpoint_id", endpointID),
@@ -773,9 +773,9 @@ func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string
 		       mrc.idle_timeout_secs
 		FROM agent_runtimes ar
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
-		WHERE (ar.endpoint_id = $1::uuid OR ar.id::text = $1)
+		WHERE (ar.endpoint_id = $1::uuid OR ar.id = $2::uuid)
 		  AND ar.state NOT IN ('stopping','stopped','failed','deleted')
-		ORDER BY ar.updated_at DESC LIMIT 1`, endpointID)
+		ORDER BY ar.updated_at DESC LIMIT 1`, endpointID, endpointID)
 
 	configuredTimeout := a.cfg.DefaultIdleTimeout
 	if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
