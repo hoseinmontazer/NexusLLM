@@ -724,6 +724,12 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 
 // RecordActivity updates last_used_at on the agent_runtime row.
 // Called by the proxy after successfully forwarding a request.
+//
+// ep.ID can be either:
+//   - a model_endpoints.id  (primary/single-replica path: endpoint_id = ep.ID)
+//   - an agent_runtimes.id  (HA replica path: ar.id = ep.ID, endpoint_id may differ)
+//
+// Both cases are handled so the idle clock is always reset on activity.
 func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string) {
 	_, _ = a.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
@@ -733,7 +739,7 @@ func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string
 		      WHEN state IN ('loading_model','waiting_ready','loading') THEN 'ready'
 		      ELSE state
 		    END
-		WHERE endpoint_id = $1
+		WHERE (endpoint_id = $1 OR id::text = $1)
 		  AND state NOT IN ('stopping','stopped','failed','deleted')`, endpointID)
 }
 
