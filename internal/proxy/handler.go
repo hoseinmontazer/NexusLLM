@@ -326,6 +326,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, req.Model).Inc()
 	atomic.AddInt64(&ep.ActiveConns, 1)
+	// Pre-inference activity: resets idle clock at request start.
 	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
 	if h.activator != nil {
 		h.activator.RecordActivity(c.Request.Context(), ep.ID)
@@ -339,6 +340,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, req.Model).Dec()
 		atomic.AddInt64(&ep.ActiveConns, -1)
+		// Post-inference activity: resets idle clock at request completion so
+		// last_used_at reflects when the last response byte was sent, not when
+		// the request arrived. Critical for long streaming responses where the
+		// start-of-request timestamp would otherwise expire the idle timeout
+		// while the client is still receiving tokens.
+		if h.activator != nil {
+			h.activator.RecordActivity(context.Background(), ep.ID)
+		}
 	}()
 
 	c.Header("X-Nexus-Request-ID", c.GetString(middleware.RequestIDKey))

@@ -23,31 +23,31 @@ import (
 
 // Policy is the Go representation of a prompt_policies row.
 type Policy struct {
-	ID                  string    `db:"id"`
-	Scope               string    `db:"scope"`
-	ScopeID             string    `db:"scope_id"`
-	Name                string    `db:"name"`
-	Priority            int       `db:"priority"`
-	Enabled             bool      `db:"enabled"`
-	SystemPrompt        string    `db:"system_prompt"`
-	SystemPromptMode    string    `db:"system_prompt_mode"`
-	MaxTemperature      *float64  `db:"max_temperature"`
-	MaxTokensOverride   *int      `db:"max_tokens_override"`
-	EnablePIIDetection  bool      `db:"enable_pii_detection"`
-	EnableModeration    bool      `db:"enable_moderation"`
-	AllowedTools        []string  `db:"-"` // unmarshalled from JSONB
-	DeniedTools         []string  `db:"-"`
-	OutputFilters       []Filter  `db:"-"`
-	InputDenyList       []string  `db:"-"`
-	InputAllowList      []string  `db:"-"`
-	UpdatedAt           time.Time `db:"updated_at"`
+	ID                 string    `db:"id"`
+	Scope              string    `db:"scope"`
+	ScopeID            string    `db:"scope_id"`
+	Name               string    `db:"name"`
+	Priority           int       `db:"priority"`
+	Enabled            bool      `db:"enabled"`
+	SystemPrompt       string    `db:"system_prompt"`
+	SystemPromptMode   string    `db:"system_prompt_mode"`
+	MaxTemperature     *float64  `db:"max_temperature"`
+	MaxTokensOverride  *int      `db:"max_tokens_override"`
+	EnablePIIDetection bool      `db:"enable_pii_detection"`
+	EnableModeration   bool      `db:"enable_moderation"`
+	AllowedTools       []string  `db:"-"` // unmarshalled from JSONB
+	DeniedTools        []string  `db:"-"`
+	OutputFilters      []Filter  `db:"-"`
+	InputDenyList      []string  `db:"-"`
+	InputAllowList     []string  `db:"-"`
+	UpdatedAt          time.Time `db:"updated_at"`
 }
 
 // Filter is a single output filter rule (regex or keyword).
 type Filter struct {
-	Type    string `json:"type"`    // "regex" | "keyword"
+	Type    string `json:"type"` // "regex" | "keyword"
 	Pattern string `json:"pattern"`
-	Action  string `json:"action"`  // "block" | "redact"
+	Action  string `json:"action"` // "block" | "redact"
 }
 
 // Decision is the result of evaluating all policies for a request.
@@ -205,21 +205,31 @@ func (e *Engine) CreatePolicy(ctx context.Context, p Policy) error {
 
 // ─── private ──────────────────────────────────────────────────────────────────
 
-func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelID string) []Policy {
+func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelName string) []Policy {
+	// Resolve the model name to its internal UUID so the 'model'-scoped
+	// query always uses the correct type for the scope_id (uuid) column.
+	// If no row is found the lookup returns an empty string which will
+	// simply match no model-scoped policies — safe fallback.
+	var modelID string
+	_ = e.db.QueryRowContext(ctx,
+		`SELECT id::text FROM models WHERE name = $1 AND enabled = TRUE LIMIT 1`,
+		modelName,
+	).Scan(&modelID)
+
 	// Execution order: org → team → model, sorted by priority ASC within each scope
 	var rows []struct {
-		ID               string   `db:"id"`
-		Scope            string   `db:"scope"`
-		ScopeID          string   `db:"scope_id"`
-		Name             string   `db:"name"`
-		Priority         int      `db:"priority"`
-		Enabled          bool     `db:"enabled"`
-		SystemPrompt     string   `db:"system_prompt"`
-		SystemPromptMode string   `db:"system_prompt_mode"`
-		MaxTemperature   *float64 `db:"max_temperature"`
-		MaxTokensOverride *int    `db:"max_tokens_override"`
-		EnablePII        bool     `db:"enable_pii_detection"`
-		EnableMod        bool     `db:"enable_moderation"`
+		ID                string   `db:"id"`
+		Scope             string   `db:"scope"`
+		ScopeID           string   `db:"scope_id"`
+		Name              string   `db:"name"`
+		Priority          int      `db:"priority"`
+		Enabled           bool     `db:"enabled"`
+		SystemPrompt      string   `db:"system_prompt"`
+		SystemPromptMode  string   `db:"system_prompt_mode"`
+		MaxTemperature    *float64 `db:"max_temperature"`
+		MaxTokensOverride *int     `db:"max_tokens_override"`
+		EnablePII         bool     `db:"enable_pii_detection"`
+		EnableMod         bool     `db:"enable_moderation"`
 	}
 
 	_ = e.db.SelectContext(ctx, &rows, `
@@ -231,9 +241,9 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelID string
 		FROM prompt_policies
 		WHERE enabled = TRUE
 		  AND (
-		        (scope = 'org'   AND scope_id = $1)
-		     OR (scope = 'team'  AND scope_id = $2)
-		     OR (scope = 'model' AND scope_id = $3)
+		        (scope = 'org'   AND scope_id = $1::uuid)
+		     OR (scope = 'team'  AND scope_id = $2::uuid)
+		     OR (scope = 'model' AND scope_id = $3::uuid)
 		      )
 		ORDER BY
 		  CASE scope WHEN 'org' THEN 1 WHEN 'team' THEN 2 ELSE 3 END,
@@ -314,8 +324,8 @@ func injectSystemPrompt(messages []models.Message, prompt, mode string) []models
 // hasPII is a stub — production would call an actual PII detection service.
 func hasPII(messages []models.Message) bool {
 	piiPatterns := []string{
-		`\b\d{3}-\d{2}-\d{4}\b`,           // SSN
-		`\b4[0-9]{12}(?:[0-9]{3})?\b`,     // Visa
+		`\b\d{3}-\d{2}-\d{4}\b`,                                // SSN
+		`\b4[0-9]{12}(?:[0-9]{3})?\b`,                          // Visa
 		`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`, // email
 	}
 	for _, m := range messages {

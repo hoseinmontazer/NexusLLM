@@ -730,8 +730,10 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 //   - an agent_runtimes.id  (HA replica path: ar.id = ep.ID, endpoint_id may differ)
 //
 // Both cases are handled so the idle clock is always reset on activity.
+// The endpoint_id column is type uuid; cast $1 explicitly to avoid the
+// "operator does not exist: text = uuid" error when PostgreSQL infers text.
 func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string) {
-	_, _ = a.db.ExecContext(ctx, `
+	res, err := a.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
 		SET last_used_at = NOW(),
 		    updated_at   = NOW(),
@@ -739,8 +741,66 @@ func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string
 		      WHEN state IN ('loading_model','waiting_ready','loading') THEN 'ready'
 		      ELSE state
 		    END
-		WHERE (endpoint_id = $1 OR id::text = $1)
+		WHERE (endpoint_id = $1::uuid OR id::text = $1)
 		  AND state NOT IN ('stopping','stopped','failed','deleted')`, endpointID)
+	if err != nil {
+		a.log.Warn("RecordActivity: failed to update last_used_at",
+			zap.String("endpoint_id", endpointID),
+			zap.Error(err),
+		)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// No row matched — endpoint_id is not a UUID or runtime row is gone.
+		// This is not fatal but means the idle clock was NOT reset.
+		a.log.Warn("RecordActivity: no runtime row updated — idle clock NOT reset",
+			zap.String("endpoint_id", endpointID),
+			zap.String("reason", "no matching agent_runtimes row (wrong id type or runtime stopped)"),
+		)
+		return
+	}
+
+	// Log the updated timestamps for idle-lifecycle debugging.
+	var row struct {
+		StartedAt   *time.Time `db:"started_at"`
+		LastUsedAt  *time.Time `db:"last_used_at"`
+		UpdatedAt   time.Time  `db:"updated_at"`
+		IdleTimeout *int       `db:"idle_timeout_secs"`
+	}
+	_ = a.db.GetContext(ctx, &row, `
+		SELECT ar.started_at, ar.last_used_at, ar.updated_at,
+		       mrc.idle_timeout_secs
+		FROM agent_runtimes ar
+		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
+		WHERE (ar.endpoint_id = $1::uuid OR ar.id::text = $1)
+		  AND ar.state NOT IN ('stopping','stopped','failed','deleted')
+		ORDER BY ar.updated_at DESC LIMIT 1`, endpointID)
+
+	configuredTimeout := a.cfg.DefaultIdleTimeout
+	if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
+		configuredTimeout = time.Duration(*row.IdleTimeout) * time.Second
+	}
+	idleFor := time.Duration(0)
+	if row.LastUsedAt != nil {
+		idleFor = time.Since(*row.LastUsedAt)
+	}
+	fmtTime := func(t *time.Time) string {
+		if t == nil {
+			return "<nil>"
+		}
+		return t.Format(time.RFC3339)
+	}
+	a.log.Debug("RecordActivity: last_used_at updated",
+		zap.String("endpoint_id", endpointID),
+		zap.Int64("rows_updated", n),
+		zap.String("started_at", fmtTime(row.StartedAt)),
+		zap.String("last_used_at", fmtTime(row.LastUsedAt)),
+		zap.String("updated_at", row.UpdatedAt.Format(time.RFC3339)),
+		zap.Duration("idle_for_after_update", idleFor),
+		zap.Duration("configured_timeout", configuredTimeout),
+		zap.Any("idle_timeout_secs_raw", row.IdleTimeout),
+	)
 }
 
 // Status returns the current runtime state of a model.
