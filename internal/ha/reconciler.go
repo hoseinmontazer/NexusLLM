@@ -1022,6 +1022,29 @@ func (r *Reconciler) stepDrainingReplicas(ctx context.Context) {
 // stopDrainedRuntime transitions a draining runtime to 'stopping' and
 // dispatches an UNLOAD_RUNTIME task.
 func (r *Reconciler) stopDrainedRuntime(ctx context.Context, runtimeID, modelID, nodeID, containerID string, termGraceS int) {
+	// ── Diagnostic: capture last_used_at before we change state so the log
+	// entry shows exactly how long the runtime was idle at the point of unload.
+	var lastUsedAt *time.Time
+	_ = r.db.GetContext(ctx, &lastUsedAt,
+		`SELECT last_used_at FROM agent_runtimes WHERE id = $1`, runtimeID)
+	idleFor := time.Duration(0)
+	lastUsedStr := "<nil>"
+	if lastUsedAt != nil {
+		idleFor = time.Since(*lastUsedAt)
+		lastUsedStr = lastUsedAt.Format(time.RFC3339)
+	}
+
+	r.log.Info("UNLOAD_RUNTIME will be enqueued",
+		zap.String("caller", "ha.Reconciler.stopDrainedRuntime"),
+		zap.String("runtime_id", runtimeID),
+		zap.String("model_id", modelID),
+		zap.String("node_id", nodeID),
+		zap.String("reason", "rolling_replacement_drain_complete"),
+		zap.String("last_used_at", lastUsedStr),
+		zap.Duration("idle_for", idleFor),
+		zap.String("configured_timeout", "n/a — HA drain path, not idle eviction"),
+	)
+
 	_, _ = r.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
 		SET state = 'stopping', updated_at = NOW()
@@ -1057,6 +1080,8 @@ func (r *Reconciler) stopDrainedRuntime(ctx context.Context, runtimeID, modelID,
 		zap.String("model_id", modelID),
 		zap.String("node_id", nodeID),
 		zap.String("reason", "rolling_replacement_drain_complete"),
+		zap.String("last_used_at", lastUsedStr),
+		zap.Duration("idle_for", idleFor),
 	)
 }
 

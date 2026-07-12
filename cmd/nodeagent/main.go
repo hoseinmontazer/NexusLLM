@@ -511,15 +511,9 @@ func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
 	// Mark running
 	_ = a.post(ctx, "/agent/v1/tasks/"+task.ID+"/running", map[string]interface{}{}, nil)
 
-	// Touch the runtime row immediately so the gateway knows work is in progress
-	// and doesn't treat it as a stale loading row.
+	// Parse runtime_id from task payload directly — the payload always
+	// carries runtime_id in StopRuntimePayload / StartModelPayload.
 	var runtimeID string
-	if err := a.getAuth(ctx, "/agent/v1/tasks/"+task.ID+"/runtime-id", &struct {
-		RuntimeID string `json:"runtime_id"`
-	}{}); err == nil {
-		// best-effort — extract runtime_id from task payload instead
-	}
-	// Parse runtime_id from task payload directly
 	var payloadFields struct {
 		RuntimeID string `json:"runtime_id"`
 	}

@@ -180,7 +180,7 @@ func main() {
 	serviceH := handlers.NewServiceHandler(db, svcRegistry, placementEng, registry, modelCtrl)
 	nodeH := handlers.NewNodeHandler(db)
 	placementH := handlers.NewPlacementHandler(db, placementEng)
-	agentH := handlers.NewAgentHandler(db, agentAuthSvc, taskMgr)
+	agentH := handlers.NewAgentHandler(db, agentAuthSvc, taskMgr, log)
 	taskH := handlers.NewTaskHandler(taskMgr)
 	requireH := handlers.NewRequirementsHandler(db)
 	lazyH := handlers.NewLazyRuntimeHandler(db)

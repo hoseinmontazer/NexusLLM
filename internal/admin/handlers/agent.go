@@ -32,6 +32,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/agentauth"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
+	"go.uber.org/zap"
 )
 
 // AgentHandler handles all agent-to-control-plane communication.
@@ -39,11 +40,17 @@ type AgentHandler struct {
 	db      *sqlx.DB
 	authSvc *agentauth.Service
 	taskMgr *taskmanager.Manager
+	log     *zap.Logger
 }
 
 // NewAgentHandler constructs an AgentHandler.
-func NewAgentHandler(db *sqlx.DB, authSvc *agentauth.Service, taskMgr *taskmanager.Manager) *AgentHandler {
-	return &AgentHandler{db: db, authSvc: authSvc, taskMgr: taskMgr}
+// Pass the process-wide logger so UpdateRuntime diagnostic logs share the same
+// encoder/output as all other structured logs.
+func NewAgentHandler(db *sqlx.DB, authSvc *agentauth.Service, taskMgr *taskmanager.Manager, log *zap.Logger) *AgentHandler {
+	if log == nil {
+		log, _ = zap.NewProduction()
+	}
+	return &AgentHandler{db: db, authSvc: authSvc, taskMgr: taskMgr, log: log}
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -554,12 +561,36 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 
 	// Only allow state update for runtimes owned by this node
 	if input.State != "" {
+		// ── Diagnostic: capture last_used_at BEFORE the update so we can see
+		// if this state report is about to reset the idle clock.
+		// The UPDATE below sets last_used_at = NOW() whenever state IN ('ready','active'),
+		// which means every agent startup notification resets the idle countdown.
+		// Log at WARN so it is always visible — this is the write path most
+		// likely to cause premature UNLOAD_RUNTIME if the idle timeout is short.
+		if input.State == "ready" || input.State == "active" {
+			var prevLastUsedAt *time.Time
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT last_used_at FROM agent_runtimes WHERE id = $1`, runtimeID,
+			).Scan(&prevLastUsedAt)
+			prevStr := "<nil>"
+			if prevLastUsedAt != nil {
+				prevStr = prevLastUsedAt.Format(time.RFC3339)
+			}
+			h.log.Warn("UpdateRuntime: resetting last_used_at to NOW() — idle clock restarted",
+				zap.String("caller", "agent.UpdateRuntime"),
+				zap.String("runtime_id", runtimeID),
+				zap.String("new_state", input.State),
+				zap.String("prev_last_used_at", prevStr),
+				zap.String("reason", "agent_state_report_ready_or_active"),
+			)
+		}
+
 		_, err := h.db.ExecContext(c.Request.Context(), `
 			UPDATE agent_runtimes
-			SET state=$1, updated_at=NOW(),
-			    started_at   = CASE WHEN $1 IN ('ready','active') AND started_at IS NULL THEN NOW() ELSE started_at END,
-			    last_used_at = CASE WHEN $1 IN ('ready','active') THEN NOW() ELSE last_used_at END,
-			    stopped_at   = CASE WHEN $1 IN ('stopped','unloaded','deleted') THEN NOW() ELSE stopped_at END
+			SET state=$1::varchar, updated_at=NOW(),
+			    started_at   = CASE WHEN $1::text IN ('ready','active') AND started_at IS NULL THEN NOW() ELSE started_at END,
+			    last_used_at = CASE WHEN $1::text IN ('ready','active') THEN NOW() ELSE last_used_at END,
+			    stopped_at   = CASE WHEN $1::text IN ('stopped','unloaded','deleted') THEN NOW() ELSE stopped_at END
 			WHERE id=$2 AND node_id=$3`,
 			input.State, runtimeID, claims.NodeID)
 		if err != nil {
