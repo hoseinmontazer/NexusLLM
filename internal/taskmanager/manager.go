@@ -163,6 +163,12 @@ type StartModelPayload struct {
 	LlamaCppCtxSize      int    `json:"llamacpp_ctx_size,omitempty"`
 	LlamaCppNGPULayers   int    `json:"llamacpp_n_gpu_layers,omitempty"`
 	LlamaCppModelsVolume string `json:"llamacpp_models_volume,omitempty"`
+
+	// StaleContainerNames lists Docker container names that should be stopped
+	// before starting the new container. Used by the activator to clean up
+	// HA-reconciler-named containers (e.g. nexus-model-r0-abc123) when the
+	// proxy cold-start path takes over and uses the plain name (nexus-model).
+	StaleContainerNames []string `json:"stale_container_names,omitempty"`
 }
 
 // DeployRuntimePayload is an alias kept for backward compatibility with any

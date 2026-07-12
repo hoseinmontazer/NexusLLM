@@ -378,19 +378,36 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	}
 
 	// Park any in-progress rows so the UI always shows a single current row.
+	// Also collect the runtime_names of rows being parked so the executor can
+	// stop their containers as part of the START_MODEL pre-flight. This prevents
+	// stale HA-named containers (e.g. nexus-model-r0-abc123) from running
+	// alongside the new activator-named container (nexus-model).
 	// IMPORTANT: do NOT park 'loading_model' or 'starting' rows — those indicate
 	// a live container start in progress.  Parking them would cause the next
 	// proxy request to create a new runtime row while the container is already
 	// starting, leading to a perpetual pending/park loop.
-	_, _ = a.db.ExecContext(ctx, `
+	type parkedRow struct {
+		RuntimeName string `db:"runtime_name"`
+	}
+	var parked []parkedRow
+	_ = a.db.SelectContext(ctx, &parked, `
 		UPDATE agent_runtimes
 		SET state = 'stopped', updated_at = NOW()
 		WHERE model_id = $1 AND node_id = $2
 		  AND state NOT IN (
 		      'deleted','stopping','stopped','failed',
 		      'loading_model','waiting_ready','starting','validating','downloading'
-		  )`,
+		  )
+		RETURNING runtime_name`,
 		cfg.ModelID, cfg.NodeID)
+
+	// Collect names of stale containers to pre-stop in the task payload.
+	var staleContainerNames []string
+	for _, p := range parked {
+		if p.RuntimeName != "" && p.RuntimeName != containerName {
+			staleContainerNames = append(staleContainerNames, p.RuntimeName)
+		}
+	}
 
 	workloadPolicy := cfg.WorkloadPolicy
 	if workloadPolicy == "" {
@@ -490,36 +507,37 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	committed = true
 
 	payload := taskmanager.StartModelPayload{
-		RuntimeID:      runtimeID,
-		ModelID:        cfg.ModelID,
-		RuntimeName:    containerName,
-		Backend:        backend,
-		Image:          image,
-		ModelName:      cfg.ModelName,
-		ServedAs:       cfg.ModelName,
-		BindHost:       cfg.BindHost,
-		BindPort:       cfg.BindPort,
-		GPUDevices:     gpuDevices, // nil for cpu mode
-		CPUSetCPUs:     cfg.CPUSetCPUs,
-		NUMANode:       cfg.NUMANode,
-		MemoryLimit:    cfg.MemoryLimit,
-		CPULimit:       cfg.CPUThreads,
-		GGUFPath:       cfg.GGUFPath,
-		HFRepo:         cfg.HFRepo,
-		HFFile:         cfg.HFFile,
-		HFToken:        cfg.HFToken,
-		ModelsVolume:   vol,
-		CtxSize:        ctxSize,
-		NGPULayers:     nGPULayers, // 0 for cpu mode
-		TensorParallel: cfg.TensorParallel,
-		GPUMemoryUtil:  cfg.GPUMemoryUtil,
-		MaxModelLen:    cfg.MaxModelLen,
-		Dtype:          cfg.Dtype,
-		Quantization:   cfg.Quantization,
-		ExtraArgs:      injectReasoningFlag(ctx, a.db, cfg.ModelID, backend, cfg.ExtraArgs),
-		ExecutionMode:  effectiveMode,
-		WorkloadPolicy: workloadPolicy,
-		Env:            map[string]string{},
+		RuntimeID:           runtimeID,
+		ModelID:             cfg.ModelID,
+		RuntimeName:         containerName,
+		Backend:             backend,
+		Image:               image,
+		ModelName:           cfg.ModelName,
+		ServedAs:            cfg.ModelName,
+		BindHost:            cfg.BindHost,
+		BindPort:            cfg.BindPort,
+		GPUDevices:          gpuDevices, // nil for cpu mode
+		CPUSetCPUs:          cfg.CPUSetCPUs,
+		NUMANode:            cfg.NUMANode,
+		MemoryLimit:         cfg.MemoryLimit,
+		CPULimit:            cfg.CPUThreads,
+		GGUFPath:            cfg.GGUFPath,
+		HFRepo:              cfg.HFRepo,
+		HFFile:              cfg.HFFile,
+		HFToken:             cfg.HFToken,
+		ModelsVolume:        vol,
+		CtxSize:             ctxSize,
+		NGPULayers:          nGPULayers, // 0 for cpu mode
+		TensorParallel:      cfg.TensorParallel,
+		GPUMemoryUtil:       cfg.GPUMemoryUtil,
+		MaxModelLen:         cfg.MaxModelLen,
+		Dtype:               cfg.Dtype,
+		Quantization:        cfg.Quantization,
+		ExtraArgs:           injectReasoningFlag(ctx, a.db, cfg.ModelID, backend, cfg.ExtraArgs),
+		ExecutionMode:       effectiveMode,
+		WorkloadPolicy:      workloadPolicy,
+		Env:                 map[string]string{},
+		StaleContainerNames: staleContainerNames,
 	}
 
 	taskID, err := a.taskMgr.Enqueue(ctx, cfg.NodeID,

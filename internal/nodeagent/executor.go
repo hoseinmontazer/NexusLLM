@@ -393,12 +393,13 @@ type startModelPayload struct {
 	//   "auto" or "" — legacy: agent decides from GPUDevices/NGPULayers
 	ExecutionMode string `json:"execution_mode,omitempty"`
 	// Legacy DEPLOY_RUNTIME aliases
-	LlamaCppModelPath    string `json:"llamacpp_model_path,omitempty"`
-	LlamaCppHFRepo       string `json:"llamacpp_hf_repo,omitempty"`
-	LlamaCppHFFile       string `json:"llamacpp_hf_file,omitempty"`
-	LlamaCppCtxSize      int    `json:"llamacpp_ctx_size,omitempty"`
-	LlamaCppNGPULayers   int    `json:"llamacpp_n_gpu_layers,omitempty"`
-	LlamaCppModelsVolume string `json:"llamacpp_models_volume,omitempty"`
+	LlamaCppModelPath    string   `json:"llamacpp_model_path,omitempty"`
+	LlamaCppHFRepo       string   `json:"llamacpp_hf_repo,omitempty"`
+	LlamaCppHFFile       string   `json:"llamacpp_hf_file,omitempty"`
+	LlamaCppCtxSize      int      `json:"llamacpp_ctx_size,omitempty"`
+	LlamaCppNGPULayers   int      `json:"llamacpp_n_gpu_layers,omitempty"`
+	LlamaCppModelsVolume string   `json:"llamacpp_models_volume,omitempty"`
+	StaleContainerNames  []string `json:"stale_container_names,omitempty"`
 }
 
 // resolveModelSource normalises legacy DEPLOY_RUNTIME fields into the canonical
@@ -617,6 +618,29 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 			e.log.Warn("docker rm pre-flight warning",
 				zap.String("name", p.RuntimeName),
 				zap.String("output", string(out)),
+			)
+		}
+	}
+
+	// Stop any stale containers from previous HA-named or otherwise-named runs
+	// of this model. These accumulate when the activator uses a plain name
+	// (nexus-model) but a prior HA reconciler used a suffixed name
+	// (nexus-model-r0-abc123). Without this, both containers run simultaneously.
+	for _, staleName := range p.StaleContainerNames {
+		if staleName == "" || staleName == p.RuntimeName {
+			continue
+		}
+		if out, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", staleName).CombinedOutput(); rmErr != nil {
+			if !strings.Contains(string(out), "No such container") {
+				e.log.Warn("docker rm stale container warning",
+					zap.String("stale_name", staleName),
+					zap.String("output", string(out)),
+				)
+			}
+		} else {
+			e.log.Info("stopped stale container before new start",
+				zap.String("stale_name", staleName),
+				zap.String("new_runtime", p.RuntimeName),
 			)
 		}
 	}
