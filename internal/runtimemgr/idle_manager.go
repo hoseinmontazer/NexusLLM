@@ -99,6 +99,37 @@ func (m *IdleManager) evict(ctx context.Context) {
 	}
 
 	for _, row := range rows {
+		// ── Diagnostic: log every candidate so the caller of UNLOAD_RUNTIME
+		// can be pinpointed exactly.  Logged at debug so it doesn't spam
+		// production; raise to info temporarily when debugging.
+		configuredTimeout := m.cfg.DefaultIdleTimeout
+		if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
+			configuredTimeout = time.Duration(*row.IdleTimeout) * time.Second
+		}
+		idleForDiag := time.Duration(0)
+		if row.LastUsedAt != nil {
+			idleForDiag = time.Since(*row.LastUsedAt)
+		}
+		timeoutSource := "default"
+		if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
+			timeoutSource = "model_runtime_configs"
+		}
+		m.log.Debug("idle manager: evaluating runtime",
+			zap.String("caller", "IdleManager.evict"),
+			zap.String("runtime_id", row.RuntimeID),
+			zap.String("model_id", row.ModelID),
+			zap.String("model_name", row.ModelName),
+			zap.String("state", row.RuntimeState),
+			zap.String("workload_policy", row.WorkloadPolicy),
+			zap.Bool("always_running", row.AlwaysRunning),
+			zap.Bool("protected", row.Protected),
+			zap.String("last_used_at", lastUsedStr(row.LastUsedAt)),
+			zap.Duration("idle_for", idleForDiag),
+			zap.Duration("configured_timeout", configuredTimeout),
+			zap.String("timeout_source", timeoutSource),
+			zap.Any("idle_timeout_secs_raw", row.IdleTimeout),
+		)
+
 		// Workload policy protection: never evict always_on services
 		if row.WorkloadPolicy == "always_on" {
 			continue
@@ -145,17 +176,27 @@ func (m *IdleManager) evict(ctx context.Context) {
 			continue
 		}
 
-		m.log.Info("idle timeout — stopping container",
-			zap.String("model", row.ModelName),
+		// ── Will evict: log at INFO with full context so the trigger is always visible ──
+		m.log.Info("idle manager: UNLOAD_RUNTIME will be enqueued",
+			zap.String("caller", "IdleManager.evict"),
 			zap.String("runtime_id", row.RuntimeID),
+			zap.String("model_id", row.ModelID),
+			zap.String("model_name", row.ModelName),
+			zap.String("state", row.RuntimeState),
+			zap.String("workload_policy", row.WorkloadPolicy),
+			zap.String("last_used_at", lastUsedStr(row.LastUsedAt)),
 			zap.Duration("idle_for", idleFor),
-			zap.Duration("timeout", timeout),
+			zap.Duration("configured_timeout", timeout),
+			zap.String("timeout_source", timeoutSource),
+			zap.String("reason", "idle_timeout_exceeded"),
 		)
 
 		m.stopRuntime(ctx, row)
 	}
 }
 
+// lastUsedStringer is a fmt.Stringer wrapper for *time.Time that prints
+// "<nil>" for nil pointers instead of panicking.
 func (m *IdleManager) stopRuntime(ctx context.Context, row idleRow) {
 	// Mark stopping immediately so we don't double-dispatch.
 	_, _ = m.db.ExecContext(ctx, `
@@ -169,6 +210,19 @@ func (m *IdleManager) stopRuntime(ctx context.Context, row idleRow) {
 			SET is_enabled = FALSE, lifecycle_state = 'unloaded',
 			    health_status = 'down', updated_at = NOW()
 			WHERE id = $1`, row.EndpointID)
+	}
+
+	idleFor := time.Duration(0)
+	if row.LastUsedAt != nil {
+		idleFor = time.Since(*row.LastUsedAt)
+	}
+	configuredTimeout := m.cfg.DefaultIdleTimeout
+	if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
+		configuredTimeout = time.Duration(*row.IdleTimeout) * time.Second
+	}
+	timeoutSource := "default"
+	if row.IdleTimeout != nil && *row.IdleTimeout > 0 {
+		timeoutSource = "model_runtime_configs"
 	}
 
 	// Dispatch UNLOAD_RUNTIME task to the node agent.
@@ -197,9 +251,26 @@ func (m *IdleManager) stopRuntime(ctx context.Context, row idleRow) {
 	}
 
 	m.log.Info("UNLOAD_RUNTIME enqueued",
-		zap.String("model", row.ModelName),
+		zap.String("caller", "IdleManager.stopRuntime"),
 		zap.String("task_id", taskID),
+		zap.String("runtime_id", row.RuntimeID),
+		zap.String("model_id", row.ModelID),
+		zap.String("model_name", row.ModelName),
+		zap.String("reason", "idle_timeout_exceeded"),
+		zap.String("last_used_at", lastUsedStr(row.LastUsedAt)),
+		zap.Duration("idle_for", idleFor),
+		zap.Duration("configured_timeout", configuredTimeout),
+		zap.String("timeout_source", timeoutSource),
+		zap.Any("idle_timeout_secs_raw", row.IdleTimeout),
 	)
+}
+
+// lastUsedStr formats a nullable time pointer for structured logging.
+func lastUsedStr(t *time.Time) string {
+	if t == nil {
+		return "<nil>"
+	}
+	return t.Format(time.RFC3339)
 }
 
 // restoreAlwaysRunning checks projects with always_running=TRUE and ensures

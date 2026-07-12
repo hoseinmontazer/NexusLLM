@@ -1048,7 +1048,16 @@ func (r *Reconciler) stopDrainedRuntime(ctx context.Context, runtimeID, modelID,
 		_, _ = r.db.ExecContext(ctx, `
 			UPDATE agent_runtimes SET state = 'draining', updated_at = NOW()
 			WHERE id = $1 AND state = 'stopping'`, runtimeID)
+		return
 	}
+
+	r.log.Info("UNLOAD_RUNTIME enqueued",
+		zap.String("caller", "ha.Reconciler.stopDrainedRuntime"),
+		zap.String("runtime_id", runtimeID),
+		zap.String("model_id", modelID),
+		zap.String("node_id", nodeID),
+		zap.String("reason", "rolling_replacement_drain_complete"),
+	)
 }
 
 // loadPlacementPolicy fetches the model's placement policy from DB.
