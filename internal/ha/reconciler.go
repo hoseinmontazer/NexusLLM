@@ -688,15 +688,23 @@ func (r *Reconciler) selectNode(ctx context.Context, status ReplicaStatus) (stri
 
 func (r *Reconciler) loadReplicaStatuses(ctx context.Context) ([]ReplicaStatus, error) {
 	var rows []ReplicaStatus
+	// Exclude lazy_load models — they are managed by the IdleManager and the
+	// proxy cold-start activator. The HA reconciler only manages always_on
+	// workloads. Recovering a lazy_load model after idle eviction would cause
+	// the container to be restarted immediately after every timeout, defeating
+	// the purpose of idle eviction.
 	err := r.db.SelectContext(ctx, &rows, `
-		SELECT model_id, model_name, desired_replicas, min_available,
-		       placement_policy, auto_recover,
-		       max_surge, health_retry_interval_s, replacement_start_timeout_s,
-		       drain_timeout_s, termination_grace_s,
-		       active_replicas, starting_replicas, idle_replicas,
-		       unhealthy_replicas, draining_replicas,
-		       lost_replicas, node_count, ha_status
-		FROM runtime_replica_status WHERE desired_replicas > 0`)
+		SELECT rrs.model_id, rrs.model_name, rrs.desired_replicas, rrs.min_available,
+		       rrs.placement_policy, rrs.auto_recover,
+		       rrs.max_surge, rrs.health_retry_interval_s, rrs.replacement_start_timeout_s,
+		       rrs.drain_timeout_s, rrs.termination_grace_s,
+		       rrs.active_replicas, rrs.starting_replicas, rrs.idle_replicas,
+		       rrs.unhealthy_replicas, rrs.draining_replicas,
+		       rrs.lost_replicas, rrs.node_count, rrs.ha_status
+		FROM runtime_replica_status rrs
+		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = rrs.model_id
+		WHERE rrs.desired_replicas > 0
+		  AND COALESCE(mrc.workload_policy, 'lazy_load') = 'always_on'`)
 	return rows, err
 }
 
