@@ -1090,13 +1090,48 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 }
 
 func (a *RuntimeActivator) enableEndpoint(ctx context.Context, modelID string) {
-	// Only enable endpoints whose node is currently online — never re-enable
-	// endpoints that belong to offline/dead nodes.
+	// Re-enable the endpoint and sync port+host from the active agent_runtime row
+	// so the registry and watcher use the port the container actually bound to.
+	// This is critical when the agent picked a different port (port=0 → OS-allocated,
+	// or a port-conflict scan), or when the previous port is stale from an old deployment.
+	_, _ = a.db.ExecContext(ctx, `
+		UPDATE model_endpoints me
+		SET is_enabled       = TRUE,
+		    lifecycle_state  = 'active',
+		    health_status    = 'healthy',
+		    port             = CASE
+		                         WHEN ar.bind_port > 0 THEN ar.bind_port
+		                         ELSE me.port
+		                       END,
+		    host             = CASE
+		                         WHEN ar.bind_host IS NOT NULL AND ar.bind_host != ''
+		                         THEN ar.bind_host
+		                         ELSE me.host
+		                       END,
+		    updated_at       = NOW()
+		FROM (
+		    SELECT bind_port, bind_host
+		    FROM agent_runtimes
+		    WHERE model_id = $1
+		      AND state IN ('ready','active','warm','loading_model','waiting_ready')
+		      AND bind_port > 0
+		    ORDER BY updated_at DESC
+		    LIMIT 1
+		) ar
+		WHERE me.model_id = $1
+		  AND (
+		      me.node_id IS NULL
+		      OR me.node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))
+		  )`, modelID)
+
+	// Fallback: if no active runtime row matched (e.g. still in early startup states),
+	// enable the endpoint without port change so routing can start.
 	_, _ = a.db.ExecContext(ctx, `
 		UPDATE model_endpoints
 		SET is_enabled = TRUE, lifecycle_state = 'active',
 		    health_status = 'healthy', updated_at = NOW()
 		WHERE model_id = $1
+		  AND is_enabled = FALSE
 		  AND (
 		      node_id IS NULL
 		      OR node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))

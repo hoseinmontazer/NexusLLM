@@ -321,11 +321,11 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 				UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW() WHERE id=$2`,
 				int(bindPort), runtimeID)
 			// Also sync back to model_endpoints so the registry and health watcher
-			// use the correct port. This is the critical path for port=0 deploys:
-			// the agent is the source of truth for the actual bound port.
+			// use the correct port. Reset consecutive_failures so the watcher circuit
+			// breaker doesn't immediately re-disable the endpoint on the new port.
 			_, _ = h.db.ExecContext(c.Request.Context(), `
 				UPDATE model_endpoints
-				SET port = $1, updated_at = NOW()
+				SET port = $1, consecutive_failures = 0, updated_at = NOW()
 				WHERE id = (
 				    SELECT endpoint_id FROM agent_runtimes
 				    WHERE id = $2 AND endpoint_id IS NOT NULL
