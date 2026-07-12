@@ -131,16 +131,18 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 	}
 
 	// Direct DB count of ALL non-terminal rows — bypasses view lag.
-	// IMPORTANT: 'failed' is intentionally included here as non-terminal.
-	// A container that failed health checks is still a Docker container on disk.
-	// Excluding 'failed' causes the reconciler to spawn replacements while the
-	// failed containers accumulate, leading to N×desired containers over time.
-	// The stuck-runtime sweeper handles cleanup of failed containers separately.
+	// IMPORTANT: 'failed' and 'unhealthy' are treated as terminal here,
+	// matching the claim_replica_slot() DB function (migration 032).
+	// A failed container is definitively gone; an unhealthy one has a rolling
+	// replacement already in progress. Neither should block a new cold-start.
 	var nonTerminal int
 	_ = r.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM agent_runtimes
 		WHERE model_id = $1
-		  AND state NOT IN ('stopped','deleted','archived','unloaded','lost')`,
+		  AND state NOT IN (
+		      'stopped','deleted','archived','unloaded','lost',
+		      'draining','failed','unhealthy'
+		  )`,
 		status.ModelID,
 	).Scan(&nonTerminal)
 
