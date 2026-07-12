@@ -953,15 +953,37 @@ func (h *RuntimeHandler) GetDeployStatus(c *gin.Context) {
 
 // ResetHealth handles POST /admin/v1/models/:id/reset-health
 // Clears failed/unknown health state so the watcher can re-evaluate.
-// This is a recovery tool — it doesn't actually contact the backend.
+// Also syncs port/host from the most recent active agent_runtime so the
+// watcher probes the correct address after a container restart.
 func (h *RuntimeHandler) ResetHealth(c *gin.Context) {
 	modelID := c.Param("id")
 	epID := c.Query("endpoint_id") // optional — reset specific endpoint or all
 
+	// Sync port and host from the most recently updated active agent_runtime.
+	// This corrects the stale port that accumulates when the container restarts
+	// on a different port (port=0 OS-allocated, or conflict scan) while the
+	// model_endpoints row still holds the previous port.
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		UPDATE model_endpoints me
+		SET port        = CASE WHEN ar.bind_port > 0 THEN ar.bind_port ELSE me.port END,
+		    host        = CASE WHEN ar.bind_host != '' THEN ar.bind_host ELSE me.host END,
+		    updated_at  = NOW()
+		FROM (
+		    SELECT bind_port, bind_host
+		    FROM agent_runtimes
+		    WHERE model_id = $1
+		      AND bind_port > 0
+		      AND state NOT IN ('stopped','deleted','failed')
+		    ORDER BY updated_at DESC
+		    LIMIT 1
+		) ar
+		WHERE me.model_id = $1`, modelID)
+
 	query := `UPDATE model_endpoints
 	          SET health_status = 'unknown',
+	              is_enabled    = TRUE,
 	              lifecycle_state = CASE
-	                WHEN lifecycle_state = 'failed' THEN 'active'
+	                WHEN lifecycle_state IN ('failed','unloaded') THEN 'active'
 	                ELSE lifecycle_state
 	              END,
 	              consecutive_failures = 0,

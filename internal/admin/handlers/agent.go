@@ -320,12 +320,19 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 			_, _ = h.db.ExecContext(c.Request.Context(), `
 				UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW() WHERE id=$2`,
 				int(bindPort), runtimeID)
-			// Also sync back to model_endpoints so the registry and health watcher
-			// use the correct port. Reset consecutive_failures so the watcher circuit
-			// breaker doesn't immediately re-disable the endpoint on the new port.
+			// Sync port to model_endpoints, re-enable if disabled, and reset
+			// consecutive_failures so the watcher probes the correct address
+			// immediately without triggering the circuit breaker on the old port.
 			_, _ = h.db.ExecContext(c.Request.Context(), `
 				UPDATE model_endpoints
-				SET port = $1, consecutive_failures = 0, updated_at = NOW()
+				SET port                 = $1,
+				    consecutive_failures = 0,
+				    is_enabled           = TRUE,
+				    lifecycle_state      = CASE
+				      WHEN lifecycle_state IN ('unloaded','failed') THEN 'loading'
+				      ELSE lifecycle_state
+				    END,
+				    updated_at = NOW()
 				WHERE id = (
 				    SELECT endpoint_id FROM agent_runtimes
 				    WHERE id = $2 AND endpoint_id IS NOT NULL
@@ -615,13 +622,19 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW()
 			WHERE id=$2 AND node_id=$3`,
 			input.BindPort, runtimeID, claims.NodeID)
-		// Sync port to model_endpoints so the registry and health watcher
-		// use the correct address. Critical when port was 0 (agent-allocated).
-		// Reset consecutive_failures so the watcher circuit breaker doesn't
-		// re-disable the endpoint because it was briefly hitting the old port.
+		// Sync port to model_endpoints, re-enable if disabled, and reset
+		// consecutive_failures so the watcher probes the correct address
+		// immediately without triggering the circuit breaker on the old port.
 		_, _ = h.db.ExecContext(c.Request.Context(), `
 			UPDATE model_endpoints
-			SET port = $1, consecutive_failures = 0, updated_at = NOW()
+			SET port                 = $1,
+			    consecutive_failures = 0,
+			    is_enabled           = TRUE,
+			    lifecycle_state      = CASE
+			      WHEN lifecycle_state IN ('unloaded','failed') THEN 'loading'
+			      ELSE lifecycle_state
+			    END,
+			    updated_at = NOW()
 			WHERE id = (
 			    SELECT endpoint_id FROM agent_runtimes
 			    WHERE id = $2 AND endpoint_id IS NOT NULL
