@@ -297,12 +297,12 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		UNION ALL
 
 		-- Runtime-level endpoints: one per agent_runtime replica.
-		-- Includes both healthy (ready/active/warm/idle) and still-starting
-		-- (loading_model/waiting_ready) runtimes so the health watcher can
-		-- probe them and transition them to healthy as soon as they are ready.
-		-- EXCLUDED: unhealthy and draining runtimes — they must not receive
-		-- new requests. The rolling reconciler keeps them alive for in-flight
-		-- requests and tears them down after the replacement is READY.
+		-- Only includes runtimes in a stable operational state (ready/active/warm/idle)
+		-- for routing. loading_model and waiting_ready are included as 'down' so the
+		-- health watcher can probe them and promote HA replicas (endpoint_id IS NULL)
+		-- to 'ready' when health passes — but IsAvailable()=false means the proxy
+		-- never routes to them while they are still loading.
+		-- EXCLUDED: unhealthy and draining runtimes — they must not receive new requests.
 		SELECT
 		    ar.id                                    AS id,
 		    ar.model_id,
@@ -318,9 +318,9 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		        WHEN 'active'        THEN 'healthy'::text
 		        WHEN 'warm'          THEN 'healthy'::text
 		        WHEN 'idle'          THEN 'healthy'::text
-		        WHEN 'loading_model' THEN 'unknown'::text
-		        WHEN 'waiting_ready' THEN 'unknown'::text
-		        ELSE 'unknown'::text
+		        WHEN 'loading_model' THEN 'down'::text
+		        WHEN 'waiting_ready' THEN 'down'::text
+		        ELSE 'down'::text
 		    END                                      AS health_status,
 		    TRUE                                     AS is_enabled,
 		    0                                        AS consecutive_failures

@@ -104,9 +104,15 @@ func main() {
 	usageTracker := usage.NewTracker(db, rdb, log)
 	teamPolicies := loadTeamPolicies(ctx, db, log)
 
-	// Lifecycle manager — unload endpoints idle for >30 min
+	// Lifecycle manager — legacy Redis-based idle tracker.
+	// The IdleManager (below) is the canonical idle eviction system for lazy_load
+	// models. This legacy manager had unloader=nil so it never stopped containers —
+	// it only set lifecycle_state='idle' on model_endpoints, which could remove
+	// endpoints from the registry and cause spurious "no_healthy_endpoint" errors.
+	// It is kept as a no-op RecordActivity sink (still called by the proxy) but
+	// its eviction loop is no longer started.
 	lifecycleMgr := lifecycle.NewManager(db, rdb, 30*time.Minute, nil, log)
-	go lifecycleMgr.Start(watchCtx)
+	// NOTE: lifecycleMgr.Start() intentionally NOT called — eviction disabled.
 
 	// ── Runtime Manager (lazy-load architecture) ──────────────────────────────
 	taskMgr := taskmanager.NewManager(db, log)
