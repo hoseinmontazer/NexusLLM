@@ -184,6 +184,11 @@ export interface DeployModelInput {
   supports_thinking?: boolean
   thinking_enabled?: boolean
   min_thinking_tokens?: number
+  // Cloud / external API credentials — leave blank for local self-hosted models.
+  // upstream_api_key is injected as Authorization: Bearer on every upstream request.
+  // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+  upstream_api_key?: string
+  upstream_base_url?: string
 }
 
 export interface LazyConfig {
@@ -217,7 +222,14 @@ export interface RuntimeStatus {
 export interface RegisterModelInput {
   name: string; display_name: string; backend_type: string
   host: string; port: number; provider?: string
+  service_type?: string
   max_context?: number; max_output?: number
+  capabilities?: string[]
+  // Cloud / external API credentials — leave blank for local self-hosted models.
+  // upstream_api_key is injected as Authorization: Bearer on every upstream request.
+  // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+  upstream_api_key?: string
+  upstream_base_url?: string
 }
 
 // ── Project types ─────────────────────────────────────────────────────────────

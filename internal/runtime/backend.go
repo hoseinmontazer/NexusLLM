@@ -61,14 +61,16 @@ type BackendModel struct {
 // ChatRequest is the canonical request passed to a backend's Chat method.
 // It carries the original InferenceRequest plus routing metadata.
 type ChatRequest struct {
-	Req         *models.InferenceRequest
-	EndpointURL string
+	Req            *models.InferenceRequest
+	EndpointURL    string
+	UpstreamAPIKey string // non-empty for cloud/external endpoints
 }
 
 // EmbedRequest is the canonical request passed to a backend's Embeddings method.
 type EmbedRequest struct {
-	Req         *models.EmbeddingRequest
-	EndpointURL string
+	Req            *models.EmbeddingRequest
+	EndpointURL    string
+	UpstreamAPIKey string // non-empty for cloud/external endpoints
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

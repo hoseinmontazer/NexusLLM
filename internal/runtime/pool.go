@@ -29,7 +29,14 @@ type Endpoint struct {
 	Status      HealthStatus
 	ActiveConns int64 // atomic; incremented on dispatch, decremented on finish
 	LastSuccess time.Time
-	mu          sync.RWMutex
+	// Cloud / external model credentials.
+	// When non-empty, the openai_compat backend injects these on upstream requests.
+	// UpstreamBaseURL overrides the URL for routing (e.g. https://api.openai.com).
+	// UpstreamAPIKey is sent as Authorization: Bearer <key>.
+	// Both are empty for local models — default behaviour unchanged.
+	UpstreamAPIKey  string
+	UpstreamBaseURL string
+	mu              sync.RWMutex
 }
 
 // IsAvailable returns true when the endpoint can accept requests.

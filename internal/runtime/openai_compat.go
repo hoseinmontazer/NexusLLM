@@ -100,6 +100,9 @@ func (b *openAICompatBackend) Chat(ctx context.Context, r ChatRequest) (*Backend
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if r.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
+	}
 	if r.Req.Stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
@@ -130,6 +133,9 @@ func (b *openAICompatBackend) Embeddings(ctx context.Context, r EmbedRequest) (*
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if r.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
+	}
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, err

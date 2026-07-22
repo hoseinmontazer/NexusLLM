@@ -374,7 +374,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	c.Header("X-Nexus-Model", req.Model)
 	c.Header("X-Nexus-Endpoint", ep.ID)
 
-	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: ep.URL}
+	// Resolve effective URL: UpstreamBaseURL overrides host:port for cloud endpoints.
+	endpointURL := ep.URL
+	if ep.UpstreamBaseURL != "" {
+		endpointURL = ep.UpstreamBaseURL
+	}
+	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey}
 
 	// ── Backend compatibility sanitization + Thinking mode resolution ─────
 	// Order matters:
@@ -454,7 +459,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					zap.String("model", req.Model),
 				)
 				disabledReq := thinking.InjectThinkingControl(req, false, thinkingCaps)
-				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: ep.URL}
+				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey}
 				c.Header("X-Nexus-Thinking-Retry", "1")
 				middleware.ThinkingRequestsTotal.WithLabelValues(
 					claims.TeamID, claims.ProjectID, req.Model, "fast_retry").Inc()
@@ -513,7 +518,11 @@ func (h *Handler) Embeddings(c *gin.Context) {
 	}
 
 	start := time.Now()
-	resp, err := backend.Embeddings(c.Request.Context(), runtime.EmbedRequest{Req: &req, EndpointURL: ep.URL})
+	embURL := ep.URL
+	if ep.UpstreamBaseURL != "" {
+		embURL = ep.UpstreamBaseURL
+	}
+	resp, err := backend.Embeddings(c.Request.Context(), runtime.EmbedRequest{Req: &req, EndpointURL: embURL, UpstreamAPIKey: ep.UpstreamAPIKey})
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return

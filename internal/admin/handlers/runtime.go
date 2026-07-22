@@ -133,6 +133,13 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// When omitted, capabilities are derived automatically from ServiceType.
 		// Example: ["chat","completion"] for a chat model, ["transcription"] for Whisper.
 		Capabilities []string `json:"capabilities"`
+
+		// Cloud / external API credentials — for models not run by NexusLLM containers.
+		// upstream_api_key is injected as Authorization: Bearer on every upstream request.
+		// upstream_base_url overrides host:port (e.g. "https://api.openai.com").
+		// Leave blank for local self-hosted models.
+		UpstreamAPIKey  string `json:"upstream_api_key"`
+		UpstreamBaseURL string `json:"upstream_base_url"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -276,9 +283,12 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	_, err = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_endpoints
 		  (id, model_id, host, port, base_path, weight, priority,
-		   health_status, is_enabled, lifecycle_state, runtime_image)
-		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'registered',$5)`,
+		   health_status, is_enabled, lifecycle_state, runtime_image,
+		   upstream_api_key, upstream_base_url)
+		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'registered',$5,
+		        NULLIF($6,''), NULLIF($7,''))`,
 		epID, mID, bindHost, input.Port, runtimeImage,
+		input.UpstreamAPIKey, input.UpstreamBaseURL,
 	)
 	if err != nil {
 		// Rollback model row
@@ -610,6 +620,12 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		// Capabilities explicitly declares which API endpoints this model supports.
 		// When omitted, derived automatically from service_type.
 		Capabilities []string `json:"capabilities"`
+		// Cloud / external API credentials.
+		// upstream_api_key is injected as Authorization: Bearer on every upstream request.
+		// upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+		// Leave blank for local self-hosted models.
+		UpstreamAPIKey  string `json:"upstream_api_key"`
+		UpstreamBaseURL string `json:"upstream_base_url"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -654,18 +670,22 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	_, _ = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_endpoints
 		  (id, model_id, host, port, base_path, weight, priority,
-		   health_status, is_enabled, lifecycle_state)
-		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active')`,
+		   health_status, is_enabled, lifecycle_state,
+		   upstream_api_key, upstream_base_url)
+		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active',
+		        NULLIF($5,''), NULLIF($6,''))`,
 		epID, mID, input.Host, input.Port,
+		input.UpstreamAPIKey, input.UpstreamBaseURL,
 	)
 
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusCreated, gin.H{
-		"model_id":     mID,
-		"model_name":   input.Name,
-		"endpoint_id":  epID,
-		"capabilities": capabilitiesJSON,
-		"note":         "registered as external model — NexusLLM will not manage its container lifecycle",
+		"model_id":      mID,
+		"model_name":    input.Name,
+		"endpoint_id":   epID,
+		"capabilities":  capabilitiesJSON,
+		"upstream_auth": input.UpstreamAPIKey != "",
+		"note":          "registered as external model — NexusLLM will not manage its container lifecycle",
 	})
 }
 

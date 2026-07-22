@@ -236,12 +236,15 @@ func (h *Handler) Rerank(c *gin.Context) {
 
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost,
-		ep.URL+"/v1/rerank", bytes.NewReader(body))
+		epEffectiveURL(ep)+"/v1/rerank", bytes.NewReader(body))
 	if err != nil {
 		abortErr(c, http.StatusInternalServerError, "request_build_error", err.Error())
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if ep.UpstreamAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
+	}
 
 	resp, err := h.httpClient.Do(httpReq)
 	if err != nil {
@@ -285,7 +288,7 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	}
 	start := time.Now()
 
-	if err := h.forwardRaw(c, ep.URL+"/v1/audio/transcriptions"); err != nil {
+	if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey); err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -329,12 +332,15 @@ func (h *Handler) Speech(c *gin.Context) {
 
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost,
-		ep.URL+"/v1/audio/speech", bytes.NewReader(body))
+		epEffectiveURL(ep)+"/v1/audio/speech", bytes.NewReader(body))
 	if err != nil {
 		abortErr(c, http.StatusInternalServerError, "request_build_error", err.Error())
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if ep.UpstreamAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
+	}
 
 	resp, err := h.httpClient.Do(httpReq)
 	if err != nil {
@@ -390,12 +396,15 @@ func (h *Handler) OCR(c *gin.Context) {
 
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost,
-		ep.URL+"/v1/ocr", bytes.NewReader(body))
+		epEffectiveURL(ep)+"/v1/ocr", bytes.NewReader(body))
 	if err != nil {
 		abortErr(c, http.StatusInternalServerError, "request_build_error", err.Error())
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if ep.UpstreamAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
+	}
 
 	resp, err := h.httpClient.Do(httpReq)
 	if err != nil {
@@ -421,7 +430,8 @@ func (h *Handler) OCR(c *gin.Context) {
 // forwardRaw proxies the current Gin request (body + headers) verbatim to
 // targetURL and writes the response back. Used for binary/multipart requests
 // where we must not buffer or reparse the body (e.g. STT audio upload).
-func (h *Handler) forwardRaw(c *gin.Context, targetURL string) error {
+// upstreamAPIKey, when non-empty, is injected as Authorization: Bearer.
+func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey string) error {
 	httpReq, err := http.NewRequestWithContext(
 		c.Request.Context(), c.Request.Method, targetURL, c.Request.Body)
 	if err != nil {
@@ -434,6 +444,10 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL string) error {
 		for _, v := range vals {
 			httpReq.Header.Add(key, v)
 		}
+	}
+	// Inject upstream key after stripping the client's Authorization header.
+	if upstreamAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+upstreamAPIKey)
 	}
 	resp, err := h.httpClient.Do(httpReq)
 	if err != nil {
@@ -448,6 +462,16 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL string) error {
 	c.Status(resp.StatusCode)
 	_, _ = io.Copy(c.Writer, resp.Body)
 	return nil
+}
+
+// epEffectiveURL returns the URL to use for an endpoint.
+// If the endpoint has an UpstreamBaseURL (cloud/external), that is used.
+// Otherwise falls back to the in-process host:port URL.
+func epEffectiveURL(ep *runtime.Endpoint) string {
+	if ep.UpstreamBaseURL != "" {
+		return ep.UpstreamBaseURL
+	}
+	return ep.URL
 }
 
 func statusFromHTTP(code int) string {

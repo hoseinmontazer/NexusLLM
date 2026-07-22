@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, Users, FolderKanban, X, ShieldCheck } from 'lucide-react'
+import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, FolderKanban, X, ShieldCheck } from 'lucide-react'
 import Link from 'next/link'
 
 // ── Model access grant panel ──────────────────────────────────────────────────

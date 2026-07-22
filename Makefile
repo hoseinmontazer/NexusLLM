@@ -187,7 +187,8 @@ MIGRATIONS := \
 	036_drop_service_abstraction_remnants.sql \
 	037_capability_validation.sql \
 	038_recover_stuck_runtimes.sql \
-	039_register_orphan_gpt_oss_120b.sql
+	039_register_orphan_gpt_oss_120b.sql \
+	040_model_endpoint_upstream_auth.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

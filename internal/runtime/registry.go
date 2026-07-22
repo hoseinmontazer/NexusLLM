@@ -32,6 +32,9 @@ type RegistryEndpoint struct {
 	HealthStatus        HealthStatus `db:"health_status"`
 	IsEnabled           bool         `db:"is_enabled"`
 	ConsecutiveFailures int          `db:"consecutive_failures"`
+	// Cloud / external model credentials. NULL for local models.
+	UpstreamAPIKey  string `db:"upstream_api_key"`
+	UpstreamBaseURL string `db:"upstream_base_url"`
 }
 
 // URL builds the base URL from host and port (no base_path).
@@ -109,13 +112,15 @@ func (r *Registry) Reload(ctx context.Context) error {
 		pool := newPools[row.ModelName]
 
 		ep := &Endpoint{
-			ID:          row.ID,
-			ModelID:     row.ModelID,
-			BackendType: row.BackendType,
-			URL:         row.URL(),
-			Weight:      row.Weight,
-			Priority:    row.Priority,
-			Status:      row.HealthStatus,
+			ID:              row.ID,
+			ModelID:         row.ModelID,
+			BackendType:     row.BackendType,
+			URL:             row.URL(),
+			Weight:          row.Weight,
+			Priority:        row.Priority,
+			Status:          row.HealthStatus,
+			UpstreamAPIKey:  row.UpstreamAPIKey,
+			UpstreamBaseURL: row.UpstreamBaseURL,
 		}
 		pool.Add(ep)
 
@@ -307,7 +312,9 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    me.priority,
 		    me.health_status,
 		    me.is_enabled,
-		    me.consecutive_failures
+		    me.consecutive_failures,
+		    COALESCE(me.upstream_api_key, '')  AS upstream_api_key,
+		    COALESCE(me.upstream_base_url, '') AS upstream_base_url
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
 		WHERE me.is_enabled = TRUE
@@ -324,14 +331,6 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		UNION ALL
 
 		-- Runtime-level endpoints: one row per agent_runtime replica.
-		-- Covers both HA replicas (endpoint_id IS NULL) and regular deployments
-		-- (endpoint_id IS NOT NULL, including when model_endpoints.is_enabled=FALSE
-		-- due to watcher marking it down during the loading phase).
-		--
-		-- State → health_status mapping:
-		--   ready/active/warm/idle → 'healthy' (routable)
-		--   loading_model/waiting_ready → 'down'  (in pool but not routable yet;
-		--       watcher will promote to 'ready' on first passing health check)
 		SELECT
 		    ar.id                                    AS id,
 		    ar.model_id,
@@ -352,17 +351,15 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		        ELSE                      'down'::text
 		    END                                      AS health_status,
 		    TRUE                                     AS is_enabled,
-		    0                                        AS consecutive_failures
+		    0                                        AS consecutive_failures,
+		    ''                                       AS upstream_api_key,
+		    ''                                       AS upstream_base_url
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
 		  AND ar.bind_host != ''
 		  AND ar.bind_port > 0
 		  AND m.enabled = TRUE
-		  -- Always include all valid agent_runtimes — the first UNION already
-		  -- deduplicates by excluding model_endpoints rows that have a covering
-		  -- agent_runtime. We must not re-exclude here or there is a gap where
-		  -- both UNIONs exclude the same endpoint (is_enabled=TRUE + endpoint_id set).
 
 		ORDER BY model_name, priority, weight DESC
 	`)
