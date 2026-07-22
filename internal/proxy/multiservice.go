@@ -150,7 +150,8 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 	// ── 6. EnsureRunning (lazy-load cold start) ───────────────────────────────
 	if h.activator != nil {
 		if _, _, err := h.registry.ResolveWithFailover(realModel, 1); err != nil {
-			probeCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			// Same 8-second probe as ChatCompletions — covers one full HealthPollInterval cycle.
+			probeCtx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 			_, probeErr := h.activator.EnsureRunning(probeCtx, realModel)
 			cancel()
 			if probeErr != nil {

@@ -1,5 +1,5 @@
-.PHONY: build build-gateway build-admin build-scheduler build-nodeagent build-web \
-        run-gateway run-admin run-scheduler run-nodeagent run-web web-install \
+.PHONY: build build-gateway build-admin build-nodeagent build-web \
+        run-gateway run-admin run-nodeagent run-web web-install \
         docker-build docker-push docker-build-web \
         test lint \
         migrate migrate-external migrate-dry _check-dsn _run-migration-external \
@@ -40,7 +40,7 @@ endef
 # ─────────────────────────────────────────────────────────────────────────────
 # Build
 # ─────────────────────────────────────────────────────────────────────────────
-build: build-gateway build-admin build-scheduler build-nodeagent
+build: build-gateway build-admin build-nodeagent
 
 build-gateway:
 	@echo "→ Building nexus-gateway..."
@@ -51,11 +51,6 @@ build-admin:
 	@echo "→ Building nexus-admin..."
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-admin ./cmd/admin
-
-build-scheduler:
-	@echo "→ Building nexus-scheduler..."
-	@mkdir -p $(BINARY_DIR)
-	CGO_ENABLED=0 go build $(GO_FLAGS) -o $(BINARY_DIR)/nexus-scheduler ./cmd/scheduler
 
 build-nodeagent:
 	@echo "→ Building nexus-nodeagent..."
@@ -93,10 +88,6 @@ run-admin: build-admin
 	NEXUS_AUTH_JWTSECRET="dev-secret" \
 	./$(BINARY_DIR)/nexus-admin
 
-run-scheduler: build-scheduler
-	NEXUS_REDIS_ADDR="localhost:6379" \
-	./$(BINARY_DIR)/nexus-scheduler
-
 # Run the node agent — uses new task-based system with JWT auth.
 # On first run it auto-registers and saves credentials to /var/lib/nexus-agent/.
 # On remote nodes, set NEXUS_ADMIN_URL=http://<control-plane-ip>:8081
@@ -132,14 +123,12 @@ lint:
 docker-build:
 	docker build -f Dockerfile.gateway  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/gateway:$(VERSION)   .
 	docker build -f Dockerfile.admin    --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/admin:$(VERSION)     .
-	docker build -f Dockerfile.scheduler  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000 -t $(REGISTRY)/scheduler:$(VERSION) .
-# 	docker build -f Dockerfile.nodeagent  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000-t $(REGISTRY)/nodeagent:$(VERSION) .
+# 	docker build -f Dockerfile.nodeagent  --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000 -t $(REGISTRY)/nodeagent:$(VERSION) .
 	docker build -f Dockerfile.web      --network host  --build-arg HTTP_PROXY=http://127.0.0.1:3000 --build-arg HTTPS_PROXY=http://127.0.0.1:3000  -t $(REGISTRY)/web:$(VERSION)       .
 
 docker-push: docker-build
 	docker push $(REGISTRY)/gateway:$(VERSION)
 	docker push $(REGISTRY)/admin:$(VERSION)
-	docker push $(REGISTRY)/scheduler:$(VERSION)
 # 	docker push $(REGISTRY)/nodeagent:$(VERSION)
 	docker push $(REGISTRY)/web:$(VERSION)
 
@@ -267,9 +256,6 @@ dev-up:
 	@echo "  make run-admin      →  http://localhost:8081  (control plane + scheduler)"
 	@echo "  make run-nodeagent  →  (on each GPU/CPU server)"
 	@echo ""
-	@echo "NOTE: nexus-scheduler (GPU watcher) is only needed for vLLM endpoints."
-	@echo "      All scheduling runs inside nexus-admin for llamacpp setups."
-	@echo ""
 	@echo "AI Platform endpoints (gateway):"
 	@echo "  POST /v1/chat/completions"
 	@echo "  POST /v1/embeddings"
@@ -298,15 +284,11 @@ ADMIN_URL ?= http://localhost:8081/admin/v1
 placement-simulate:
 	curl -s -X POST $(ADMIN_URL)/placement/simulate \
 	  -H 'Content-Type: application/json' \
-	  -d '{"model_name":"$(MODEL)","service_type":"CHAT","runtime_type":"GPU_RUNTIME","min_vram_mb":$(VRAM),"gpu_count":$(GPUS)}' | jq .
+	  -d '{"model_name":"$(MODEL)","runtime_type":"GPU_RUNTIME","min_vram_mb":$(VRAM),"gpu_count":$(GPUS)}' | jq .
 
 # Show node status
 node-status:
 	curl -s $(ADMIN_URL)/nodes | jq '.data[] | {hostname, status, total_cpu, total_ram_mb, total_vram_mb, last_heartbeat_at}'
-
-# List all AI services
-service-list:
-	curl -s "$(ADMIN_URL)/services" | jq '.data[] | {name, service_type, runtime_type, endpoint_count, healthy_count}'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities

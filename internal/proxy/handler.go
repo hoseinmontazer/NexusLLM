@@ -291,18 +291,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if err != nil {
 		// Registry miss — try lazy-loading via the runtime activator.
 		if h.activator != nil {
-			// Check if model is already starting up (in-flight warm-up).
-			// If it is, return 503 + Retry-After immediately so the client
-			// retries rather than holding a long HTTP connection open.
-			// Holding the connection open causes the HTTP write timeout to
-			// fire (default 30s), which the client receives as a 400/EOF.
-			//
-			// We use a short probe context (3s) to detect if the model is
-			// already healthy right now. If it responds immediately it was
-			// just slow to register in the registry — proceed. Otherwise
-			// kick off the warm-up in the background and tell the client
-			// to retry in 10 seconds.
-			probeCtx, probeCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			// Check if the model is already healthy right now by giving EnsureRunning
+			// enough time for at least one full health-poll cycle (HealthPollInterval=3s).
+			// A 3s probe was too tight: the ticker fires at exactly 3s but the context
+			// expires at the same moment, causing a race where ctx.Done() always wins
+			// and the probe always returns an error even when the model is ready.
+			// 8 seconds = 2× HealthPollInterval + 2s slack for DB latency.
+			probeCtx, probeCancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 			_, probeErr := h.activator.EnsureRunning(probeCtx, req.Model)
 			probeCancel()
 
