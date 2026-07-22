@@ -155,17 +155,39 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	w.persistHealthResult(ctx, ep.ID, result)
 
 	// ── Promote loading_model/waiting_ready → ready on first successful health check ────
-	// HA reconciler creates agent_runtimes with endpoint_id=NULL. These enter the
-	// routing pool with health_status='unknown' while loading. The first passing
-	// health check here transitions them to 'ready' so requests start flowing.
-	// This is the mechanism that closes the HA failover loop end-to-end.
+	// Covers both deployment paths:
+	//   1. HA reconciler replicas (endpoint_id IS NULL)
+	//   2. Regular admin-deploy runtimes (endpoint_id IS NOT NULL)
+	// Previously this only promoted HA replicas. Regular deployments could get
+	// stuck in loading_model permanently if waitForReady timed out or the gateway
+	// restarted before the model finished loading.
 	if result.Status == StatusHealthy {
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE agent_runtimes
 			SET state = 'ready', last_used_at = COALESCE(last_used_at, NOW()), updated_at = NOW()
 			WHERE id = $1
-			  AND state IN ('loading_model','waiting_ready','loading')
-			  AND endpoint_id IS NULL`,
+			  AND state IN ('loading_model','waiting_ready','loading')`,
+			ep.ID)
+
+		// Re-enable model_endpoints if this runtime is now healthy.
+		// The endpoint may have been disabled by a previous health check failure
+		// during the loading period (connection refused while model was loading).
+		// Now that the model is healthy, re-enable it and sync the port/host from
+		// the actual agent_runtime row.
+		_, _ = w.db.ExecContext(ctx, `
+			UPDATE model_endpoints me
+			SET is_enabled     = TRUE,
+			    lifecycle_state = 'active',
+			    health_status   = 'healthy',
+			    port            = CASE WHEN ar.bind_port > 0 THEN ar.bind_port ELSE me.port END,
+			    host            = CASE WHEN ar.bind_host != '' THEN ar.bind_host ELSE me.host END,
+			    updated_at      = NOW()
+			FROM (
+			    SELECT bind_port, bind_host
+			    FROM agent_runtimes
+			    WHERE id = $1 AND bind_port > 0
+			) ar
+			WHERE me.id = $1`,
 			ep.ID)
 	}
 
@@ -174,36 +196,48 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	// runtime as 'unhealthy' so the reconciler can start a rolling replacement
 	// instead of immediately stopping the container.
 	//
-	// Critical distinction:
-	//   - 'unhealthy' = health check failed; container may still be running and
-	//     serving in-flight requests. The reconciler will spawn a replacement
-	//     and only drain+stop this runtime AFTER the replacement is READY.
-	//   - 'failed'    = terminal; container has definitely exited or timed out.
-	//
-	// Gateway routing: the pool's IsAvailable() returns false for StatusDown,
-	// so the unhealthy endpoint stops receiving NEW requests immediately.
-	// In-flight requests that already started will complete (connection is not
-	// torn down — the proxy holds a long-lived response stream).
-	//
-	// Only update model_endpoints rows (not HA agent_runtime replicas with NULL
-	// endpoint_id — those are managed exclusively by the rolling reconciler).
+	// Exception: do NOT disable endpoints whose agent_runtime is still in a
+	// loading state (loading_model, waiting_ready). Connection refused during
+	// model loading is expected — the server starts accepting connections only
+	// after the model weights are fully loaded into VRAM. Disabling here would
+	// prevent the endpoint from ever becoming routable.
 	if result.Status == StatusDown {
-		_, _ = w.db.ExecContext(ctx, `
-			UPDATE model_endpoints
-			SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
-			WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
+		// Check if the runtime is still loading — if so, skip the disable.
+		var loadingCount int
+		_ = w.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM agent_runtimes
+			WHERE id = $1
+			  AND state IN ('loading_model','waiting_ready','loading',
+			                'pending','validating','downloading','starting')`,
+			ep.ID).Scan(&loadingCount)
 
-		// Transition to 'unhealthy' so the reconciler can perform a safe rolling
-		// replacement. Only update runtimes explicitly linked to this endpoint.
-		// HA replicas (endpoint_id IS NULL) are handled separately.
-		_, _ = w.db.ExecContext(ctx, `
-			UPDATE agent_runtimes
-			SET state     = 'unhealthy',
-			    error_msg = 'health check failed 3 consecutive times',
-			    updated_at = NOW()
-			WHERE endpoint_id = $1
-			  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
-			ep.ID)
+		if loadingCount == 0 {
+			// Runtime is not in a loading state — genuinely down.
+			_, _ = w.db.ExecContext(ctx, `
+				UPDATE model_endpoints
+				SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
+				WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
+
+			// Transition to 'unhealthy' so the reconciler can perform a safe rolling
+			// replacement. Only update runtimes explicitly linked to this endpoint.
+			// HA replicas (endpoint_id IS NULL) are handled separately.
+			_, _ = w.db.ExecContext(ctx, `
+				UPDATE agent_runtimes
+				SET state     = 'unhealthy',
+				    error_msg = 'health check failed 3 consecutive times',
+				    updated_at = NOW()
+				WHERE endpoint_id = $1
+				  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
+				ep.ID)
+		}
+		// If still loading: update health_status in DB to 'down' for observability
+		// but keep is_enabled=TRUE so the endpoint stays in routing after it becomes healthy.
+		if loadingCount > 0 {
+			_, _ = w.db.ExecContext(ctx, `
+				UPDATE model_endpoints
+				SET health_status = 'down', updated_at = NOW()
+				WHERE id = $1`, ep.ID)
+		}
 	}
 
 	// ── Prometheus metrics ─────────────────────────────────────────────────

@@ -293,7 +293,8 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 	// This supports N replicas on different hosts/ports while keeping the
 	// same model_endpoints row for backward compat.
 	err := r.db.SelectContext(ctx, &rows, `
-		-- Primary endpoints from model_endpoints (backward-compat single-replica path)
+		-- Primary endpoints from model_endpoints (backward-compat single-replica path).
+		-- Only included when no agent_runtime has taken over this endpoint.
 		SELECT
 		    me.id,
 		    me.model_id,
@@ -311,10 +312,6 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		JOIN models m ON m.id = me.model_id
 		WHERE me.is_enabled = TRUE
 		  AND m.enabled = TRUE
-		  -- Only include if no active agent_runtime is bound to this specific
-		  -- endpoint (me.id) via endpoint_id, OR if no HA-managed runtimes
-		  -- (endpoint_id IS NULL) are running for this model. This prevents
-		  -- duplicate routing when the agent has taken over the endpoint.
 		  AND (
 		      NOT EXISTS (
 		          SELECT 1 FROM agent_runtimes ar
@@ -326,13 +323,15 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 
 		UNION ALL
 
-		-- Runtime-level endpoints: one per agent_runtime replica.
-		-- Only includes runtimes in a stable operational state (ready/active/warm/idle)
-		-- for routing. loading_model and waiting_ready are included as 'down' so the
-		-- health watcher can probe them and promote HA replicas (endpoint_id IS NULL)
-		-- to 'ready' when health passes — but IsAvailable()=false means the proxy
-		-- never routes to them while they are still loading.
-		-- EXCLUDED: unhealthy and draining runtimes — they must not receive new requests.
+		-- Runtime-level endpoints: one row per agent_runtime replica.
+		-- Covers both HA replicas (endpoint_id IS NULL) and regular deployments
+		-- (endpoint_id IS NOT NULL, including when model_endpoints.is_enabled=FALSE
+		-- due to watcher marking it down during the loading phase).
+		--
+		-- State → health_status mapping:
+		--   ready/active/warm/idle → 'healthy' (routable)
+		--   loading_model/waiting_ready → 'down'  (in pool but not routable yet;
+		--       watcher will promote to 'ready' on first passing health check)
 		SELECT
 		    ar.id                                    AS id,
 		    ar.model_id,
@@ -350,7 +349,7 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		        WHEN 'idle'          THEN 'healthy'::text
 		        WHEN 'loading_model' THEN 'down'::text
 		        WHEN 'waiting_ready' THEN 'down'::text
-		        ELSE 'down'::text
+		        ELSE                      'down'::text
 		    END                                      AS health_status,
 		    TRUE                                     AS is_enabled,
 		    0                                        AS consecutive_failures
@@ -360,11 +359,17 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		  AND ar.bind_host != ''
 		  AND ar.bind_port > 0
 		  AND m.enabled = TRUE
-		  -- Exclude runtimes already covered by model_endpoints UNION above
-		  AND (ar.endpoint_id IS NULL OR NOT EXISTS (
-		      SELECT 1 FROM model_endpoints me2
-		      WHERE me2.id = ar.endpoint_id AND me2.is_enabled = TRUE
-		  ))
+		  -- Include when:
+		  --   a) HA replica with no model_endpoint row (endpoint_id IS NULL), OR
+		  --   b) endpoint_id set but model_endpoints.is_enabled=FALSE
+		  --      (watcher disabled it during loading — runtime is now the truth source)
+		  AND (
+		      ar.endpoint_id IS NULL
+		      OR NOT EXISTS (
+		          SELECT 1 FROM model_endpoints me2
+		          WHERE me2.id = ar.endpoint_id AND me2.is_enabled = TRUE
+		      )
+		  )
 
 		ORDER BY model_name, priority, weight DESC
 	`)
