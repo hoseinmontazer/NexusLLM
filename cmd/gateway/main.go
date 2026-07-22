@@ -196,7 +196,7 @@ func main() {
 		v1.GET("/models", proxyHandler.Models)
 		v1.GET("/models/:model_id", proxyHandler.ModelByID) // single-model lookup (Cline, Continue, Kilo Code)
 
-		// Multi-service APIs (AI Platform)
+		// Additional inference endpoints
 		v1.POST("/rerank", proxyHandler.Rerank)
 		v1.POST("/audio/transcriptions", proxyHandler.Transcriptions)
 		v1.POST("/audio/speech", proxyHandler.Speech)

@@ -1,9 +1,9 @@
 package handlers
 
-// placement.go — Admin API handler for placement engine operations.
+// placement.go — Admin API handler for placement operations.
 //
 // Routes:
-//   POST /admin/v1/placement/simulate  — dry-run placement for a service spec
+//   POST /admin/v1/placement/simulate  — dry-run placement for a model
 //   GET  /admin/v1/placement/decisions — recent placement decisions
 
 import (
@@ -12,18 +12,19 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
-	"github.com/nexusllm/nexusllm/internal/placement"
+	"github.com/nexusllm/nexusllm/internal/project"
+	"github.com/nexusllm/nexusllm/internal/scheduler"
 )
 
-// PlacementHandler exposes placement engine admin operations.
+// PlacementHandler exposes placement admin operations.
 type PlacementHandler struct {
-	db     *sqlx.DB
-	engine *placement.Engine
+	db    *sqlx.DB
+	sched *scheduler.Scheduler
 }
 
 // NewPlacementHandler constructs a PlacementHandler.
-func NewPlacementHandler(db *sqlx.DB, engine *placement.Engine) *PlacementHandler {
-	return &PlacementHandler{db: db, engine: engine}
+func NewPlacementHandler(db *sqlx.DB, sched *scheduler.Scheduler) *PlacementHandler {
+	return &PlacementHandler{db: db, sched: sched}
 }
 
 // Simulate handles POST /admin/v1/placement/simulate
@@ -31,15 +32,12 @@ func NewPlacementHandler(db *sqlx.DB, engine *placement.Engine) *PlacementHandle
 // Useful for capacity planning and pre-flight checks.
 func (h *PlacementHandler) Simulate(c *gin.Context) {
 	var input struct {
-		ModelName      string `json:"model_name"   binding:"required"`
-		ServiceType    string `json:"service_type" binding:"required"`
-		RuntimeType    string `json:"runtime_type"`
-		PriorityWeight int    `json:"priority"` // numeric [0–1000], defaults to 500
+		ModelName      string `json:"model_name" binding:"required"`
+		RuntimeType    string `json:"runtime_type"` // GPU_RUNTIME | CPU_RUNTIME (informational)
+		PriorityWeight int    `json:"priority"`     // [0–1000], defaults to 500
 		MinVRAMMB      int64  `json:"min_vram_mb"`
-		MaxVRAMMB      int64  `json:"max_vram_mb"`
 		GPUCount       int    `json:"gpu_count"`
 		CPUCores       int    `json:"cpu_cores"`
-		NUMANode       int    `json:"numa_node"`
 		RAMMBLimit     int64  `json:"ram_mb"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -54,33 +52,29 @@ func (h *PlacementHandler) Simulate(c *gin.Context) {
 		return
 	}
 
-	rType := placement.RuntimeGPU
+	execMode := "auto"
 	if input.RuntimeType == "CPU_RUNTIME" {
-		rType = placement.RuntimeCPU
+		execMode = "cpu"
+	} else if input.RuntimeType == "GPU_RUNTIME" {
+		execMode = "gpu"
 	}
 
-	numaNode := input.NUMANode
-	if numaNode == 0 && input.CPUCores == 0 {
-		numaNode = -1
+	req := scheduler.PlacementRequest{
+		ModelName:         input.ModelName,
+		RequiredVRAMMB:    input.MinVRAMMB,
+		RequiredGPUs:      orDefaultInt(input.GPUCount, 1),
+		RequiredCPU:       input.CPUCores,
+		RequiredRAMMB:     input.RAMMBLimit,
+		ExecutionMode:     execMode,
+		Mode:              scheduler.ModeAuto,
+		PriorityWeight:    project.PriorityWeight(input.PriorityWeight),
+		EffectivePriority: input.PriorityWeight,
+	}
+	if execMode == "cpu" {
+		req.RequiredGPUs = 0
 	}
 
-	req := placement.Request{
-		ModelName:   input.ModelName,
-		ServiceType: placement.ServiceType(input.ServiceType),
-		RuntimeType: rType,
-		Priority:    placement.PriorityWeight(input.PriorityWeight),
-		MinVRAMMB:   input.MinVRAMMB,
-		MaxVRAMMB:   input.MaxVRAMMB,
-		GPUCount:    orDefaultInt(input.GPUCount, 1),
-		CPUCores:    input.CPUCores,
-		NUMANode:    numaNode,
-		RAMMBLimit:  input.RAMMBLimit,
-	}
-	if rType == placement.RuntimeCPU {
-		req.GPUCount = 0
-	}
-
-	dec, err := h.engine.Decide(c.Request.Context(), req)
+	dec, err := h.sched.Decide(c.Request.Context(), req)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{
 			"feasible": false,
@@ -93,14 +87,11 @@ func (h *PlacementHandler) Simulate(c *gin.Context) {
 		"feasible": true,
 		"decision": gin.H{
 			"node_id":     dec.NodeID,
-			"node_host":   dec.NodeHost,
+			"node_host":   dec.NodeHostname,
 			"gpu_devices": dec.GPUDeviceIndices,
-			"vram_mb":     dec.TotalVRAMMB,
-			"cpu_cores":   dec.CPUCores,
 			"numa_node":   dec.NUMANode,
-			"ram_mb":      dec.RAMMBLimit,
-			"strategy":    dec.Strategy,
-			"score":       dec.Score,
+			"strategy":    dec.Trace.Reason,
+			"score":       dec.NodeScore,
 			"reason":      dec.Reason,
 			"decided_at":  dec.DecidedAt,
 		},

@@ -24,13 +24,12 @@ import (
 	"github.com/nexusllm/nexusllm/internal/ha"
 	"github.com/nexusllm/nexusllm/internal/nodeagent"
 	"github.com/nexusllm/nexusllm/internal/nodehealth"
-	"github.com/nexusllm/nexusllm/internal/placement"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/preemption"
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
-	"github.com/nexusllm/nexusllm/internal/services"
+	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -89,8 +88,6 @@ func main() {
 	ppEngine := promptpolicy.NewEngine(db, rdb, log)
 	dockerDriver := controller.NewDockerDriver()
 	modelCtrl := controller.NewModelController(db, rdb, dockerDriver, log)
-	placementEng := placement.NewEngine(db, log)
-	svcRegistry := services.NewRegistry(db, log)
 	agentAuthSvc := agentauth.NewService(db, cfg.Auth.JWTSecret)
 	taskMgr := taskmanager.NewManager(db, log)
 
@@ -161,6 +158,13 @@ func main() {
 	go preemptEngine.Start(usageCtx)
 	log.Info("preemption engine started")
 
+	// ── Placement Scheduler ───────────────────────────────────────────────────
+	// Used by RuntimeHandler for auto_place deployments and the admin
+	// Simulate endpoint. Same scheduler instance as the queue processor.
+	sched := scheduler.NewScheduler(db, taskMgr, preemptEngine, log)
+	go sched.Start(usageCtx)
+	log.Info("placement scheduler started")
+
 	// ── Project Metrics Collector ─────────────────────────────────────────────
 	projectMetrics := project.NewMetricsCollector(db, log)
 	go projectMetrics.Start(usageCtx)
@@ -171,15 +175,14 @@ func main() {
 	teamH := handlers.NewTeamHandler(db, rdb, policyEngine)
 	apikeyH := handlers.NewAPIKeyHandler(db, rdb)
 	orgGovH := handlers.NewOrgGovernanceHandler(db, rdb, policyEngine)
-	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithPlacement(placementEng).WithTaskManager(taskMgr)
+	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithScheduler(sched).WithTaskManager(taskMgr)
 	controllerH := handlers.NewControllerHandler(modelCtrl)
 	gpuH := handlers.NewGPUHandler(gpuInventory)
 	usageH := handlers.NewUsageHandler(usageTracker)
 	aliasH := handlers.NewAliasHandler(aliasResolver)
 	ppH := handlers.NewPromptPolicyHandler(ppEngine)
-	serviceH := handlers.NewServiceHandler(db, svcRegistry, runtimeH)
 	nodeH := handlers.NewNodeHandler(db)
-	placementH := handlers.NewPlacementHandler(db, placementEng)
+	placementH := handlers.NewPlacementHandler(db, sched)
 	agentH := handlers.NewAgentHandler(db, agentAuthSvc, taskMgr, log)
 	taskH := handlers.NewTaskHandler(taskMgr)
 	requireH := handlers.NewRequirementsHandler(db)
@@ -246,6 +249,10 @@ func main() {
 	a.DELETE("/models/:id", runtimeH.DeleteModel)
 	a.GET("/models/:id/deploy-status", runtimeH.GetDeployStatus)
 
+	// ── Model Resource Reservations ───────────────────────────────────────────
+	a.GET("/models/:id/reservation", runtimeH.GetReservation)
+	a.PUT("/models/:id/reservation", runtimeH.UpsertReservation)
+
 	// ── Model Controller ──────────────────────────────────────────────────────
 	a.POST("/models/:id/start", controllerH.StartModel)
 	a.POST("/models/:id/stop", controllerH.StopModel)
@@ -278,13 +285,14 @@ func main() {
 	// ── Prompt Policies ───────────────────────────────────────────────────────
 	a.POST("/prompt-policies", ppH.CreatePolicy)
 
-	// ── AI Service Registry ───────────────────────────────────────────────────
-	// POST /services/deploy must come before /services/:id to avoid Gin conflicts
-	a.POST("/services/deploy", serviceH.DeployService)
-	a.POST("/services", serviceH.RegisterService)
-	a.GET("/services", serviceH.ListServices)
-	a.GET("/services/:id/reservation", serviceH.GetReservation)
-	a.PUT("/services/:id/reservation", serviceH.UpsertReservation)
+	// ── AI Service Registry (deprecated) — forwarded to /models API with Deprecation headers ──
+	// Kept for backward compatibility with existing API clients.
+	// New clients should use /models/* directly.
+	a.POST("/services/deploy", runtimeH.DeployModel)
+	a.POST("/services", runtimeH.RegisterModel)
+	a.GET("/services", runtimeH.ListModels)
+	a.GET("/services/:id/reservation", runtimeH.GetReservation)
+	a.PUT("/services/:id/reservation", runtimeH.UpsertReservation)
 
 	// ── Cluster Nodes ─────────────────────────────────────────────────────────
 	a.POST("/nodes", nodeH.RegisterNode)

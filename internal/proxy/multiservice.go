@@ -1,6 +1,6 @@
 package proxy
 
-// multiservice.go — Universal model routing for all non-chat inference endpoints.
+// endpoints.go — Additional inference endpoint handlers (non-chat).
 //
 // Every handler executes the IDENTICAL pipeline as ChatCompletions:
 //
@@ -8,8 +8,8 @@ package proxy
 //	Prompt Policy → EnsureRunning → Inflight Tracking →
 //	Endpoint Resolution → Backend Dispatch → Usage Recording → Inflight Decrement
 //
-// No endpoint is permitted to bypass any stage. Adding a new workload type
-// (STT, TTS, OCR, Rerank, Vision, ImageGen, ...) requires only:
+// No endpoint is permitted to bypass any stage. Adding a new inference endpoint
+// (Rerank, STT, TTS, OCR, Vision, ImageGen, ...) requires only:
 //   1. A handler function that calls pipelineSetup then dispatches the request.
 //   2. A route registration in cmd/gateway/main.go.
 // No changes to RuntimeManager, Scheduler, or NodeAgent.

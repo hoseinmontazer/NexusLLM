@@ -40,7 +40,7 @@ export interface ApiKey {
 }
 export interface Model {
   id: string; name: string; display_name: string; provider: string
-  backend_type: string; service_type: string; runtime_type: string
+  backend_type: string; service_type: string
   max_context: number; max_output: number
   enabled: boolean; endpoint_count: number; healthy_count: number
   lifecycle: string  // active | archived | deleted
@@ -96,21 +96,6 @@ export interface UsageSummary {
   avg_latency_ms: number
 }
 
-export interface ServiceRecord {
-  id: string; name: string; display_name: string
-  service_type: string; runtime_type: string; backend_type: string
-  provider: string; max_context: number; max_output: number
-  enabled: boolean; endpoint_count: number; healthy_count: number
-  tags?: string; created_at: string
-}
-
-export interface ResourceReservation {
-  id: string; model_id: string
-  min_vram_mb: number; max_vram_mb: number
-  cpu_cores: number; numa_node_pref: number; ram_mb: number
-  priority: string; preferred_runtime: string
-  created_at: string; updated_at: string
-}
 
 export interface ClusterNode {
   id: string; hostname: string; display_name: string
@@ -575,6 +560,18 @@ export const api = {
     getRuntimeStatus: (id: string) =>
       req<{ model_id: string; runtimes: RuntimeStatus[]; count: number }>(
         'GET', `/models/${id}/runtime-status`),
+    getReservation: (id: string) =>
+      req<{
+        id: string; model_id: string
+        min_vram_mb: number; max_vram_mb: number
+        cpu_cores: number; numa_node_pref: number; ram_mb: number
+        preferred_runtime: string; created_at: string; updated_at: string
+      }>('GET', `/models/${id}/reservation`),
+    upsertReservation: (id: string, b: {
+      min_vram_mb?: number; max_vram_mb?: number
+      cpu_cores?: number; numa_node_pref?: number; ram_mb?: number
+      preferred_runtime?: string
+    }) => req<{ message: string }>('PUT', `/models/${id}/reservation`, b),
   },
 
   gpu: {
@@ -600,18 +597,6 @@ export const api = {
       req<{ data: UsageSummary[] }>('GET', `/usage/orgs/${orgId}/daily?from=${from}&to=${to}`),
   },
 
-  services: {
-    list: (type?: string) =>
-      req<{ data: ServiceRecord[]; total: number }>('GET', type ? `/services?type=${type}` : '/services'),
-    register: (b: Partial<ServiceRecord> & { host: string; port: number }) =>
-      req<{ model_id: string; endpoint_id: string }>('POST', '/services', b),
-    deploy: (b: Record<string, unknown>) =>
-      req<{ model_id: string; endpoint_id: string; placement: Record<string, unknown> }>('POST', '/services/deploy', b),
-    getReservation: (id: string) =>
-      req<ResourceReservation>('GET', `/services/${id}/reservation`),
-    upsertReservation: (id: string, b: Partial<ResourceReservation>) =>
-      req<{ message: string }>('PUT', `/services/${id}/reservation`, b),
-  },
 
   nodes: {
     list: () => req<{ data: ClusterNode[]; total: number }>('GET', '/nodes'),
@@ -649,7 +634,7 @@ export const api = {
 
   placement: {
     simulate: (b: {
-      model_name: string; service_type: string; runtime_type?: string
+      model_name: string; runtime_type?: string
       min_vram_mb?: number; gpu_count?: number; cpu_cores?: number
       numa_node?: number; ram_mb?: number; priority?: string
     }) => req<{ feasible: boolean; decision?: Record<string, unknown>; error?: string }>('POST', '/placement/simulate', b),

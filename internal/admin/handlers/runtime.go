@@ -10,20 +10,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/controller"
-	"github.com/nexusllm/nexusllm/internal/placement"
+	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/redis/go-redis/v9"
 )
 
 // RuntimeHandler manages the runtime lifecycle API.
 type RuntimeHandler struct {
-	db        *sqlx.DB
-	rdb       *redis.Client
-	registry  *runtime.Registry
-	ctrl      *controller.ModelController
-	placement placement.Placer     // optional; nil = manual GPU assignment only
-	taskMgr   *taskmanager.Manager // optional; nil = local Docker deployment only
+	db       *sqlx.DB
+	rdb      *redis.Client
+	registry *runtime.Registry
+	ctrl     *controller.ModelController
+	sched    *scheduler.Scheduler // optional; nil = manual GPU assignment only
+	taskMgr  *taskmanager.Manager // optional; nil = local Docker deployment only
 }
 
 // NewRuntimeHandler constructs a RuntimeHandler.
@@ -31,9 +32,16 @@ func NewRuntimeHandler(db *sqlx.DB, rdb *redis.Client, registry *runtime.Registr
 	return &RuntimeHandler{db: db, rdb: rdb, registry: registry, ctrl: ctrl}
 }
 
-// WithPlacement attaches a placement engine to the handler.
-func (h *RuntimeHandler) WithPlacement(p placement.Placer) *RuntimeHandler {
-	h.placement = p
+// WithScheduler attaches the placement scheduler to the handler.
+// When set, auto_place=true deployments use the scheduler to select a node.
+func (h *RuntimeHandler) WithScheduler(s *scheduler.Scheduler) *RuntimeHandler {
+	h.sched = s
+	return h
+}
+
+// WithPlacement is a no-op kept for call-site compatibility while callers migrate.
+// Deprecated: use WithScheduler instead.
+func (h *RuntimeHandler) WithPlacement(_ interface{}) *RuntimeHandler {
 	return h
 }
 
@@ -57,6 +65,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		DisplayName string   `json:"display_name" binding:"required"`
 		Provider    string   `json:"provider"`
 		BackendType string   `json:"backend_type"`
+		ServiceType string   `json:"service_type"` // CHAT | STT | TTS | OCR | EMBEDDING | RERANK | VISION | IMAGE_GENERATION | CUSTOM
 		MaxContext  int      `json:"max_context"`
 		MaxOutput   int      `json:"max_output"`
 		Tags        []string `json:"tags"`
@@ -130,6 +139,9 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	if input.BackendType == "" {
 		input.BackendType = "vllm"
 	}
+	if input.ServiceType == "" {
+		input.ServiceType = "CHAT"
+	}
 	if input.Provider == "" {
 		input.Provider = "local"
 	}
@@ -189,11 +201,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	}
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
-		  (id, name, display_name, provider, backend_type,
+		  (id, name, display_name, provider, backend_type, service_type,
 		   max_context, max_output, enabled, tags,
 		   supports_thinking, thinking_enabled, min_thinking_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9,$10,$11)`,
-		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10,$11,$12)`,
+		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
 		input.SupportsThinking, input.ThinkingEnabled, minThinkTok,
@@ -202,10 +214,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// May fail if migration 027 hasn't run — retry without thinking columns.
 		_, err = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO models
-			  (id, name, display_name, provider, backend_type,
+			  (id, name, display_name, provider, backend_type, service_type,
 			   max_context, max_output, enabled, tags)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8)`,
-			mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)`,
+			mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 			input.MaxContext, input.MaxOutput,
 			tagsJSON(input.Tags),
 		)
@@ -277,8 +289,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		input.NodeID = input.SpecificNodeID
 	}
 
-	// ── Auto-placement (placement engine picks GPU/NUMA) ──────────────────
-	if (input.AutoPlace || input.NodeID != "") && h.placement != nil && input.NodeID == "" {
+	// ── Auto-placement: scheduler picks the best node + GPU allocation ────────
+	// Activated when auto_place=true and no explicit NodeID was given.
+	// The scheduler considers VRAM, RAM, CPU, GPU count, NUMA locality,
+	// node labels, and project priority — identical to HA replica placement.
+	if (input.AutoPlace || input.NodeID != "") && h.sched != nil && input.NodeID == "" {
 		gpuCount := len(input.GPUDevices)
 		if gpuCount == 0 {
 			gpuCount = input.TensorParallel
@@ -286,25 +301,47 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 				gpuCount = 1
 			}
 		}
-		pReq := placement.Request{
-			ModelID:     mID,
-			ModelName:   input.Name,
-			ServiceType: "CHAT",
-			RuntimeType: placement.RuntimeGPU,
-			Priority: placement.PriorityWeight(func() int {
+		execMode := input.ExecutionMode
+		if execMode == "" {
+			execMode = "auto"
+		}
+		sReq := scheduler.PlacementRequest{
+			ModelID:        mID,
+			ModelName:      input.Name,
+			RequiredVRAMMB: input.MinVRAMMB,
+			RequiredGPUs:   gpuCount,
+			ExecutionMode:  execMode,
+			Mode:           scheduler.ModeAuto,
+			AcceleratorReq: func() scheduler.AcceleratorType {
+				switch input.AcceleratorType {
+				case "gpu":
+					return scheduler.AcceleratorGPU
+				case "cpu":
+					return scheduler.AcceleratorCPU
+				default:
+					return scheduler.AcceleratorAny
+				}
+			}(),
+			PriorityWeight: project.PriorityWeight(func() int {
 				if input.PriorityWeight > 0 {
 					return input.PriorityWeight
 				}
 				return 500
 			}()),
-			MinVRAMMB: input.MinVRAMMB,
-			MaxVRAMMB: input.MaxVRAMMB,
-			GPUCount:  gpuCount,
+			EffectivePriority: func() int {
+				if input.PriorityWeight > 0 {
+					return input.PriorityWeight
+				}
+				return 500
+			}(),
 		}
-		if dec, placErr := h.placement.Decide(c.Request.Context(), pReq); placErr == nil {
+		if dec, schedErr := h.sched.Decide(c.Request.Context(), sReq); schedErr == nil {
 			input.GPUDevices = dec.GPUDeviceIndices
-			input.TensorParallel = len(dec.GPUDeviceIndices)
-			_ = h.placement.Apply(c.Request.Context(), dec, pReq, epID)
+			if len(dec.GPUDeviceIndices) > 0 {
+				input.TensorParallel = len(dec.GPUDeviceIndices)
+			}
+			// Apply: mark the scheduler decision as used.
+			_, _ = h.sched.Apply(c.Request.Context(), dec, sReq)
 		}
 	}
 	// ── Path A: Deploy via Node Agent ──────────────────────────────────────
@@ -785,6 +822,7 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		DisplayName       string `db:"display_name"        json:"display_name"`
 		Provider          string `db:"provider"            json:"provider"`
 		BackendType       string `db:"backend_type"        json:"backend_type"`
+		ServiceType       string `db:"service_type"        json:"service_type"`
 		MaxContext        int    `db:"max_context"         json:"max_context"`
 		MaxOutput         int    `db:"max_output"          json:"max_output"`
 		Enabled           bool   `db:"enabled"             json:"enabled"`
@@ -799,6 +837,7 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 
 	query := `
 		SELECT m.id, m.name, m.display_name, m.provider, m.backend_type,
+		       COALESCE(m.service_type, 'CHAT') AS service_type,
 		       m.max_context, m.max_output, m.enabled,
 		       COALESCE(m.lifecycle,'active') AS lifecycle,
 		       COUNT(me.id) AS endpoint_cnt,
@@ -1095,6 +1134,99 @@ func (h *RuntimeHandler) ImportOllamaModels(c *gin.Context) {
 		"results": results,
 		"total":   len(results),
 	})
+}
+
+// ─── Model Resource Reservations ─────────────────────────────────────────────
+
+// GetReservation handles GET /admin/v1/models/:id/reservation
+//
+// Deprecated: The resource_reservations table is dropped in migration 036.
+// Resource requirements are now expressed via model_runtime_configs.
+// This endpoint remains for API clients that haven't migrated yet.
+func (h *RuntimeHandler) GetReservation(c *gin.Context) {
+	modelID := c.Param("id")
+	var rr struct {
+		ID               string    `db:"id"                json:"id"`
+		ModelID          string    `db:"model_id"          json:"model_id"`
+		MinVRAMMB        int64     `db:"min_vram_mb"       json:"min_vram_mb"`
+		MaxVRAMMB        int64     `db:"max_vram_mb"       json:"max_vram_mb"`
+		CPUCores         int       `db:"cpu_cores"         json:"cpu_cores"`
+		NUMANodePref     int       `db:"numa_node_pref"    json:"numa_node_pref"`
+		RAMMB            int64     `db:"ram_mb"            json:"ram_mb"`
+		PreferredRuntime string    `db:"preferred_runtime" json:"preferred_runtime"`
+		CreatedAt        time.Time `db:"created_at"        json:"created_at"`
+		UpdatedAt        time.Time `db:"updated_at"        json:"updated_at"`
+	}
+	// Add deprecation header so clients know to migrate.
+	c.Header("Deprecation", "true")
+	c.Header("Link", `</admin/v1/models/`+modelID+`/runtime-config>; rel="successor-version"`)
+
+	err := h.db.GetContext(c.Request.Context(), &rr, `
+		SELECT id, model_id, min_vram_mb, max_vram_mb, cpu_cores,
+		       numa_node_pref, ram_mb, preferred_runtime, created_at, updated_at
+		FROM resource_reservations WHERE model_id = $1`, modelID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":      "no reservation found for model " + modelID,
+			"deprecated": "resource_reservations removed in migration 036 — use PUT /models/:id/lazy-config for resource hints",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, rr)
+}
+
+// UpsertReservation handles PUT /admin/v1/models/:id/reservation
+//
+// Deprecated: The resource_reservations table is dropped in migration 036.
+// Use PUT /admin/v1/models/:id/lazy-config for resource requirement hints.
+func (h *RuntimeHandler) UpsertReservation(c *gin.Context) {
+	modelID := c.Param("id")
+	var req struct {
+		MinVRAMMB        int64  `json:"min_vram_mb"`
+		MaxVRAMMB        int64  `json:"max_vram_mb"`
+		CPUCores         int    `json:"cpu_cores"`
+		NUMANodePref     int    `json:"numa_node_pref"`
+		RAMMB            int64  `json:"ram_mb"`
+		PreferredRuntime string `json:"preferred_runtime"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.PreferredRuntime == "" {
+		req.PreferredRuntime = "GPU_RUNTIME"
+	}
+
+	c.Header("Deprecation", "true")
+	c.Header("Link", `</admin/v1/models/`+modelID+`/lazy-config>; rel="successor-version"`)
+
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO resource_reservations
+		  (id, model_id, min_vram_mb, max_vram_mb, cpu_cores,
+		   numa_node_pref, ram_mb, preferred_runtime)
+		VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (model_id) DO UPDATE SET
+		  min_vram_mb      = EXCLUDED.min_vram_mb,
+		  max_vram_mb      = EXCLUDED.max_vram_mb,
+		  cpu_cores        = EXCLUDED.cpu_cores,
+		  numa_node_pref   = EXCLUDED.numa_node_pref,
+		  ram_mb           = EXCLUDED.ram_mb,
+		  preferred_runtime = EXCLUDED.preferred_runtime,
+		  updated_at       = NOW()`,
+		modelID,
+		req.MinVRAMMB, req.MaxVRAMMB,
+		req.CPUCores, req.NUMANodePref,
+		req.RAMMB, req.PreferredRuntime,
+	)
+	if err != nil {
+		// Table was dropped in migration 036 — return a helpful message.
+		c.JSON(http.StatusGone, gin.H{
+			"error":     "resource_reservations table no longer exists (removed in migration 036)",
+			"migration": "use PUT /admin/v1/models/" + modelID + "/lazy-config with min_vram_mb field instead",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "reservation updated", "model_id": modelID})
 }
 
 // ─── Model Lifecycle (Archive / Restore) ─────────────────────────────────────

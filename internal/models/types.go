@@ -466,22 +466,37 @@ type OCRPage struct {
 	Text string `json:"text"`
 }
 
-// ServiceType constants mirror those in the placement and services packages.
-// Reproduced here to keep models/ free of cross-package dependencies.
-// Canonical source of truth: internal/services/registry.go
+// ModelType* constants describe which API endpoints a model supports.
+// The canonical storage is the models.service_type column in PostgreSQL.
 const (
-	ServiceTypeChat      = "CHAT"
-	ServiceTypeEmbedding = "EMBEDDING"
-	ServiceTypeRerank    = "RERANK"
-	ServiceTypeSTT       = "STT"
-	ServiceTypeTTS       = "TTS"
-	ServiceTypeOCR       = "OCR"
-	ServiceTypeAgent     = "AGENT"
-	ServiceTypeMCP       = "MCP"
+	ModelTypeChat      = "CHAT"
+	ModelTypeEmbedding = "EMBEDDING"
+	ModelTypeRerank    = "RERANK"
+	ModelTypeSTT       = "STT"
+	ModelTypeTTS       = "TTS"
+	ModelTypeOCR       = "OCR"
+	ModelTypeAgent     = "AGENT"
+	ModelTypeMCP       = "MCP"
 	// Extended types (migration 033)
-	ServiceTypeVision          = "VISION"
-	ServiceTypeImageGeneration = "IMAGE_GENERATION"
-	ServiceTypeModeration      = "MODERATION"
-	ServiceTypeTranslation     = "TRANSLATION"
-	ServiceTypeCustom          = "CUSTOM"
+	ModelTypeVision          = "VISION"
+	ModelTypeImageGeneration = "IMAGE_GENERATION"
+	ModelTypeModeration      = "MODERATION"
+	ModelTypeTranslation     = "TRANSLATION"
+	ModelTypeCustom          = "CUSTOM"
+
+	// Legacy aliases — kept so existing callers compile without changes.
+	// Deprecated: use ModelType* constants instead.
+	ServiceTypeChat            = ModelTypeChat
+	ServiceTypeEmbedding       = ModelTypeEmbedding
+	ServiceTypeRerank          = ModelTypeRerank
+	ServiceTypeSTT             = ModelTypeSTT
+	ServiceTypeTTS             = ModelTypeTTS
+	ServiceTypeOCR             = ModelTypeOCR
+	ServiceTypeAgent           = ModelTypeAgent
+	ServiceTypeMCP             = ModelTypeMCP
+	ServiceTypeVision          = ModelTypeVision
+	ServiceTypeImageGeneration = ModelTypeImageGeneration
+	ServiceTypeModeration      = ModelTypeModeration
+	ServiceTypeTranslation     = ModelTypeTranslation
+	ServiceTypeCustom          = ModelTypeCustom
 )

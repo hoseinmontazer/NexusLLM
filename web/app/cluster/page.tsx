@@ -444,12 +444,11 @@ function RegisterNodeForm({ onDone }: { onDone: () => void }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // PLACEMENT SIMULATOR TAB
 // ─────────────────────────────────────────────────────────────────────────────
-const SERVICE_TYPES = ['CHAT','EMBEDDING','RERANK','STT','TTS','OCR','AGENT','MCP']
 const RUNTIME_TYPES = ['GPU_RUNTIME','CPU_RUNTIME']
 
 function PlacementTab() {
   const [form, setForm] = useState({
-    model_name: '', service_type: 'CHAT', runtime_type: 'GPU_RUNTIME',
+    model_name: '', runtime_type: 'GPU_RUNTIME',
     min_vram_mb: '65536', gpu_count: '1', cpu_cores: '0',
     numa_node: '-1', ram_mb: '0', priority_weight: '500',
   })
@@ -467,7 +466,6 @@ function PlacementTab() {
   const mut = useMutation({
     mutationFn: () => api.placement.simulate({
       model_name:   form.model_name || 'test-model',
-      service_type: form.service_type,
       runtime_type: form.runtime_type,
       min_vram_mb:  isGPU ? parseInt(form.min_vram_mb) || 0 : 0,
       gpu_count:    isGPU ? parseInt(form.gpu_count) || 1 : 0,
@@ -494,10 +492,6 @@ function PlacementTab() {
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <div><Label>Model name</Label>
               <Input value={form.model_name} onChange={set('model_name')} placeholder="qwen3-32b" className="mt-1" /></div>
-            <div><Label>Service type</Label>
-              <select className="w-full border rounded-md h-9 px-3 text-sm mt-1" value={form.service_type} onChange={set('service_type')}>
-                {SERVICE_TYPES.map(t => <option key={t}>{t}</option>)}
-              </select></div>
             <div><Label>Runtime type</Label>
               <select className="w-full border rounded-md h-9 px-3 text-sm mt-1" value={form.runtime_type} onChange={set('runtime_type')}>
                 {RUNTIME_TYPES.map(t => <option key={t}>{t}</option>)}
