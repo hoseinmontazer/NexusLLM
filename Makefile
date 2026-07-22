@@ -134,11 +134,61 @@ docker-push: docker-build
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Database migrations
-# All migration files are idempotent — safe to re-run at any time.
-# Files are applied in lexicographic sort order (the same order ls -1 returns).
-# Adding a new migration file is all that's needed — the Makefile picks it up
-# automatically on the next run.
+# IMPORTANT: files are applied in the EXPLICIT order listed in MIGRATIONS below.
+# Do NOT rely on ls | sort — several filenames share the same numeric prefix
+# (e.g. 005_ai_platform depends on 005_enterprise_platform) and alphabetical
+# order breaks those dependencies.
+#
+# When adding a new migration:
+#   1. Create the .sql file in migrations/
+#   2. Append its filename at the END of the MIGRATIONS list below.
 # ─────────────────────────────────────────────────────────────────────────────
+MIGRATIONS := \
+	001_initial.sql \
+	002_seed_data.sql \
+	003_runtime_layer.sql \
+	004_single_gpu_runtime_seed.sql \
+	005_enterprise_platform.sql \
+	005_ai_platform.sql \
+	006_controller_columns.sql \
+	006_h200_platform_seed.sql \
+	007_agent_tasks.sql \
+	008_node_model_cache.sql \
+	009_resilience.sql \
+	010_lazy_runtime.sql \
+	011_projects.sql \
+	011_runtime_config_gpu.sql \
+	012_unified_startup_states.sql \
+	013_start_model_task_type.sql \
+	014_execution_mode.sql \
+	015_catchup_schema.sql \
+	016_workload_policy.sql \
+	017_scheduler.sql \
+	018_weighted_priority.sql \
+	018b_catchup_weighted.sql \
+	018b_weighted_priority_fixup.sql \
+	019_ha_replicas.sql \
+	020_port_allocator.sql \
+	021_missing_columns.sql \
+	022_project_api_keys.sql \
+	023_project_policies.sql \
+	024_placement_v2.sql \
+	025_placement_labels.sql \
+	026_extra_args.sql \
+	027_thinking_mode.sql \
+	028_replica_slot_guard.sql \
+	029_rolling_replacement.sql \
+	030_state_constraint_catchup.sql \
+	031_org_as_root.sql \
+	032_fix_claim_replica_slot_failed_state.sql \
+	033_universal_runtime_platform.sql \
+	034_deprecate_legacy_columns.sql \
+	035_drop_deprecated_columns.sql \
+	036_drop_service_abstraction_remnants.sql \
+	037_capability_validation.sql \
+	038_recover_stuck_runtimes.sql \
+	039_register_orphan_gpt_oss_120b.sql
+
 migrate:
 	@echo "→ Waiting for postgres..."
 	@until docker compose exec -T postgres pg_isready -U nexus -d nexusllm > /dev/null 2>&1; \
@@ -146,7 +196,7 @@ migrate:
 	@echo "→ Copying migrations into container..."
 	@docker compose cp migrations/. postgres:/migrations/
 	@echo "→ Applying all migrations in order..."
-	@for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort | xargs -n1 basename); do \
+	@for f in $(MIGRATIONS); do \
 	  echo "  → $$f"; \
 	  docker compose exec -T postgres psql -U nexus -d nexusllm \
 	    -v ON_ERROR_STOP=1 -f /migrations/$$f \
@@ -199,7 +249,7 @@ migrate-external: _check-dsn
 	@echo "  ✓ Connected"
 	@echo ""
 	@PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')"; \
-	for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort | xargs -n1 basename); do \
+	for f in $(MIGRATIONS); do \
 	  echo "  → $$f"; \
 	  docker run --rm \
 	    --network host \
@@ -231,7 +281,7 @@ _run-migration-external:
 # Dry-run: print the SQL files that would be applied without connecting
 migrate-dry:
 	@echo "→ Migrations that would be applied (in order):"
-	@for f in $$(LC_ALL=C ls migrations/*.sql | LC_ALL=C sort); do echo "  $$f"; done
+	@for f in $(MIGRATIONS); do echo "  migrations/$$f"; done
 	@echo ""
 	@echo "To run against an external DB:"
 	@echo "  make migrate-external DB_DSN=\"postgres://user:pass@host:5432/nexusllm\""
