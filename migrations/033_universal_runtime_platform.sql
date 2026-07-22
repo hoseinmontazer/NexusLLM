@@ -135,19 +135,26 @@ WHERE m.id = me.model_id
 ALTER TABLE node_capabilities
     ADD COLUMN IF NOT EXISTS supported_backends JSONB NOT NULL DEFAULT '[]';
 
--- Seed supported_backends from existing boolean columns
-UPDATE node_capabilities
-SET supported_backends = (
-    SELECT jsonb_agg(b) FROM (
-        SELECT 'vllm'    AS b WHERE has_vllm    = TRUE UNION ALL
-        SELECT 'ollama'  AS b WHERE has_ollama  = TRUE UNION ALL
-        SELECT 'tgi'     AS b WHERE has_tgi     = TRUE UNION ALL
-        SELECT 'whisper' AS b WHERE has_whisper = TRUE UNION ALL
-        SELECT 'tts'     AS b WHERE has_tts     = TRUE UNION ALL
-        SELECT 'embedding' AS b WHERE has_embedding = TRUE
-    ) t
-)
-WHERE supported_backends = '[]'::jsonb;
+-- Seed supported_backends from existing boolean columns (only if they still exist).
+-- These columns are dropped in migration 035; skip silently when they're gone.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='node_capabilities' AND column_name='has_vllm') THEN
+        UPDATE node_capabilities
+        SET supported_backends = (
+            SELECT jsonb_agg(b) FROM (
+                SELECT 'vllm'      AS b WHERE has_vllm      = TRUE UNION ALL
+                SELECT 'ollama'    AS b WHERE has_ollama    = TRUE UNION ALL
+                SELECT 'tgi'       AS b WHERE has_tgi       = TRUE UNION ALL
+                SELECT 'whisper'   AS b WHERE has_whisper   = TRUE UNION ALL
+                SELECT 'tts'       AS b WHERE has_tts       = TRUE UNION ALL
+                SELECT 'embedding' AS b WHERE has_embedding = TRUE
+            ) t
+        )
+        WHERE supported_backends = '[]'::jsonb;
+    END IF;
+END $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 7. NORMALIZE: ensure all CHAT models have workload_policy
@@ -170,7 +177,6 @@ SELECT
     m.display_name,
     m.service_type,
     m.backend_type,
-    m.runtime_type,
     m.provider,
     m.enabled,
     m.capabilities,
@@ -197,7 +203,7 @@ LEFT JOIN agent_runtimes ar       ON ar.model_id = m.id
                                   AND ar.state NOT IN ('stopped','deleted','failed','archived')
 LEFT JOIN model_replica_specs rs  ON rs.model_id = m.id
 GROUP BY m.id, m.name, m.display_name, m.service_type, m.backend_type,
-         m.runtime_type, m.provider, m.enabled, m.capabilities, m.tags,
+         m.provider, m.enabled, m.capabilities, m.tags,
          m.created_at, m.updated_at,
          rs.desired_replicas, rs.auto_recover;
 

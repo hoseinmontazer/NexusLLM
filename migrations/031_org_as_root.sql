@@ -49,10 +49,16 @@ ALTER TABLE projects
 -- Change the uniqueness constraint:
 --   BEFORE: UNIQUE(team_id, name)  → projects unique within a team
 --   AFTER:  UNIQUE(organization_id, name) → projects unique within an org
-ALTER TABLE projects
-    DROP CONSTRAINT IF EXISTS projects_team_id_name_key;
-ALTER TABLE projects
-    ADD CONSTRAINT projects_organization_id_name_key UNIQUE (organization_id, name);
+DO $$
+BEGIN
+    ALTER TABLE projects
+        DROP CONSTRAINT IF EXISTS projects_team_id_name_key;
+    ALTER TABLE projects
+        ADD CONSTRAINT projects_organization_id_name_key UNIQUE (organization_id, name);
+EXCEPTION WHEN duplicate_table THEN
+    -- Constraint already exists — nothing to do.
+    NULL;
+END $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. org_model_permissions

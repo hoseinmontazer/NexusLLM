@@ -66,4 +66,43 @@ DROP TABLE IF EXISTS resource_reservations;
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP TABLE IF EXISTS cpu_allocations;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 5. Refresh universal_models view — remove runtime_type reference
+--    This view was originally created in migration 033 with runtime_type.
+--    Now that the column is dropped, recreate it without that field.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE VIEW universal_models AS
+SELECT
+    m.id,
+    m.name,
+    m.display_name,
+    m.service_type,
+    m.backend_type,
+    m.provider,
+    m.enabled,
+    m.capabilities,
+    m.tags,
+    m.created_at,
+    m.updated_at,
+    COUNT(me.id)                                              AS endpoint_count,
+    COUNT(me.id) FILTER (WHERE me.health_status = 'healthy') AS healthy_count,
+    COUNT(ar.id) FILTER (
+        WHERE ar.state IN ('ready','active','warm','idle')
+    )                                                         AS running_replicas,
+    COUNT(ar.id) FILTER (
+        WHERE ar.state IN ('created','validating','downloading','starting',
+                           'loading_model','waiting_ready','pending','recovering')
+    )                                                         AS starting_replicas,
+    COALESCE(rs.desired_replicas, 1)                          AS desired_replicas,
+    COALESCE(rs.auto_recover, TRUE)                           AS auto_recover
+FROM models m
+LEFT JOIN model_endpoints me      ON me.model_id = m.id AND me.is_enabled = TRUE
+LEFT JOIN agent_runtimes ar       ON ar.model_id = m.id
+                                  AND ar.state NOT IN ('stopped','deleted','failed','archived')
+LEFT JOIN model_replica_specs rs  ON rs.model_id = m.id
+GROUP BY m.id, m.name, m.display_name, m.service_type, m.backend_type,
+         m.provider, m.enabled, m.capabilities, m.tags,
+         m.created_at, m.updated_at,
+         rs.desired_replicas, rs.auto_recover;
+
 COMMIT;
