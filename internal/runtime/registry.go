@@ -359,17 +359,10 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		  AND ar.bind_host != ''
 		  AND ar.bind_port > 0
 		  AND m.enabled = TRUE
-		  -- Include when:
-		  --   a) HA replica with no model_endpoint row (endpoint_id IS NULL), OR
-		  --   b) endpoint_id set but model_endpoints.is_enabled=FALSE
-		  --      (watcher disabled it during loading — runtime is now the truth source)
-		  AND (
-		      ar.endpoint_id IS NULL
-		      OR NOT EXISTS (
-		          SELECT 1 FROM model_endpoints me2
-		          WHERE me2.id = ar.endpoint_id AND me2.is_enabled = TRUE
-		      )
-		  )
+		  -- Always include all valid agent_runtimes — the first UNION already
+		  -- deduplicates by excluding model_endpoints rows that have a covering
+		  -- agent_runtime. We must not re-exclude here or there is a gap where
+		  -- both UNIONs exclude the same endpoint (is_enabled=TRUE + endpoint_id set).
 
 		ORDER BY model_name, priority, weight DESC
 	`)

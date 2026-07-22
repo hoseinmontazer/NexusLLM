@@ -82,14 +82,16 @@ func (s *Scheduler) Start(ctx context.Context) {
 func (s *Scheduler) processQueue(ctx context.Context) {
 	var queued []QueuedDeployment
 	err := s.db.SelectContext(ctx, &queued, `
-		SELECT id, project_id, runtime_config, priority_score,
+		SELECT id, project_id, runtime_config,
+		       COALESCE(priority_weight, priority_score, 500)     AS priority_weight,
+		       COALESCE(effective_priority, priority_score, 500)  AS effective_priority,
 		       required_vram_mb, required_ram_mb, required_cpu,
 		       execution_mode, prefer_node_id,
 		       attempts, enqueued_at, last_attempt_at
 		FROM deployment_queue
 		WHERE status = 'pending'
 		  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-		ORDER BY priority_score DESC, enqueued_at ASC
+		ORDER BY COALESCE(priority_weight, priority_score, 500) DESC, enqueued_at ASC
 		LIMIT 10
 	`)
 
