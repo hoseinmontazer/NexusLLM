@@ -214,7 +214,6 @@ type ScoredNode struct {
 type QueuedDeployment struct {
 	ID                string     `db:"id"`
 	ProjectID         string     `db:"project_id"`
-	ModelName         string     `db:"model_name"`
 	RuntimeConfig     string     `db:"runtime_config"` // JSON
 	PriorityWeight    int        `db:"priority_weight"`
 	EffectivePriority int        `db:"effective_priority"`
@@ -224,10 +223,9 @@ type QueuedDeployment struct {
 	ExecutionMode     string     `db:"execution_mode"`
 	PreferNodeID      *string    `db:"prefer_node_id"`
 	Attempts          int        `db:"attempts"`
-	WaitingSince      time.Time  `db:"waiting_since"`
 	EnqueuedAt        time.Time  `db:"enqueued_at"`
 	LastAttemptAt     *time.Time `db:"last_attempt_at"`
-	ErrorMsg          string     `db:"error_msg"`
+	LastError         string     `db:"last_error"`
 }
 
 // ToPlacementRequest converts a queue item into a PlacementRequest.
@@ -237,9 +235,10 @@ func (q *QueuedDeployment) ToPlacementRequest() (PlacementRequest, error) {
 		return PlacementRequest{}, err
 	}
 	modelID, _ := cfg["model_id"].(string)
+	modelName, _ := cfg["model_name"].(string)
 	req := PlacementRequest{
 		ModelID:           modelID,
-		ModelName:         q.ModelName,
+		ModelName:         modelName,
 		ProjectID:         q.ProjectID,
 		RequiredCPU:       q.RequiredCPU,
 		RequiredRAMMB:     q.RequiredRAMMB,

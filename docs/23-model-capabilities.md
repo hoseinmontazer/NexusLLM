@@ -225,6 +225,339 @@ Content-Type: application/json
 
 ---
 
+## curl Samples — Register Every Model Type
+
+Replace `GATEWAY_URL`, `ADMIN_URL`, and `YOUR_API_KEY` with your actual values.
+
+### LLM / Chat model (`CHAT`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "llama-3.3-70b",
+    "display_name": "Llama 3.3 70B",
+    "service_type": "CHAT",
+    "backend_type": "llamacpp",
+    "capabilities": ["chat", "completion"],
+    "host":         "localhost",
+    "port":         8080,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b",
+    "messages": [{"role": "user", "content": "Hello, how are you?"}]
+  }'
+```
+
+**Wrong endpoint → HTTP 400:**
+```bash
+curl -X POST $GATEWAY_URL/v1/audio/transcriptions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "model=llama-3.3-70b" \
+  -F "file=@audio.mp3"
+# → {"error":{"type":"invalid_model","message":"Model 'llama-3.3-70b' does not support Audio Transcription.","required_capability":"transcription","model_capabilities":["chat","completion"]}}
+```
+
+---
+
+### Embedding model (`EMBEDDING`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "bge-m3",
+    "display_name": "BGE M3",
+    "service_type": "EMBEDDING",
+    "backend_type": "openai_compat",
+    "capabilities": ["embedding"],
+    "host":         "localhost",
+    "port":         8081,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/embeddings \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bge-m3",
+    "input": "The quick brown fox"
+  }'
+```
+
+**Wrong endpoint → HTTP 400:**
+```bash
+curl -X POST $GATEWAY_URL/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-m3","messages":[{"role":"user","content":"Hello"}]}'
+# → {"error":{"type":"invalid_model","message":"Model 'bge-m3' does not support Chat Completions.","required_capability":"chat","model_capabilities":["embedding"]}}
+```
+
+---
+
+### Speech-to-Text / Transcription (`STT`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "whisper-large-v3",
+    "display_name": "Whisper Large v3",
+    "service_type": "STT",
+    "backend_type": "openai_compat",
+    "capabilities": ["transcription"],
+    "host":         "localhost",
+    "port":         8082,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/audio/transcriptions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "model=whisper-large-v3" \
+  -F "file=@audio.mp3" \
+  -F "response_format=json"
+```
+
+**Wrong endpoint → HTTP 400:**
+```bash
+curl -X POST $GATEWAY_URL/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"whisper-large-v3","messages":[{"role":"user","content":"Hello"}]}'
+# → {"error":{"type":"invalid_model","message":"Model 'whisper-large-v3' does not support Chat Completions.","required_capability":"chat","model_capabilities":["transcription"]}}
+```
+
+---
+
+### Text-to-Speech (`TTS`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "kokoro-en",
+    "display_name": "Kokoro English",
+    "service_type": "TTS",
+    "backend_type": "openai_compat",
+    "capabilities": ["speech"],
+    "host":         "localhost",
+    "port":         8083,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/audio/speech \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kokoro-en",
+    "input": "Hello, this is a test.",
+    "voice": "af_heart",
+    "response_format": "mp3"
+  }' \
+  --output speech.mp3
+```
+
+---
+
+### Reranker (`RERANK`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "bge-reranker-v2",
+    "display_name": "BGE Reranker v2",
+    "service_type": "RERANK",
+    "backend_type": "openai_compat",
+    "capabilities": ["rerank"],
+    "host":         "localhost",
+    "port":         8084,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/rerank \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bge-reranker-v2",
+    "query": "What is the capital of France?",
+    "documents": ["Paris is the capital.", "London is in England.", "France is in Europe."],
+    "top_n": 2
+  }'
+```
+
+---
+
+### OCR (`OCR`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "surya-ocr",
+    "display_name": "Surya OCR",
+    "service_type": "OCR",
+    "backend_type": "openai_compat",
+    "capabilities": ["ocr"],
+    "host":         "localhost",
+    "port":         8085,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/ocr \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "surya-ocr",
+    "image": "<base64-encoded-image>"
+  }'
+```
+
+---
+
+### Vision / Multimodal (`VISION`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "qwen2-vl-7b",
+    "display_name": "Qwen2 VL 7B",
+    "service_type": "VISION",
+    "backend_type": "llamacpp",
+    "capabilities": ["chat", "vision"],
+    "host":         "localhost",
+    "port":         8086,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2-vl-7b",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}},
+        {"type": "text", "text": "What is in this image?"}
+      ]
+    }]
+  }'
+```
+
+---
+
+### Image Generation (`IMAGE_GENERATION`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "stable-diffusion-xl",
+    "display_name": "Stable Diffusion XL",
+    "service_type": "IMAGE_GENERATION",
+    "backend_type": "openai_compat",
+    "capabilities": ["image_generation"],
+    "host":         "localhost",
+    "port":         8087,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/images/generations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "stable-diffusion-xl",
+    "prompt": "A photorealistic cat sitting on a red velvet chair",
+    "n": 1,
+    "size": "1024x1024"
+  }'
+```
+
+---
+
+### Moderation (`MODERATION`)
+
+**Register:**
+```bash
+curl -X POST $ADMIN_URL/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":         "text-moderation-v1",
+    "display_name": "Text Moderation v1",
+    "service_type": "MODERATION",
+    "backend_type": "openai_compat",
+    "capabilities": ["moderation"],
+    "host":         "localhost",
+    "port":         8088,
+    "start_now":    false
+  }'
+```
+
+**Use:**
+```bash
+curl -X POST $GATEWAY_URL/v1/moderations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "text-moderation-v1",
+    "input": "I want to buy a new laptop"
+  }'
+```
+
+---
+
+### Update capabilities for an existing model
+
+No restart required — takes effect on the next request.
+
+```bash
+curl -X PUT $ADMIN_URL/admin/v1/models/{model_id}/capabilities \
+  -H "Content-Type: application/json" \
+  -d '{"capabilities": ["chat", "completion", "vision"]}'
+```
+
+---
+
 ## Design Principles
 
 1. **Engine-independent** — validation runs in the gateway, before any backend adapter is selected.
