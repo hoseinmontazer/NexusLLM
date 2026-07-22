@@ -145,6 +145,10 @@ export interface DeployModelInput {
   // Universal model type — every workload declares its type
   // LLM | STT | TTS | OCR | EMBEDDING | RERANK | VISION | IMAGE_GENERATION | CUSTOM
   service_type?: string
+  // Explicit capability list — overrides automatic derivation from service_type.
+  // Example: ["chat","completion"] for LLMs, ["transcription"] for Whisper models.
+  // When omitted, capabilities are derived automatically from service_type.
+  capabilities?: string[]
   // Extra args forwarded verbatim to the container entrypoint.
   // Used for non-llamacpp backends (faster-whisper, kokoro, surya, etc.)
   extra_args?: string[]
@@ -557,6 +561,10 @@ export const api = {
       thinking_enabled?: boolean
       min_thinking_tokens?: number
     }) => req<{ message: string }>('PUT', `/models/${id}/thinking`, b),
+    setCapabilities: (id: string, capabilities: string[]) =>
+      req<{ model_id: string; capabilities: string[]; message: string }>(
+        'PUT', `/models/${id}/capabilities`, { capabilities }
+      ),
     getRuntimeStatus: (id: string) =>
       req<{ model_id: string; runtimes: RuntimeStatus[]; count: number }>(
         'GET', `/models/${id}/runtime-status`),
