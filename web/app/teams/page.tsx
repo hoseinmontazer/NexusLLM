@@ -9,8 +9,125 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, Users, FolderKanban } from 'lucide-react'
+import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, Users, FolderKanban, X, ShieldCheck } from 'lucide-react'
 import Link from 'next/link'
+
+// ── Model access grant panel ──────────────────────────────────────────────────
+function ModelAccessPanel({ team }: { team: Team }) {
+  const qc = useQueryClient()
+  const [modelInput, setModelInput] = useState('')
+
+  const { data: modelsData, isLoading } = useQuery({
+    queryKey: ['team-models', team.id],
+    queryFn: () => api.teams.listModels(team.id),
+  })
+
+  // All registered models for the autocomplete list
+  const { data: allModels } = useQuery({
+    queryKey: ['models'],
+    queryFn: () => api.models.list(),
+  })
+  const modelNames = (allModels?.data ?? []).map(m => m.name)
+  const grantedModels = modelsData?.models ?? []
+  const ungrantedModels = modelNames.filter(n => !grantedModels.includes(n))
+
+  const grant = useMutation({
+    mutationFn: (name: string) => api.teams.addModel(team.id, name),
+    onSuccess: (_,name) => {
+      toast({ title: `Access granted`, description: `${team.name} → ${name}` })
+      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
+      setModelInput('')
+    },
+    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const revoke = useMutation({
+    mutationFn: (name: string) => api.teams.removeModel(team.id, name),
+    onSuccess: (_,name) => {
+      toast({ title: `Access revoked`, description: `${team.name} ✕ ${name}` })
+      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
+    },
+    onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
+  })
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+        <ShieldCheck className="w-3.5 h-3.5" />Model Access
+        <span className="font-normal normal-case text-muted-foreground ml-1">
+          — gateway ACL, required before any inference request
+        </span>
+      </div>
+
+      {/* Granted list */}
+      {isLoading ? (
+        <p className="text-xs text-muted-foreground">Loading…</p>
+      ) : grantedModels.length === 0 ? (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+          ⚠️ No models granted — all inference requests from this team will be rejected with <code>model_not_allowed</code>.
+        </p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5">
+          {grantedModels.map(name => (
+            <span key={name}
+              className="inline-flex items-center gap-1 text-xs bg-green-50 text-green-700 border border-green-200 rounded-full pl-2.5 pr-1 py-0.5">
+              {name}
+              <button
+                onClick={() => revoke.mutate(name)}
+                disabled={revoke.isPending}
+                className="ml-0.5 hover:text-red-600 transition-colors rounded-full p-0.5 hover:bg-red-50"
+                title={`Revoke ${name}`}
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Grant new model */}
+      <div className="flex gap-2">
+        <div className="flex-1 relative">
+          <Input
+            value={modelInput}
+            onChange={e => setModelInput(e.target.value)}
+            placeholder="model name…"
+            className="text-sm h-8"
+            list={`model-list-${team.id}`}
+          />
+          <datalist id={`model-list-${team.id}`}>
+            {ungrantedModels.map(n => <option key={n} value={n} />)}
+          </datalist>
+        </div>
+        <Button
+          size="sm"
+          className="h-8 shrink-0"
+          disabled={!modelInput.trim() || grant.isPending}
+          onClick={() => modelInput.trim() && grant.mutate(modelInput.trim())}
+        >
+          <Plus className="w-3.5 h-3.5 mr-1" />Grant
+        </Button>
+      </div>
+
+      {/* Quick-grant all */}
+      {ungrantedModels.length > 0 && (
+        <div className="flex flex-wrap gap-1 pt-1">
+          <span className="text-xs text-muted-foreground self-center mr-1">Quick grant:</span>
+          {ungrantedModels.slice(0, 6).map(name => (
+            <button
+              key={name}
+              onClick={() => grant.mutate(name)}
+              disabled={grant.isPending}
+              className="text-[10px] px-2 py-0.5 rounded border border-dashed border-gray-300 text-muted-foreground hover:border-green-400 hover:text-green-700 hover:bg-green-50 transition-colors"
+            >
+              + {name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── Edit team form ─────────────────────────────────────────────────────────────
 function EditTeamForm({ team, onDone }: { team: Team; onDone: () => void }) {
@@ -57,13 +174,6 @@ function TeamCard({ team }: { team: Team }) {
     enabled: expanded,
   })
   const teamProjects = projectsData?.data ?? []
-
-  // Load model access for this team
-  const { data: modelsData } = useQuery({
-    queryKey: ['team-models', team.id],
-    queryFn: () => api.teams.listModels(team.id),
-    enabled: expanded,
-  })
 
   const deleteMut = useMutation({
     mutationFn: () => api.teams.delete(team.id),
@@ -125,19 +235,22 @@ function TeamCard({ team }: { team: Team }) {
               </div>
             </div>
 
-            {/* Expanded: membership info only */}
+            {/* Expanded details */}
             {expanded && (
               <div className="mt-3 border-t pt-3 space-y-4">
+                {/* Model access — grant/revoke */}
+                <ModelAccessPanel team={team} />
+
                 {/* Project assignments (read-only view) */}
                 <div>
                   <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5 mb-2">
                     <FolderKanban className="w-3.5 h-3.5" />Project Assignments
                   </p>
                   <p className="text-xs text-muted-foreground mb-2">
-                    Projects using this team for RBAC grouping. Rate limits, quotas and scheduling belong to the Project, not the Team.
+                    Projects using this team for RBAC grouping.
                   </p>
                   {teamProjects.length === 0 ? (
-                    <p className="text-xs text-muted-foreground italic">No projects assigned to this team yet.</p>
+                    <p className="text-xs text-muted-foreground italic">No projects assigned yet.</p>
                   ) : (
                     <div className="flex flex-wrap gap-1.5">
                       {teamProjects.map(p => (
@@ -150,42 +263,8 @@ function TeamCard({ team }: { team: Team }) {
                       ))}
                     </div>
                   )}
-                  <div className="mt-2">
-                    <Link href={`/projects`}
-                      className="text-xs text-blue-600 hover:underline">
-                      Manage project assignments in Projects →
-                    </Link>
-                  </div>
-                </div>
-
-                {/* Model access (team-level model permissions for RBAC) */}
-                <div>
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5 mb-2">
-                    <Users className="w-3.5 h-3.5" />Allowed Models (RBAC)
-                  </p>
-                  <p className="text-xs text-muted-foreground mb-2">
-                    Models this team's members can access. Scheduling and quota is controlled per-project.
-                  </p>
-                  {(modelsData?.models ?? []).length === 0 ? (
-                    <p className="text-xs text-muted-foreground italic">No model permissions granted yet.</p>
-                  ) : (
-                    <div className="flex flex-wrap gap-1.5">
-                      {(modelsData?.models ?? []).map(name => (
-                        <span key={name}
-                          className="inline-flex items-center text-xs bg-green-50 text-green-700 border border-green-200 rounded-full px-2.5 py-0.5">
-                          {name}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Info notice */}
-                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
-                  <p className="font-semibold mb-1">Teams are RBAC/membership only</p>
-                  <p>Priority, rate limits, quotas, usage analytics and billing are all configured per Project. Teams only group members and grant model permissions.</p>
-                  <Link href="/projects" className="text-amber-700 underline mt-1 inline-block">
-                    Configure execution settings in Projects →
+                  <Link href="/projects" className="text-xs text-blue-600 hover:underline mt-1.5 inline-block">
+                    Manage projects →
                   </Link>
                 </div>
               </div>
