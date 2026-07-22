@@ -761,17 +761,55 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 
 	// Resolve the host-side directory for the shared models volume so we can
 	// check whether the file already exists on disk.
-	hostVolumeRoot := firstNonEmpty(p.ModelsVolume, "nexus_models", "llamacpp_models")
-	hostVolumeDir := hostVolumeRoot
-	if !strings.HasPrefix(hostVolumeRoot, "/") {
-		volOut, volErr := exec.CommandContext(ctx, "docker", "volume", "inspect",
-			"--format", "{{.Mountpoint}}", hostVolumeRoot).Output()
-		if volErr == nil {
-			hostVolumeDir = strings.TrimSpace(string(volOut))
+	//
+	// Resolution order:
+	//   1. p.ModelsVolume (explicit operator config) — highest priority
+	//   2. "nexus_models" — preferred default volume name
+	//   3. "llamacpp_models" — legacy / single-GPU stack fallback
+	//
+	// For named volumes (non-absolute paths) we call `docker volume inspect` to
+	// get the real mountpoint. If a candidate volume doesn't exist we skip it
+	// rather than using the bare name as a relative path (which would always
+	// produce wrong stat checks). The first candidate that resolves to a real
+	// mountpoint wins; if none resolves we fall back to the last candidate so
+	// that `docker run` can create it on first use.
+	resolveVolumeDir := func(volumeName string) (string, bool) {
+		if strings.HasPrefix(volumeName, "/") {
+			return volumeName, true
 		}
-		// If the volume doesn't exist yet, hostVolumeDir stays as the volume name.
-		// We'll fall through and let docker run create it.
+		volOut, volErr := exec.CommandContext(ctx, "docker", "volume", "inspect",
+			"--format", "{{.Mountpoint}}", volumeName).Output()
+		if volErr != nil {
+			return "", false
+		}
+		mp := strings.TrimSpace(string(volOut))
+		if mp == "" {
+			return "", false
+		}
+		return mp, true
 	}
+
+	candidates := []string{"nexus_models", "llamacpp_models"}
+	if p.ModelsVolume != "" {
+		candidates = append([]string{p.ModelsVolume}, candidates...)
+	}
+
+	hostVolumeRoot := candidates[len(candidates)-1] // fallback: last candidate
+	hostVolumeDir := hostVolumeRoot
+	for _, cand := range candidates {
+		if mp, ok := resolveVolumeDir(cand); ok {
+			hostVolumeRoot = cand
+			hostVolumeDir = mp
+			e.log.Info("ensureModelCached: resolved models volume",
+				zap.String("volume", hostVolumeRoot),
+				zap.String("mountpoint", hostVolumeDir),
+			)
+			break
+		}
+	}
+	// Persist the resolved volume name back into the payload so buildDockerArgs
+	// mounts the same volume without needing its own inspect call.
+	p.ModelsVolume = hostVolumeRoot
 
 	// Case 3: no explicit GGUFPath but HFRepo+HFFile provided.
 	// Check if the HFFile is already cached in the volume. If it is, reuse it
@@ -988,7 +1026,11 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		args = append(args, "-v", "ollama_models:/root/.ollama")
 
 	case "llamacpp":
-		vol := firstNonEmpty(p.ModelsVolume, "nexus_models", "llamacpp_models")
+		// p.ModelsVolume is resolved to the correct volume name by ensureModelCached
+		// before buildDockerArgs is called. Fall back to "llamacpp_models" only
+		// when this function is called without a prior ensureModelCached (shouldn't
+		// happen in normal flow, but keeps the function self-contained).
+		vol := firstNonEmpty(p.ModelsVolume, "llamacpp_models")
 		args = append(args, "-v", vol+":/models")
 		// llamacpp uses host networking for simplicity.
 		args = append(args, "--network", "host")
