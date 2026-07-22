@@ -302,7 +302,101 @@ func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest
 		return nil, fmt.Errorf("loadCandidateNodes: %w", err)
 	}
 
-	// ── Enrich nodes with live resource data ──────────────────────────────────
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	// ── Batch-load all resource data in 3 queries total (no N+1) ─────────────
+	//
+	// Previously each node triggered 3 individual queries (GPU state, RAM
+	// telemetry, CPU allocations). For a 10-node cluster that was 30 extra round-
+	// trips per placement decision. We now load everything in bulk and look up
+	// from maps during the enrichment loop below.
+	nodeIDs := make([]string, len(rows))
+	for i, r := range rows {
+		nodeIDs[i] = r.ID
+	}
+
+	// Batch 1: latest RAM availability per node (single LATERAL query).
+	type ramRow struct {
+		NodeID   string `db:"node_id"`
+		RAMAvail int64  `db:"ram_avail_mb"`
+	}
+	var ramRows []ramRow
+	if len(nodeIDs) > 0 {
+		ramQuery, ramArgs, _ := sqlx.In(`
+			SELECT DISTINCT ON (nt.node_id)
+			    nt.node_id::text AS node_id,
+			    COALESCE(nt.ram_avail_mb, 0) AS ram_avail_mb
+			FROM node_telemetry nt
+			WHERE nt.node_id = ANY(?)
+			ORDER BY nt.node_id, nt.recorded_at DESC`, nodeIDs)
+		ramQuery = s.db.Rebind(ramQuery)
+		_ = s.db.SelectContext(ctx, &ramRows, ramQuery, ramArgs...)
+	}
+	ramByNode := make(map[string]int64, len(ramRows))
+	for _, r := range ramRows {
+		ramByNode[r.NodeID] = r.RAMAvail
+	}
+
+	// Batch 2: total allocated CPU per node (single aggregate query).
+	type cpuRow struct {
+		NodeID   string `db:"node_id"`
+		AllocCPU int    `db:"alloc_cpu"`
+	}
+	var cpuRows []cpuRow
+	if len(nodeIDs) > 0 {
+		cpuQuery, cpuArgs, _ := sqlx.In(`
+			SELECT node_id::text AS node_id, COALESCE(SUM(cpu_cores), 0) AS alloc_cpu
+			FROM cpu_allocations
+			WHERE node_id = ANY(?) AND released_at IS NULL
+			GROUP BY node_id`, nodeIDs)
+		cpuQuery = s.db.Rebind(cpuQuery)
+		_ = s.db.SelectContext(ctx, &cpuRows, cpuQuery, cpuArgs...)
+	}
+	cpuByNode := make(map[string]int, len(cpuRows))
+	for _, r := range cpuRows {
+		cpuByNode[r.NodeID] = r.AllocCPU
+	}
+
+	// Batch 3: GPU devices + latest telemetry for all candidate nodes.
+	type gpuBatchRow struct {
+		NodeID         string `db:"node_id"`
+		ID             string `db:"id"`
+		DeviceIndex    int    `db:"device_index"`
+		Name           string `db:"name"`
+		VRAMMB         int64  `db:"vram_mb"`
+		MemUsedMB      int64  `db:"mem_used_mb"`
+		UtilizationPct int    `db:"utilization_pct"`
+		TemperatureC   int    `db:"temperature_c"`
+		NUMANode       int    `db:"numa_node"`
+	}
+	var gpuBatchRows []gpuBatchRow
+	if len(nodeIDs) > 0 {
+		gpuBatchQuery, gpuBatchArgs, _ := sqlx.In(`
+			SELECT gn.node_id::text AS node_id,
+			       d.id, d.device_index, d.name, d.vram_mb,
+			       COALESCE(gt.memory_used_mb, 0) AS mem_used_mb,
+			       COALESCE(d.utilization_pct, 0) AS utilization_pct,
+			       COALESCE(d.temperature_c, 0)   AS temperature_c,
+			       COALESCE(d.numa_node, 0)        AS numa_node
+			FROM gpu_devices d
+			JOIN gpu_nodes gn ON gn.id = d.node_id
+			LEFT JOIN LATERAL (
+			    SELECT memory_used_mb FROM gpu_telemetry
+			    WHERE device_id = d.id ORDER BY recorded_at DESC LIMIT 1
+			) gt ON TRUE
+			WHERE gn.node_id = ANY(?)`, nodeIDs)
+		gpuBatchQuery = s.db.Rebind(gpuBatchQuery)
+		_ = s.db.SelectContext(ctx, &gpuBatchRows, gpuBatchQuery, gpuBatchArgs...)
+	}
+	// Group GPU rows by node.
+	gpusByNode := make(map[string][]gpuBatchRow, len(rows))
+	for _, g := range gpuBatchRows {
+		gpusByNode[g.NodeID] = append(gpusByNode[g.NodeID], g)
+	}
+
+	// ── Enrich nodes with live resource data (O(1) map lookups, no DB calls) ──
 	nodes := make([]Node, 0, len(rows))
 	for _, r := range rows {
 		node := Node{
@@ -316,23 +410,39 @@ func (s *Scheduler) loadCandidateNodes(ctx context.Context, req PlacementRequest
 			RuntimeCount: r.RuntimeCount,
 		}
 
-		node.GPUDevices, node.FreeVRAMMB = s.loadGPUState(ctx, r.ID)
-		node.HasGPU = len(node.GPUDevices) > 0
-		node.GPUCount = len(node.GPUDevices)
+		// GPU state from batch map
+		rawGPUs := gpusByNode[r.ID]
+		var freeVRAM int64
+		gpuDevices := make([]GPUDevice, 0, len(rawGPUs))
+		for _, g := range rawGPUs {
+			gpuDevices = append(gpuDevices, GPUDevice{
+				ID:             g.ID,
+				DeviceIndex:    g.DeviceIndex,
+				Name:           g.Name,
+				VRAMMB:         g.VRAMMB,
+				MemUsedMB:      g.MemUsedMB,
+				UtilizationPct: g.UtilizationPct,
+				TemperatureC:   g.TemperatureC,
+				NUMANode:       g.NUMANode,
+			})
+			freeVRAM += g.VRAMMB - g.MemUsedMB
+		}
+		node.GPUDevices = gpuDevices
+		node.FreeVRAMMB = freeVRAM
+		node.HasGPU = len(gpuDevices) > 0
+		node.GPUCount = len(gpuDevices)
 
-		var ramAvail int64
-		_ = s.db.GetContext(ctx, &ramAvail,
-			`SELECT COALESCE(ram_avail_mb, 0) FROM node_telemetry WHERE node_id=$1 ORDER BY recorded_at DESC LIMIT 1`,
-			r.ID)
-		if ramAvail == 0 && r.TotalRAMMB > 0 {
-			ramAvail = r.TotalRAMMB / 2
+		// RAM from batch map; fall back to half of total if telemetry missing
+		ramAvail, ok := ramByNode[r.ID]
+		if !ok || ramAvail == 0 {
+			if r.TotalRAMMB > 0 {
+				ramAvail = r.TotalRAMMB / 2
+			}
 		}
 		node.FreeRAMMB = ramAvail
 
-		var allocCPU int
-		_ = s.db.GetContext(ctx, &allocCPU,
-			`SELECT COALESCE(SUM(cpu_cores),0) FROM cpu_allocations WHERE node_id=$1 AND released_at IS NULL`, r.ID)
-		node.FreeCPU = r.TotalCPU - allocCPU
+		// CPU from batch map
+		node.FreeCPU = r.TotalCPU - cpuByNode[r.ID]
 
 		// ── Hard resource validation ──────────────────────────────────────────
 		// For specific_node mode: reject with a descriptive error instead of silently skipping.
@@ -490,50 +600,6 @@ func joinStrings(ss []string, sep string) string {
 	return result
 }
 
-// loadGPUState loads GPU devices for a node and computes total free VRAM.
-func (s *Scheduler) loadGPUState(ctx context.Context, nodeID string) ([]GPUDevice, int64) {
-	type row struct {
-		ID             string `db:"id"`
-		DeviceIndex    int    `db:"device_index"`
-		Name           string `db:"name"`
-		VRAMMB         int64  `db:"vram_mb"`
-		MemUsedMB      int64  `db:"mem_used_mb"`
-		UtilizationPct int    `db:"utilization_pct"`
-		TemperatureC   int    `db:"temperature_c"`
-		NUMANode       int    `db:"numa_node"`
-	}
-	var rows []row
-	_ = s.db.SelectContext(ctx, &rows, `
-		SELECT d.id, d.device_index, d.name, d.vram_mb,
-		       COALESCE(gt.memory_used_mb,0) AS mem_used_mb,
-		       COALESCE(d.utilization_pct,0) AS utilization_pct,
-		       COALESCE(d.temperature_c,0) AS temperature_c,
-		       COALESCE(d.numa_node,0) AS numa_node
-		FROM gpu_devices d
-		JOIN gpu_nodes gn ON gn.id = d.node_id
-		LEFT JOIN LATERAL (
-		    SELECT memory_used_mb FROM gpu_telemetry WHERE device_id=d.id ORDER BY recorded_at DESC LIMIT 1
-		) gt ON TRUE
-		WHERE gn.node_id=$1`, nodeID)
-
-	var freeVRAM int64
-	devices := make([]GPUDevice, 0, len(rows))
-	for _, r := range rows {
-		devices = append(devices, GPUDevice{
-			ID:             r.ID,
-			DeviceIndex:    r.DeviceIndex,
-			Name:           r.Name,
-			VRAMMB:         r.VRAMMB,
-			MemUsedMB:      r.MemUsedMB,
-			UtilizationPct: r.UtilizationPct,
-			TemperatureC:   r.TemperatureC,
-			NUMANode:       r.NUMANode,
-		})
-		freeVRAM += r.VRAMMB - r.MemUsedMB
-	}
-	return devices, freeVRAM
-}
-
 // scoreNode computes a desirability score [0–1000] for a candidate node.
 // Components: capacity (0–400) + load (0–300) + locality (0–200) + priority bonus (0–200).
 func (s *Scheduler) scoreNode(ctx context.Context, node Node, req PlacementRequest) float64 {
@@ -623,14 +689,6 @@ func less(a, b ScoredNode) bool {
 	return a.Node.ID < b.Node.ID
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// buildDecision constructs a PlacementDecision from the winning candidate.
 func (s *Scheduler) buildDecision(ctx context.Context, best ScoredNode, req PlacementRequest, alternatives []ScoredNode) *PlacementDecision {
 	// Assign GPU devices if needed
 	var gpuIndices []int

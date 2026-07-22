@@ -15,8 +15,8 @@ import (
 
 // CachedModel represents one model found in the local cache.
 type CachedModel struct {
-	ModelRef  string `json:"model_ref"`  // HF repo ID (e.g. "google/gemma-2b") or Ollama name
-	Backend   string `json:"backend"`    // vllm | ollama
+	ModelRef  string `json:"model_ref"` // HF repo ID (e.g. "google/gemma-2b") or Ollama name
+	Backend   string `json:"backend"`   // vllm | ollama
 	SizeBytes int64  `json:"size_bytes"`
 	IsCached  bool   `json:"is_cached"`
 }
@@ -60,7 +60,7 @@ func scanHFCache() []CachedModel {
 			}
 			models = append(models, CachedModel{
 				ModelRef:  modelRef,
-				Backend:   "vllm",
+				Backend:   "huggingface", // source; actual backend is determined at deploy time
 				SizeBytes: size,
 				IsCached:  true,
 			})
@@ -87,9 +87,9 @@ func hfCacheDirs() []string {
 func hfDirToRef(dirName string) string {
 	s := strings.TrimPrefix(dirName, "models--")
 	// replace first -- with /
-	idx := strings.Index(s, "--")
-	if idx >= 0 {
-		return s[:idx] + "/" + s[idx+2:]
+	before, after, found := strings.Cut(s, "--")
+	if found {
+		return before + "/" + after
 	}
 	return s
 }

@@ -16,9 +16,9 @@ import (
 type DriverType string
 
 const (
-	DriverDocker         DriverType = "docker"
-	DriverDockerCompose  DriverType = "docker_compose"
-	DriverKubernetes     DriverType = "kubernetes"
+	DriverDocker        DriverType = "docker"
+	DriverDockerCompose DriverType = "docker_compose"
+	DriverKubernetes    DriverType = "kubernetes"
 )
 
 // RuntimeSpec describes everything needed to start a model runtime.
@@ -56,39 +56,34 @@ type RuntimeSpec struct {
 	MemoryLimit string // e.g. "16g"
 
 	// CPU_RUNTIME placement (set by placement engine)
-	// CPUSetCPUs pins the container to specific logical CPU cores (e.g. "0-31").
-	// NUMANode is the NUMA node index (-1 = no affinity).
-	// When NUMANode ≥ 0 and CPUSetCPUs is empty, the driver auto-derives
-	// the cpuset from numactl topology.
-	CPUSetCPUs  string // e.g. "0-31" or "0,2,4"
-	NUMANode    int    // -1 = no preference
+	CPUSetCPUs  string
+	NUMANode    int
 	RuntimeType string // "GPU_RUNTIME" | "CPU_RUNTIME"
 
-	// ─── llamacpp-specific ────────────────────────────────────────────────────
-	// LlamaCppModelPath is the path to a local GGUF file inside the container
-	// (e.g. "/models/7B/ggml-model-q4_0.gguf"). Takes precedence over HF fields.
-	LlamaCppModelPath string
-	// LlamaCppHFRepo + LlamaCppHFFile: if set, llama-server downloads the GGUF
-	// directly from HuggingFace at startup via --hf-repo / --hf-file flags.
-	// Set HUGGING_FACE_HUB_TOKEN in Env for gated repos.
-	LlamaCppHFRepo string
-	LlamaCppHFFile string
-	// LlamaCppCtxSize overrides the default context window size (default: 4096).
-	LlamaCppCtxSize int
-	// LlamaCppNGPULayers controls how many transformer layers are offloaded to GPU.
-	// 0 = CPU-only, -1 = all layers on GPU (full offload).
-	LlamaCppNGPULayers int
-	// LlamaCppModelsVolume is the host-side source for the /models bind-mount.
-	// Defaults to the named Docker volume "llamacpp_models" when empty.
-	// Set to an absolute host path (e.g. "/mnt/models") for a bind-mount.
-	LlamaCppModelsVolume string
+	// ─── Generic model source fields ─────────────────────────────────────────
+	// These replace the old LlamaCpp-prefixed fields. The docker driver reads
+	// them in buildLlamaCppArgs. Other backends ignore them.
+	// Keeping the field names generic means RuntimeSpec stays backend-agnostic.
+	//
+	// GGUFPath: container-side path to a local GGUF file, e.g. "/models/gemma.gguf"
+	GGUFPath string
+	// HFRepo: HuggingFace repo ID, e.g. "bartowski/gemma-2-2b-it-GGUF"
+	HFRepo string
+	// HFFile: specific file in the HF repo, e.g. "gemma-2-2b-it-Q4_K_M.gguf"
+	HFFile string
+	// CtxSize: context window size (default: 4096). Used by llamacpp server.
+	CtxSize int
+	// NGPULayers: GPU offload layers. 0=CPU-only, -1=all GPU. Used by llamacpp.
+	NGPULayers int
+	// ModelsVolume: Docker volume or host path mounted as /models. Used by llamacpp.
+	ModelsVolume string
 }
 
 // RuntimeStatus is a point-in-time snapshot of a running runtime.
 type RuntimeStatus struct {
 	EndpointID  string
 	Running     bool
-	ContainerID string     // Docker container ID or K8s pod name
+	ContainerID string // Docker container ID or K8s pod name
 	StartedAt   *time.Time
 	ExitCode    *int
 	Error       string

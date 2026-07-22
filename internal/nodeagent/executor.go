@@ -138,15 +138,22 @@ func (e *Executor) pruneExitedNexusContainers(ctx context.Context) {
 // The kernel assigns an ephemeral port atomically — no TOCTOU race.
 // This is the preferred method when bind_port == 0 in the task payload,
 // meaning the control plane delegated port selection to the agent.
+//
+// Note: there is an inherent TOCTOU window between Close() and the container
+// binding — acceptable in practice because the port is in the ephemeral range
+// and no other service should be targeting it. For strict isolation, operators
+// should use the control plane's allocate_node_port() instead.
 func allocateFreePort() (int, error) {
-	l, err := net.Listen("tcp", "0.0.0.0:0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, fmt.Errorf("allocateFreePort: %w", err)
+		// Fallback to 0.0.0.0 on systems that don't have a loopback.
+		l, err = net.Listen("tcp", "0.0.0.0:0")
+		if err != nil {
+			return 0, fmt.Errorf("allocateFreePort: %w", err)
+		}
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
-	// Brief gap between Close and the container binding — acceptable in practice
-	// because the port was ephemeral and no other service is targeting it.
 	return port, nil
 }
 
@@ -489,7 +496,7 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 	}
 	if p.Backend == "" {
-		p.Backend = "llamacpp" // backward-compat default
+		p.Backend = "openai_compat" // universal default — works for any /v1/* HTTP server
 	}
 	if p.CtxSize == 0 {
 		p.CtxSize = 4096
@@ -754,7 +761,7 @@ func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) 
 
 	// Resolve the host-side directory for the shared models volume so we can
 	// check whether the file already exists on disk.
-	hostVolumeRoot := firstNonEmpty(p.ModelsVolume, "llamacpp_models")
+	hostVolumeRoot := firstNonEmpty(p.ModelsVolume, "nexus_models", "llamacpp_models")
 	hostVolumeDir := hostVolumeRoot
 	if !strings.HasPrefix(hostVolumeRoot, "/") {
 		volOut, volErr := exec.CommandContext(ctx, "docker", "volume", "inspect",
@@ -981,7 +988,7 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		args = append(args, "-v", "ollama_models:/root/.ollama")
 
 	case "llamacpp":
-		vol := firstNonEmpty(p.ModelsVolume, "llamacpp_models")
+		vol := firstNonEmpty(p.ModelsVolume, "nexus_models", "llamacpp_models")
 		args = append(args, "-v", vol+":/models")
 		// llamacpp uses host networking for simplicity.
 		args = append(args, "--network", "host")
@@ -1002,7 +1009,11 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		)
 
 	default:
-		// vllm, tgi, cpu_native — host networking.
+		// Generic OpenAI-compatible service (faster-whisper, kokoro, surya,
+		// bge-m3, jina, vllm, tgi, custom HTTP servers, etc.)
+		// host networking — the container binds directly to the node's network.
+		// No CMD args are injected here: the image's own ENTRYPOINT/CMD handles
+		// startup. Operators pass backend-specific flags via ExtraArgs.
 		args = append(args, "--network", "host")
 	}
 

@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
+	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
@@ -38,14 +39,16 @@ const (
 // Reconciler continuously compares desired replica state vs actual state
 // and triggers recovery for under-replicated or lost models.
 type Reconciler struct {
-	db      *sqlx.DB
-	taskMgr *taskmanager.Manager
-	log     *zap.Logger
+	db       *sqlx.DB
+	taskMgr  *taskmanager.Manager
+	registry *runtime.Registry // used for backend adapter lookups (PrepareStartupArgs)
+	log      *zap.Logger
 }
 
 // NewReconciler constructs a Reconciler.
-func NewReconciler(db *sqlx.DB, taskMgr *taskmanager.Manager, log *zap.Logger) *Reconciler {
-	return &Reconciler{db: db, taskMgr: taskMgr, log: log}
+// registry is optional (nil disables PrepareStartupArgs — safe default returned).
+func NewReconciler(db *sqlx.DB, taskMgr *taskmanager.Manager, registry *runtime.Registry, log *zap.Logger) *Reconciler {
+	return &Reconciler{db: db, taskMgr: taskMgr, registry: registry, log: log}
 }
 
 // Start begins the reconciliation loop. Blocks until ctx is cancelled.
@@ -275,7 +278,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		SELECT
 		    m.id                                        AS model_id,
 		    m.name                                      AS model_name,
-		    COALESCE(m.backend_type, 'llamacpp')        AS backend,
+		    COALESCE(m.backend_type, 'openai_compat')     AS backend,
 		    COALESCE(me.runtime_image, '')              AS image,
 		    COALESCE(mrc.gguf_path,   '')               AS gguf_path,
 		    COALESCE(mrc.hf_repo,     '')               AS hf_repo,
@@ -311,20 +314,15 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
 	}
 
-	// Inject --reasoning off for llamacpp thinking models with thinking disabled.
-	// This is the same logic as injectReasoningFlag in runtimemgr/activator.go.
-	// HA-recovered replicas must have the same startup args as the original deploy.
-	if row.Backend == "llamacpp" && row.SupportsThinking && !row.ThinkingEnabled {
-		alreadySet := false
-		for _, a := range extraArgs {
-			if a == "--reasoning" || a == "-rea" {
-				alreadySet = true
-				break
-			}
+	// Delegate startup arg preparation to the backend adapter.
+	// This keeps all backend-specific logic (e.g. --reasoning off for llamacpp)
+	// inside the adapter — the reconciler passes generic capability flags only.
+	if r.registry != nil {
+		caps := runtime.ModelStartupCaps{
+			SupportsThinking: row.SupportsThinking,
+			ThinkingEnabled:  row.ThinkingEnabled,
 		}
-		if !alreadySet {
-			extraArgs = append([]string{"--reasoning", "off"}, extraArgs...)
-		}
+		extraArgs = r.registry.BackendForType(row.Backend).PrepareStartupArgs(caps, extraArgs)
 	}
 
 	return &runtimeConfig{
@@ -508,7 +506,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 	// ── 6. Build fully-populated StartModelPayload ────────────────────────────
 	modelsVolume := cfg.ModelsVolume
 	if modelsVolume == "" {
-		modelsVolume = "llamacpp_models"
+		modelsVolume = "nexus_models"
 	}
 	ctxSize := cfg.CtxSize
 	if ctxSize == 0 {
@@ -1203,7 +1201,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 
 	modelsVolume := cfg.ModelsVolume
 	if modelsVolume == "" {
-		modelsVolume = "llamacpp_models"
+		modelsVolume = "nexus_models"
 	}
 	ctxSize := cfg.CtxSize
 	if ctxSize == 0 {
@@ -1303,6 +1301,3 @@ func (r *Reconciler) sweepFailedContainers(ctx context.Context) {
 		)
 	}
 }
-
-// Ensure json import is used
-var _ = json.Marshal

@@ -35,6 +35,12 @@ func NewCPUNativeBackend(client *http.Client) Backend {
 
 func (b *cpuNativeBackend) Type() BackendType { return BackendCPUNative }
 
+// PrepareStartupArgs — CPU-native services have no server-level reasoning
+// flags; args returned unchanged.
+func (b *cpuNativeBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
+	return extraArgs
+}
+
 func (b *cpuNativeBackend) Health(ctx context.Context, url string) EndpointHealth {
 	return b.inner.Health(ctx, url)
 }

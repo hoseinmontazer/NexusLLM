@@ -813,17 +813,51 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 		gpuCount = int(n)
 	}
 
+	// Build supported_backends JSONB array from the individual boolean flags.
+	// This is the forward-compatible field; the boolean columns are kept for
+	// backward compat but new code should read supported_backends.
+	supportedBackends := `[]`
+	{
+		var backends []string
+		if vllm {
+			backends = append(backends, `"vllm"`)
+		}
+		if ollama {
+			backends = append(backends, `"ollama"`)
+		}
+		if tgi {
+			backends = append(backends, `"tgi"`)
+		}
+		if whisper {
+			backends = append(backends, `"faster_whisper"`)
+		}
+		if tts {
+			backends = append(backends, `"kokoro"`)
+		}
+		if embedding {
+			backends = append(backends, `"cpu_native"`)
+		}
+		// openai_compat is available on any node that can run Docker
+		if docker {
+			backends = append(backends, `"openai_compat"`)
+		}
+		if len(backends) > 0 {
+			supportedBackends = `[` + strings.Join(backends, ",") + `]`
+		}
+	}
+
 	_, _ = h.db.ExecContext(ctx, `
 		INSERT INTO node_capabilities
 		  (node_id, has_docker, has_vllm, has_ollama, has_tgi,
 		   has_whisper, has_tts, has_embedding, has_gpu, gpu_count,
-		   gpu_available, gpu_vram_mb, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+		   gpu_available, gpu_vram_mb, supported_backends, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,NOW())
 		ON CONFLICT (node_id) DO UPDATE SET
 		  has_docker=$2, has_vllm=$3, has_ollama=$4, has_tgi=$5,
 		  has_whisper=$6, has_tts=$7, has_embedding=$8,
 		  has_gpu=$9, gpu_count=$10,
 		  gpu_available=$11, gpu_vram_mb=$12,
+		  supported_backends=$13::jsonb,
 		  updated_at=NOW()`,
 		nodeID, docker, vllm, ollama, tgi, whisper, tts, embedding, hasGPU, gpuCount,
 		hasGPU, // gpu_available mirrors has_gpu
@@ -833,6 +867,7 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 			}
 			return 0
 		}(),
+		supportedBackends,
 	)
 }
 

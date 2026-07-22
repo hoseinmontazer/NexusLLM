@@ -18,14 +18,16 @@ func NewFactory(client *http.Client) *Factory {
 		constructors: make(map[BackendType]func(*http.Client) Backend),
 		client:       client,
 	}
-	f.Register(BackendVLLM,         NewVLLMBackend)
-	f.Register(BackendOllama,        NewOllamaBackend)
-	f.Register(BackendTGI,           NewTGIBackend)
-	f.Register(BackendOpenAICompat,  NewOpenAICompatBackend)
+	f.Register(BackendVLLM, NewVLLMBackend)
+	f.Register(BackendOllama, NewOllamaBackend)
+	f.Register(BackendTGI, NewTGIBackend)
+	f.Register(BackendOpenAICompat, NewOpenAICompatBackend)
 	// CPU-native services (embeddings, rerankers, STT, TTS, OCR, MCP, agents)
-	f.Register(BackendCPUNative,     NewCPUNativeBackend)
-	// llama.cpp server — OpenAI-compatible, CPU inference
-	f.Register(BackendType("llamacpp"), NewOpenAICompatBackend) // wire format is identical to openai_compat
+	f.Register(BackendCPUNative, NewCPUNativeBackend)
+	// llama.cpp server — has its own adapter for startup arg preparation.
+	// HTTP wire format is OpenAI-compatible, but PrepareStartupArgs handles
+	// llamacpp-specific flags (e.g. --reasoning off for thinking models).
+	f.Register(BackendLlamaCpp, NewLlamaCppBackend)
 	return f
 }
 

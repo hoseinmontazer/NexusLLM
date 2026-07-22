@@ -353,10 +353,14 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	if ctxSize == 0 {
 		ctxSize = 4096
 	}
-	// Derive backend from config; default to llamacpp if unset.
+	// Derive backend from config; default to openai_compat if unset.
+	// openai_compat is the universal safe default — every backend that exposes
+	// a /v1/* HTTP API (llama.cpp, faster-whisper, kokoro, surya, etc.) is
+	// compatible. Using llamacpp as a default was LLM-specific and wrong for
+	// STT/TTS/OCR/Embedding workloads.
 	backend := cfg.Backend
 	if backend == "" {
-		backend = "llamacpp"
+		backend = "openai_compat"
 	}
 
 	// ── Resolve execution mode ─────────────────────────────────────────────
@@ -506,6 +510,16 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	}
 	committed = true
 
+	// Query model capability flags once before building the payload.
+	// The backend adapter uses these to inject startup args (e.g. --reasoning off).
+	// This keeps all backend-specific logic inside the adapter — the activator
+	// only passes generic capability flags, never checks backend type itself.
+	var startupCaps runtime.ModelStartupCaps
+	_ = a.db.QueryRowContext(ctx, `
+		SELECT COALESCE(supports_thinking, FALSE), COALESCE(thinking_enabled, FALSE)
+		FROM models WHERE id = $1`, cfg.ModelID,
+	).Scan(&startupCaps.SupportsThinking, &startupCaps.ThinkingEnabled)
+
 	payload := taskmanager.StartModelPayload{
 		RuntimeID:           runtimeID,
 		ModelID:             cfg.ModelID,
@@ -533,7 +547,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		MaxModelLen:         cfg.MaxModelLen,
 		Dtype:               cfg.Dtype,
 		Quantization:        cfg.Quantization,
-		ExtraArgs:           injectReasoningFlag(ctx, a.db, cfg.ModelID, backend, cfg.ExtraArgs),
+		ExtraArgs:           a.registry.BackendForType(backend).PrepareStartupArgs(startupCaps, cfg.ExtraArgs),
 		ExecutionMode:       effectiveMode,
 		WorkloadPolicy:      workloadPolicy,
 		Env:                 map[string]string{},
@@ -1005,7 +1019,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		             '')                                  AS node_id,
 		    COALESCE(me.host,  '')                        AS bind_host,
 		    COALESCE(me.port,  8080)                      AS bind_port,
-		    COALESCE(m.backend_type, 'llamacpp')          AS backend,
+		    COALESCE(m.backend_type, 'openai_compat')     AS backend,
 		    COALESCE(mrc.gguf_path,  '')                  AS gguf_path,
 		    COALESCE(mrc.hf_repo,    '')                  AS hf_repo,
 		    COALESCE(mrc.hf_file,    '')                  AS hf_file,
@@ -1213,9 +1227,17 @@ func (a *RuntimeActivator) deriveState(rt *agentRuntime) State {
 //     otherwise returns "cpu"
 //   - ""     → treated as "auto"
 //
-// Backends that never support GPU (cpu_native): always return "cpu" regardless.
-// Backends that always require GPU (vllm, tgi): return "gpu" (node validation
-// is the operator's responsibility; we don't block here).
+// resolveExecutionMode converts an execution_mode of "auto" into a concrete
+// "cpu" or "gpu" value by querying the node's GPU capability from the DB.
+//
+// Rules:
+//   - "cpu"  → always returns "cpu"
+//   - "gpu"  → always returns "gpu"
+//   - "auto" or "" → returns "gpu" if the node has GPUs, otherwise "cpu"
+//
+// Backend-specific hints (e.g. n_gpu_layers for llamacpp) are intentionally
+// NOT checked here. The RuntimeManager must stay backend-agnostic.
+// If GPUDevices is explicitly set, that is treated as a definitive GPU request.
 func resolveExecutionMode(
 	ctx context.Context,
 	db *sqlx.DB,
@@ -1223,11 +1245,12 @@ func resolveExecutionMode(
 	backend string,
 	requestedMode string,
 	gpuDevices []int,
-	nGPULayers int,
+	_ int, // nGPULayers — reserved for backward compat, no longer consulted
 ) string {
-	// Backends that have no GPU path at all.
-	cpuOnlyBackends := map[string]bool{"cpu_native": true}
-	if cpuOnlyBackends[backend] {
+	// Backends with no GPU path are always CPU.
+	// This is the only backend-awareness allowed here: it is infrastructure
+	// capability (CPU-only runtime), not workload type.
+	if backend == "cpu_native" {
 		return "cpu"
 	}
 
@@ -1238,28 +1261,11 @@ func resolveExecutionMode(
 		return "gpu"
 	}
 
-	// "auto" or "" — resolve from node capability and payload hints.
-
-	// If GPUDevices is explicitly set, the operator already decided GPU.
+	// "auto" or "" — resolve from explicit assignment first, then node capability.
 	if len(gpuDevices) > 0 {
 		return "gpu"
 	}
-	// If NGPULayers is non-zero for llamacpp, that is a GPU request.
-	if backend == "llamacpp" && nGPULayers != 0 {
-		// Check the node actually has a GPU before committing to gpu mode.
-		var gpuAvailable bool
-		_ = db.QueryRowContext(ctx, `
-			SELECT COALESCE(gpu_available, gpu_count > 0, FALSE)
-			FROM node_capabilities
-			WHERE node_id = $1`, nodeID).Scan(&gpuAvailable)
-		if gpuAvailable {
-			return "gpu"
-		}
-		// Node has no GPU — downgrade to CPU despite the caller's preference.
-		return "cpu"
-	}
 
-	// Pure auto with no hints — check node capability.
 	var gpuCount int
 	_ = db.QueryRowContext(ctx, `
 		SELECT COALESCE(gpu_count, 0)
@@ -1298,47 +1304,4 @@ func (a *RuntimeActivator) httpHealthCheck(baseURL string) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
-}
-
-// injectReasoningFlag ensures that llamacpp containers for thinking-capable
-// models with thinking DISABLED always start with "--reasoning off".
-//
-// This is the authoritative mechanism for disabling thinking at the server
-// level. Per-request injection via chat_template_kwargs is unreliable because
-// it depends on the model's Jinja template honouring the flag, whereas
-// --reasoning off is enforced by the llama-server binary itself (b9821+).
-//
-// Logic:
-//   - Only applies to backend == "llamacpp"
-//   - Queries supports_thinking and thinking_enabled from the models table
-//   - If supports_thinking=true AND thinking_enabled=false: prepend "--reasoning off"
-//   - If "--reasoning" is already in extraArgs, leaves it unchanged (operator override)
-//   - All other cases: returns extraArgs unmodified
-func injectReasoningFlag(ctx context.Context, db *sqlx.DB, modelID string, backend string, extraArgs []string) []string {
-	if backend != "llamacpp" {
-		return extraArgs
-	}
-
-	// Check if --reasoning is already explicitly set by the operator.
-	for _, a := range extraArgs {
-		if a == "--reasoning" || a == "-rea" {
-			return extraArgs // operator already controls this — don't override
-		}
-	}
-
-	var supportsThinking, thinkingEnabled bool
-	err := db.QueryRowContext(ctx, `
-		SELECT COALESCE(supports_thinking, FALSE), COALESCE(thinking_enabled, FALSE)
-		FROM models WHERE id = $1`, modelID,
-	).Scan(&supportsThinking, &thinkingEnabled)
-	if err != nil {
-		return extraArgs // table column may not exist — safe default
-	}
-
-	// Model supports thinking but it's disabled by default → enforce at server level.
-	if supportsThinking && !thinkingEnabled {
-		return append([]string{"--reasoning", "off"}, extraArgs...)
-	}
-
-	return extraArgs
 }

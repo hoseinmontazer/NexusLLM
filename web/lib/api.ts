@@ -45,6 +45,8 @@ export interface Model {
   enabled: boolean; endpoint_count: number; healthy_count: number
   lifecycle: string  // active | archived | deleted
   tags?: string
+  // Universal capabilities — what API endpoints this model supports
+  capabilities?: string[]   // e.g. ["chat","completion"] or ["transcription"]
   // Thinking/reasoning mode capability flags
   supports_thinking: boolean
   thinking_enabled: boolean
@@ -155,6 +157,18 @@ export interface DeployModelInput {
   tensor_parallel?: number; gpu_memory_util?: number
   max_model_len?: number; dtype?: string; hf_token?: string
   start_now?: boolean
+  // Universal model type — every workload declares its type
+  // LLM | STT | TTS | OCR | EMBEDDING | RERANK | VISION | IMAGE_GENERATION | CUSTOM
+  service_type?: string
+  // Extra args forwarded verbatim to the container entrypoint.
+  // Used for non-llamacpp backends (faster-whisper, kokoro, surya, etc.)
+  extra_args?: string[]
+  // Environment variables injected into the container
+  env_vars?: Record<string, string>
+  // Volume mounts beyond the default models volume: [{host:"/data", container:"/app/data"}]
+  volume_mounts?: { host: string; container: string }[]
+  // Custom health check path (default: /health)
+  health_path?: string
   // Legacy node agent deployment
   node_id?: string
   auto_place?: boolean

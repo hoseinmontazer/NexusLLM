@@ -92,6 +92,15 @@ func (r *Registry) Reload(ctx context.Context) error {
 	}
 
 	newPools := make(map[string]*Pool, len(rows))
+	newBends := make(map[string]Backend)
+
+	// Pre-populate newBends with existing backends so we don't re-build them.
+	r.mu.RLock()
+	for k, v := range r.bends {
+		newBends[k] = v
+	}
+	r.mu.RUnlock()
+
 	for _, row := range rows {
 		if _, ok := newPools[row.ModelName]; !ok {
 			newPools[row.ModelName] = NewPool(row.ModelID, StrategyRoundRobin)
@@ -111,19 +120,20 @@ func (r *Registry) Reload(ctx context.Context) error {
 
 		// Ensure we have a backend instance for this type.
 		key := string(row.BackendType)
-		if _, ok := r.bends[key]; !ok {
-			b, err := r.factory.Build(row.BackendType)
-			if err != nil {
-				r.log.Warn("unknown backend type, falling back to vllm",
-					zap.String("type", key), zap.Error(err))
-				b = r.factory.MustBuild(BackendVLLM)
+		if _, ok := newBends[key]; !ok {
+			b, buildErr := r.factory.Build(row.BackendType)
+			if buildErr != nil {
+				r.log.Warn("unknown backend type, falling back to openai_compat",
+					zap.String("type", key), zap.Error(buildErr))
+				b = r.factory.MustBuild(BackendOpenAICompat)
 			}
-			r.bends[key] = b
+			newBends[key] = b
 		}
 	}
 
 	r.mu.Lock()
 	r.pools = newPools
+	r.bends = newBends
 	r.mu.Unlock()
 
 	r.log.Info("registry reloaded",
@@ -235,6 +245,29 @@ func (r *Registry) SetPoolStrategy(modelName string, strategy RoutingStrategy) e
 	return nil
 }
 
+// BackendForType returns a Backend instance for the given type string.
+func (r *Registry) BackendForType(backendType string) Backend {
+	r.mu.RLock()
+	b, ok := r.bends[backendType]
+	r.mu.RUnlock()
+	if ok {
+		return b
+	}
+	built, err := r.factory.Build(BackendType(backendType))
+	if err != nil {
+		built = r.factory.MustBuild(BackendOpenAICompat)
+	}
+	r.mu.Lock()
+	// Re-check under write lock to avoid double-write from concurrent callers.
+	if existing, ok := r.bends[backendType]; ok {
+		r.mu.Unlock()
+		return existing
+	}
+	r.bends[backendType] = built
+	r.mu.Unlock()
+	return built
+}
+
 // ListModels returns all model names currently in the registry.
 func (r *Registry) ListModels() []string {
 	r.mu.RLock()
@@ -277,20 +310,16 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		JOIN models m ON m.id = me.model_id
 		WHERE me.is_enabled = TRUE
 		  AND m.enabled = TRUE
-		  -- Only include if no active agent_runtime exists for this model (single-replica case)
-		  -- OR if the runtime row's endpoint_id matches (runtime registered its endpoint)
+		  -- Only include if no active agent_runtime is bound to this specific
+		  -- endpoint (me.id) via endpoint_id, OR if no HA-managed runtimes
+		  -- (endpoint_id IS NULL) are running for this model. This prevents
+		  -- duplicate routing when the agent has taken over the endpoint.
 		  AND (
 		      NOT EXISTS (
 		          SELECT 1 FROM agent_runtimes ar
-		          WHERE ar.model_id = me.model_id
+		          WHERE ar.endpoint_id = me.id
 		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
 		            AND ar.bind_port > 0
-		      )
-		      OR me.id IN (
-		          SELECT ar.endpoint_id FROM agent_runtimes ar
-		          WHERE ar.model_id = me.model_id
-		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
-		            AND ar.endpoint_id IS NOT NULL
 		      )
 		  )
 
@@ -366,11 +395,8 @@ func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
 	if ok {
 		return b, nil
 	}
-	// BackendType not yet registered — build and cache it
 	built, err := r.factory.Build(ep.BackendType)
 	if err != nil {
-		// Unknown backend type — fall back to openai_compat which is the most
-		// permissive (attempts /v1/models for health, accepts any JSON response)
 		r.log.Warn("unknown backend type in endpoint, falling back to openai_compat",
 			zap.String("backend_type", string(ep.BackendType)),
 			zap.String("endpoint_id", ep.ID),
@@ -378,30 +404,12 @@ func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
 		built = r.factory.MustBuild(BackendOpenAICompat)
 	}
 	r.mu.Lock()
+	// Re-check under write lock.
+	if existing, ok := r.bends[string(ep.BackendType)]; ok {
+		r.mu.Unlock()
+		return existing, nil
+	}
 	r.bends[string(ep.BackendType)] = built
 	r.mu.Unlock()
 	return built, nil
-}
-
-func (r *Registry) backendForEndpoint(modelID string) (Backend, error) {
-	// Legacy path used by proxy handler — finds a backend by scanning pools.
-	// The proxy resolves an *Endpoint first, so it should call BackendForEndpoint
-	// directly. This method is kept for the Resolve/ResolveWithFailover path.
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	// Scan all pools to find the endpoint's backend type
-	for _, pool := range r.pools {
-		for _, ep := range pool.Endpoints() {
-			if ep.ModelID == modelID {
-				if b, ok := r.bends[string(ep.BackendType)]; ok {
-					return b, nil
-				}
-			}
-		}
-	}
-	// Fallback: return any registered backend (should not happen after Reload)
-	for _, b := range r.bends {
-		return b, nil
-	}
-	return r.factory.Build(BackendVLLM)
 }

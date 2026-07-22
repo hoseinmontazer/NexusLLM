@@ -256,9 +256,9 @@ func (w *Watcher) persistHealthResult(ctx context.Context, epID string, h Endpoi
 			zap.Error(err),
 		)
 	} else if n, _ := res.RowsAffected(); n == 0 {
-		w.log.Debug("health persist UPDATE matched 0 rows — endpoint may have been removed",
-			zap.String("endpoint_id", epID),
-		)
+		// HA agent_runtime replicas (endpoint_id IS NULL) are not in model_endpoints
+		// so 0 rows affected is normal for them — don't log at debug to avoid spam.
+		_ = n
 	}
 
 	// Append to health log only for model_endpoints rows (not agent_runtimes HA replicas).

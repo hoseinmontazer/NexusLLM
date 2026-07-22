@@ -16,7 +16,6 @@ import (
 	"github.com/nexusllm/nexusllm/internal/auth"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
-	"github.com/nexusllm/nexusllm/internal/lifecycle"
 	"github.com/nexusllm/nexusllm/internal/middleware"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
@@ -104,15 +103,10 @@ func main() {
 	usageTracker := usage.NewTracker(db, rdb, log)
 	teamPolicies := loadTeamPolicies(ctx, db, log)
 
-	// Lifecycle manager — legacy Redis-based idle tracker.
-	// The IdleManager (below) is the canonical idle eviction system for lazy_load
-	// models. This legacy manager had unloader=nil so it never stopped containers —
-	// it only set lifecycle_state='idle' on model_endpoints, which could remove
-	// endpoints from the registry and cause spurious "no_healthy_endpoint" errors.
-	// It is kept as a no-op RecordActivity sink (still called by the proxy) but
-	// its eviction loop is no longer started.
-	lifecycleMgr := lifecycle.NewManager(db, rdb, 30*time.Minute, nil, log)
-	// NOTE: lifecycleMgr.Start() intentionally NOT called — eviction disabled.
+	// Lifecycle manager removed — activity tracking is now owned exclusively by
+	// RuntimeActivator (runtimemgr.Activator.RecordActivity), which writes
+	// last_used_at directly to agent_runtimes. The old Redis-based lifecycle
+	// manager is no longer instantiated. (Phase 1 of architecture cleanup.)
 
 	// ── Runtime Manager (lazy-load architecture) ──────────────────────────────
 	taskMgr := taskmanager.NewManager(db, log)
@@ -155,8 +149,8 @@ func main() {
 	// ── Proxy handler ─────────────────────────────────────────────────────────
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
-		lifecycleMgr, registry, usageTracker, teamPolicies, log,
-	).WithActivator(activator).WithDB(db)
+		registry, usageTracker, teamPolicies, log,
+	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout)
 
 	// ── Policy live reload every 60s ──────────────────────────────────────────
 	// Uses a sync.RWMutex-protected wrapper to avoid data races between the

@@ -190,13 +190,12 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type,
-		   max_context, max_output, enabled, tags, vllm_endpoint,
+		   max_context, max_output, enabled, tags,
 		   supports_thinking, thinking_enabled, min_thinking_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9,$10,$11,$12)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9,$10,$11)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
-		fmt.Sprintf("http://%s:%d", bindHost, input.Port),
 		input.SupportsThinking, input.ThinkingEnabled, minThinkTok,
 	)
 	if err != nil {
@@ -204,12 +203,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		_, err = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO models
 			  (id, name, display_name, provider, backend_type,
-			   max_context, max_output, enabled, tags, vllm_endpoint)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)`,
+			   max_context, max_output, enabled, tags)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8)`,
 			mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
 			input.MaxContext, input.MaxOutput,
 			tagsJSON(input.Tags),
-			fmt.Sprintf("http://%s:%d", bindHost, input.Port),
 		)
 		if err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -482,13 +480,13 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			Quantization:    input.Quantization,
 			ExtraArgs:       input.ExtraArgs,
 			Env:             env,
-			// llamacpp fields
-			LlamaCppModelPath:    input.LlamaCppModelPath,
-			LlamaCppHFRepo:       input.LlamaCppHFRepo,
-			LlamaCppHFFile:       input.LlamaCppHFFile,
-			LlamaCppCtxSize:      input.LlamaCppCtxSize,
-			LlamaCppNGPULayers:   input.LlamaCppNGPULayers,
-			LlamaCppModelsVolume: input.LlamaCppModelsVolume,
+			// Generic model source fields (formerly LlamaCpp-prefixed)
+			GGUFPath:     input.LlamaCppModelPath,
+			HFRepo:       input.LlamaCppHFRepo,
+			HFFile:       input.LlamaCppHFFile,
+			CtxSize:      input.LlamaCppCtxSize,
+			NGPULayers:   input.LlamaCppNGPULayers,
+			ModelsVolume: input.LlamaCppModelsVolume,
 		}
 
 		containerID, err = h.ctrl.StartRaw(c.Request.Context(), epID, mID, spec, "admin")
@@ -578,12 +576,11 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type,
-		   max_context, max_output, enabled, tags, vllm_endpoint)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)`,
+		   max_context, max_output, enabled, tags)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
-		fmt.Sprintf("http://%s:%d", input.Host, input.Port),
 	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -867,14 +864,11 @@ func tagsJSON(tags []string) string {
 	if len(tags) == 0 {
 		return "[]"
 	}
-	b := `[`
-	for i, t := range tags {
-		if i > 0 {
-			b += ","
-		}
-		b += `"` + t + `"`
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return "[]"
 	}
-	return b + `]`
+	return string(b)
 }
 
 func orDefault(s, def string) string {
@@ -1069,10 +1063,9 @@ func (h *RuntimeHandler) ImportOllamaModels(c *gin.Context) {
 		_, err = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO models
 			  (id, name, display_name, provider, backend_type, service_type,
-			   max_context, max_output, enabled, tags, vllm_endpoint)
-			VALUES ($1,$2,$3,'local','ollama','CHAT',8192,4096,TRUE,'[]',$4)`,
+			   max_context, max_output, enabled, tags)
+			VALUES ($1,$2,$3,'local','ollama','CHAT',8192,4096,TRUE,'[]')`,
 			mID, m.Name, m.Name,
-			fmt.Sprintf("http://%s:%d", input.Host, input.Port),
 		)
 		if err != nil {
 			results = append(results, result{Name: m.Name, Status: "error: " + err.Error()})

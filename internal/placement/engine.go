@@ -1,3 +1,13 @@
+// Package placement implements the resource-aware placement engine.
+//
+// DEPRECATED: New code should use internal/scheduler.Scheduler for all
+// placement decisions. This engine remains active only for:
+//   - RuntimeHandler.auto_place (POST /admin/v1/models/deploy)
+//   - PlacementHandler.Simulate (/admin/v1/placement/simulate)
+//
+// It will be removed once those callers migrate to Scheduler.
+// The Scheduler is preferred: it supports node groups, label selectors,
+// spread/pack strategies, deployment queuing, and richer scoring.
 package placement
 
 import (
@@ -31,12 +41,12 @@ func NewEngine(db *sqlx.DB, log *zap.Logger) *Engine {
 // ─── database projections ─────────────────────────────────────────────────────
 
 type dbNode struct {
-	ID           string `db:"id"`
-	Hostname     string `db:"hostname"`
-	Status       string `db:"status"`
-	TotalCPU     int    `db:"total_cpu"`
-	TotalRAMMB   int64  `db:"total_ram_mb"`
-	TotalVRAMMB  int64  `db:"total_vram_mb"`
+	ID          string `db:"id"`
+	Hostname    string `db:"hostname"`
+	Status      string `db:"status"`
+	TotalCPU    int    `db:"total_cpu"`
+	TotalRAMMB  int64  `db:"total_ram_mb"`
+	TotalVRAMMB int64  `db:"total_vram_mb"`
 }
 
 type dbGPU struct {
@@ -53,9 +63,9 @@ type dbGPU struct {
 }
 
 type cpuUsage struct {
-	NodeID      string `db:"node_id"`
-	AllocCPU    int    `db:"alloc_cpu"`
-	AllocRAMMB  int64  `db:"alloc_ram_mb"`
+	NodeID     string `db:"node_id"`
+	AllocCPU   int    `db:"alloc_cpu"`
+	AllocRAMMB int64  `db:"alloc_ram_mb"`
 }
 
 // ─── Decide ──────────────────────────────────────────────────────────────────
@@ -305,13 +315,13 @@ func (e *Engine) decideCPU(ctx context.Context, req Request) (*Decision, error) 
 	}
 
 	dec := &Decision{
-		NodeID:    best.node.ID,
-		NodeHost:  best.node.Hostname,
-		CPUCores:  neededCPU,
-		NUMANode:  numaNode,
+		NodeID:     best.node.ID,
+		NodeHost:   best.node.Hostname,
+		CPUCores:   neededCPU,
+		NUMANode:   numaNode,
 		RAMMBLimit: neededRAM,
-		Strategy:  "cpu_score",
-		Score:     best.score,
+		Strategy:   "cpu_score",
+		Score:      best.score,
 		Reason: fmt.Sprintf("node=%s free_cpu=%d numa=%d",
 			best.node.Hostname,
 			best.node.TotalCPU-usageMap[best.node.ID].AllocCPU,

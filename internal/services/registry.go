@@ -9,6 +9,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,6 +35,12 @@ const (
 	TypeOCR       ServiceType = "OCR"
 	TypeAgent     ServiceType = "AGENT"
 	TypeMCP       ServiceType = "MCP"
+	// Extended types — added in migration 033
+	TypeVision          ServiceType = "VISION"
+	TypeImageGeneration ServiceType = "IMAGE_GENERATION"
+	TypeModeration      ServiceType = "MODERATION"
+	TypeTranslation     ServiceType = "TRANSLATION"
+	TypeCustom          ServiceType = "CUSTOM"
 )
 
 // RuntimeType mirrors placement.RuntimeType.
@@ -142,13 +149,12 @@ func (r *Registry) Register(ctx context.Context, req RegisterRequest) (modelID, 
 	_, err = r.db.ExecContext(ctx, `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type, service_type, runtime_type,
-		   max_context, max_output, enabled, tags, vllm_endpoint)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11)`,
+		   max_context, max_output, enabled, tags)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)`,
 		mID, req.Name, req.DisplayName, req.Provider, req.BackendType,
 		req.ServiceType, req.RuntimeType,
 		req.MaxContext, req.MaxOutput,
 		tagsJSON(req.Tags),
-		fmt.Sprintf("http://%s:%d", host, req.Port),
 	)
 	if err != nil {
 		return "", "", fmt.Errorf("register service: model insert: %w", err)
@@ -339,14 +345,18 @@ func defaultBackend(serviceType, runtimeType string) string {
 }
 
 // defaultRuntime returns the most appropriate runtime_type for a service type.
+// Returns GPU_RUNTIME only when the workload is known to require GPU by default.
+// Operators can always override by setting runtime_type explicitly.
 func defaultRuntime(serviceType string) string {
 	switch serviceType {
-	case TypeChat:
+	case TypeChat, TypeVision, TypeImageGeneration:
+		// These can run on either GPU or CPU depending on the model.
+		// GPU_RUNTIME is the default since most production deployments use GPU,
+		// but the placement engine will downgrade to CPU when no GPU is available.
 		return RuntimeGPU
-	case TypeEmbedding, TypeRerank, TypeSTT, TypeTTS, TypeOCR, TypeAgent, TypeMCP:
-		return RuntimeCPU
 	default:
-		return RuntimeGPU
+		// Embeddings, STT, TTS, OCR, Rerank, Agent, MCP, Custom — CPU by default.
+		return RuntimeCPU
 	}
 }
 
@@ -354,14 +364,11 @@ func tagsJSON(tags []string) string {
 	if len(tags) == 0 {
 		return "[]"
 	}
-	b := "["
-	for i, t := range tags {
-		if i > 0 {
-			b += ","
-		}
-		b += `"` + t + `"`
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return "[]"
 	}
-	return b + "]"
+	return string(b)
 }
 
 // weightToLegacyPriority converts a numeric priority_weight [0–1000] to the

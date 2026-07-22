@@ -22,7 +22,6 @@ import (
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
-	"github.com/nexusllm/nexusllm/internal/lifecycle"
 	"github.com/nexusllm/nexusllm/internal/middleware"
 	"github.com/nexusllm/nexusllm/internal/models"
 	"github.com/nexusllm/nexusllm/internal/policy"
@@ -42,7 +41,6 @@ type Handler struct {
 	gwPolicy      *gatewaypolicy.Engine
 	promptPolicy  *promptpolicy.Engine
 	aliasResolver *alias.Resolver
-	lifecycleMgr  *lifecycle.Manager
 	registry      *runtime.Registry
 	activator     runtimemgr.Activator
 	usageTracker  *usage.Tracker
@@ -52,6 +50,7 @@ type Handler struct {
 	httpClient    *http.Client
 	db            *sqlx.DB
 	thinkingRes   *thinking.Resolver
+	coldStartDur  time.Duration // 0 = use default (20 min)
 }
 
 // NewHandler constructs the proxy Handler.
@@ -60,7 +59,6 @@ func NewHandler(
 	gwp *gatewaypolicy.Engine,
 	pp *promptpolicy.Engine,
 	ar *alias.Resolver,
-	lm *lifecycle.Manager,
 	registry *runtime.Registry,
 	tracker *usage.Tracker,
 	teamPolicies map[string]*policy.TeamPolicy,
@@ -71,7 +69,6 @@ func NewHandler(
 		gwPolicy:      gwp,
 		promptPolicy:  pp,
 		aliasResolver: ar,
-		lifecycleMgr:  lm,
 		registry:      registry,
 		usageTracker:  tracker,
 		log:           log,
@@ -95,6 +92,13 @@ func NewHandler(
 // When set, a registry miss triggers EnsureRunning() instead of 503.
 func (h *Handler) WithActivator(a runtimemgr.Activator) *Handler {
 	h.activator = a
+	return h
+}
+
+// WithColdStartTimeout overrides the default 20-minute cold-start timeout.
+// Should be set to match the RuntimeManager's configured ColdStartTimeout.
+func (h *Handler) WithColdStartTimeout(d time.Duration) *Handler {
+	h.coldStartDur = d
 	return h
 }
 
@@ -327,7 +331,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, req.Model).Inc()
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	// Pre-inference activity: resets idle clock at request start.
-	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
 	if h.activator != nil {
 		h.activator.RecordActivity(c.Request.Context(), ep.ID)
 	}
@@ -460,11 +463,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 // Embeddings handles POST /v1/embeddings
 func (h *Handler) Embeddings(c *gin.Context) {
-	claims := middleware.GetClaims(c)
-	if claims == nil {
-		abortErr(c, http.StatusUnauthorized, "unauthorized", "Missing authentication")
-		return
-	}
 	var req models.EmbeddingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		abortErr(c, http.StatusBadRequest, "invalid_request", err.Error())
@@ -475,37 +473,28 @@ func (h *Handler) Embeddings(c *gin.Context) {
 		return
 	}
 
-	realModel, _ := h.aliasResolver.Resolve(c.Request.Context(), req.Model, claims.TeamID, claims.OrgID)
-	req.Model = realModel
-	c.Set("model", req.Model)
-
-	tp := h.teamPolicy(claims.TeamID)
-	decision := h.policy.Evaluate(c.Request.Context(), &policy.InferenceRequest{
-		Model:     req.Model,
-		OrgID:     claims.OrgID,
-		TeamID:    claims.TeamID,
-		ProjectID: claims.ProjectID,
-	}, func() int {
-		if claims.ProjectPriorityWeight > 0 {
-			return claims.ProjectPriorityWeight
-		}
-		return 500
-	}(), tp)
-	if !decision.Allowed {
-		middleware.RecordRejection(claims.TeamID, claims.ProjectID, decision.RejectReason)
-		abortErr(c, http.StatusForbidden, decision.RejectReason, "Request rejected by policy engine")
+	// Run the full shared pipeline — identical to ChatCompletions.
+	res, ok := h.pipelineSetup(c, req.Model, 0)
+	if !ok {
 		return
 	}
+	defer h.decrementInflight(context.Background(), res.teamID, res.projectID, res.realModel)
+	req.Model = res.realModel
 
-	ep, backend, err := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
-	if err != nil {
-		abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint", err.Error())
+	ep := res.ep
+	backend, berr := h.registry.BackendForEndpoint(ep)
+	if berr != nil {
+		h.decrementInflight(context.Background(), res.teamID, res.projectID, res.realModel)
+		abortErr(c, http.StatusInternalServerError, "backend_error", berr.Error())
 		return
 	}
 
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	defer atomic.AddInt64(&ep.ActiveConns, -1)
-	h.lifecycleMgr.RecordActivity(c.Request.Context(), ep.ID)
+	if h.activator != nil {
+		h.activator.RecordActivity(c.Request.Context(), ep.ID)
+		defer h.activator.RecordActivity(context.Background(), ep.ID)
+	}
 
 	start := time.Now()
 	resp, err := backend.Embeddings(c.Request.Context(), runtime.EmbedRequest{Req: &req, EndpointURL: ep.URL})
@@ -515,14 +504,14 @@ func (h *Handler) Embeddings(c *gin.Context) {
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
-	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID, resp.Usage.TotalTokens, 0)
-	_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID, resp.Usage.TotalTokens, 0)
-	if claims.ProjectID == "" {
-		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID, resp.Usage.TotalTokens, 0)
+	_ = h.policy.RecordProjectTokenUsage(context.Background(), res.projectID, resp.Usage.TotalTokens, 0)
+	_ = h.policy.RecordOrgTokenUsage(context.Background(), res.orgID, resp.Usage.TotalTokens, 0)
+	if res.projectID == "" {
+		_ = h.policy.RecordTokenUsage(context.Background(), res.teamID, resp.Usage.TotalTokens, 0)
 	}
-	middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model, resp.Usage.TotalTokens, 0)
+	middleware.RecordTokens(res.teamID, res.projectID, res.realModel, resp.Usage.TotalTokens, 0)
 	h.usageTracker.Record(context.Background(), usage.Event{
-		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
+		OrgID: res.orgID, TeamID: res.teamID, ModelName: res.realModel,
 		EndpointID: ep.ID, PromptTokens: resp.Usage.TotalTokens,
 		LatencyMs: latencyMs, Status: "success",
 	})
@@ -834,6 +823,9 @@ func (h *Handler) streamChat(
 			}
 			resp.Stream.Close()
 			bodyBytes = []byte(strings.TrimSpace(buf.String()))
+		} else if len(resp.Body) > 0 {
+			// Non-streaming error response — body already buffered.
+			bodyBytes = resp.Body
 		}
 		if len(bodyBytes) == 0 {
 			// Log at warn so operators can see what the backend actually sent.
@@ -1017,6 +1009,13 @@ func (h *Handler) streamChat(
 // isConnectError returns true for connection-refused and similar network errors
 // that indicate the upstream server is not reachable (as opposed to returning
 // an HTTP error code). These errors are safe to retry on a different endpoint.
+//
+// Explicitly excluded:
+//   - "context deadline exceeded" / "context canceled" — these are client-side
+//     timeouts, not server failures. The endpoint may be healthy; marking it
+//     down would cause spurious failovers.
+//   - "EOF" — can indicate a mid-response disconnect, but treating it as a
+//     connect failure would mark a healthy endpoint down prematurely.
 func isConnectError(err error) bool {
 	if err == nil {
 		return false
@@ -1026,9 +1025,7 @@ func isConnectError(err error) bool {
 		strings.Contains(msg, "no route to host") ||
 		strings.Contains(msg, "connect: connection refused") ||
 		strings.Contains(msg, "dial tcp") ||
-		strings.Contains(msg, "EOF") ||
-		strings.Contains(msg, "i/o timeout") ||
-		strings.Contains(msg, "context deadline exceeded")
+		strings.Contains(msg, "i/o timeout")
 }
 
 // SwapTeamPolicies atomically replaces the in-memory team policy map.
@@ -1099,8 +1096,10 @@ func normalizeToolCallArguments(resp *models.ChatCompletionResponse) {
 }
 
 func (h *Handler) coldStartTimeout() time.Duration {
+	if h.coldStartDur > 0 {
+		return h.coldStartDur
+	}
 	// Default to 20 minutes — large models (235B) take 10-15 min to load.
-	// Can be overridden via NEXUS_RUNTIMEMGR_COLDSTARTTIMEOUT env var.
 	return 20 * time.Minute
 }
 

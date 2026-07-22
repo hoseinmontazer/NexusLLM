@@ -36,6 +36,11 @@ func NewVLLMBackend(client *http.Client) Backend {
 
 func (b *vllmBackend) Type() BackendType { return BackendVLLM }
 
+// PrepareStartupArgs — vLLM has no server-level reasoning flag; args unchanged.
+func (b *vllmBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
+	return extraArgs
+}
+
 // Health polls /health (liveness) and /metrics (capacity) to produce a
 // complete EndpointHealth snapshot.
 func (b *vllmBackend) Health(ctx context.Context, url string) EndpointHealth {

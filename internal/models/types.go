@@ -468,6 +468,7 @@ type OCRPage struct {
 
 // ServiceType constants mirror those in the placement and services packages.
 // Reproduced here to keep models/ free of cross-package dependencies.
+// Canonical source of truth: internal/services/registry.go
 const (
 	ServiceTypeChat      = "CHAT"
 	ServiceTypeEmbedding = "EMBEDDING"
@@ -477,4 +478,10 @@ const (
 	ServiceTypeOCR       = "OCR"
 	ServiceTypeAgent     = "AGENT"
 	ServiceTypeMCP       = "MCP"
+	// Extended types (migration 033)
+	ServiceTypeVision          = "VISION"
+	ServiceTypeImageGeneration = "IMAGE_GENERATION"
+	ServiceTypeModeration      = "MODERATION"
+	ServiceTypeTranslation     = "TRANSLATION"
+	ServiceTypeCustom          = "CUSTOM"
 )

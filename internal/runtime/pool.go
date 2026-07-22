@@ -22,12 +22,12 @@ const (
 type Endpoint struct {
 	ID          string
 	ModelID     string
-	BackendType BackendType     // used by watcher to pick the right health-check method
-	URL         string          // http://host:port (base URL, no path)
-	Weight      int             // used by weighted strategy (0 = excluded)
-	Priority    int             // 1 = primary, 2+ = standby (active/passive)
+	BackendType BackendType // used by watcher to pick the right health-check method
+	URL         string      // http://host:port (base URL, no path)
+	Weight      int         // used by weighted strategy (0 = excluded)
+	Priority    int         // 1 = primary, 2+ = standby (active/passive)
 	Status      HealthStatus
-	ActiveConns int64           // atomic; incremented on dispatch, decremented on finish
+	ActiveConns int64 // atomic; incremented on dispatch, decremented on finish
 	LastSuccess time.Time
 	mu          sync.RWMutex
 }
@@ -52,9 +52,9 @@ func (e *Endpoint) SetStatus(s HealthStatus) {
 // Pool is a collection of Endpoints for a single model.
 // It is safe for concurrent use.
 type Pool struct {
-	ModelID  string
-	Strategy RoutingStrategy
-	mu       sync.RWMutex
+	ModelID   string
+	Strategy  RoutingStrategy
+	mu        sync.RWMutex
 	endpoints []*Endpoint
 	rrIdx     atomic.Int64 // round-robin cursor
 }
@@ -130,11 +130,16 @@ func (p *Pool) HealthyCount() int {
 
 func (p *Pool) roundRobin() (*Endpoint, error) {
 	avail := p.available()
-	if len(avail) == 0 {
+	n := int64(len(avail))
+	if n == 0 {
 		return nil, fmt.Errorf("model %s: no healthy endpoints", p.ModelID)
 	}
 	idx := p.rrIdx.Add(1) - 1
-	return avail[idx%int64(len(avail))], nil
+	// Guard against int64 overflow wrap-around producing a negative index.
+	if idx < 0 {
+		idx = -idx
+	}
+	return avail[idx%n], nil
 }
 
 func (p *Pool) weighted() (*Endpoint, error) {
@@ -183,9 +188,11 @@ func (p *Pool) leastConn() (*Endpoint, error) {
 		return nil, fmt.Errorf("model %s: no healthy endpoints", p.ModelID)
 	}
 	best := avail[0]
+	bestConns := atomic.LoadInt64(&best.ActiveConns)
 	for _, ep := range avail[1:] {
-		if atomic.LoadInt64(&ep.ActiveConns) < atomic.LoadInt64(&best.ActiveConns) {
+		if c := atomic.LoadInt64(&ep.ActiveConns); c < bestConns {
 			best = ep
+			bestConns = c
 		}
 	}
 	return best, nil

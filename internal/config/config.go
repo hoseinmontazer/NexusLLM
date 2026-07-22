@@ -120,7 +120,7 @@ func Load() (*Config, error) {
 
 	v.SetDefault("runtimemgr.idletimeout", "15m")
 	v.SetDefault("runtimemgr.coldstarttimeout", "20m")
-	v.SetDefault("runtimemgr.modelsvolume", "llamacpp_models")
+	v.SetDefault("runtimemgr.modelsvolume", "nexus_models")
 	v.SetDefault("runtimemgr.defaultimage", "ghcr.io/ggml-org/llama.cpp:server")
 
 	// --- env ---

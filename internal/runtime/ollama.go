@@ -31,6 +31,11 @@ func NewOllamaBackend(client *http.Client) Backend {
 
 func (b *ollamaBackend) Type() BackendType { return BackendOllama }
 
+// PrepareStartupArgs — Ollama has no server-level reasoning flag; args unchanged.
+func (b *ollamaBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
+	return extraArgs
+}
+
 // Health checks GET / (Ollama returns "Ollama is running").
 func (b *ollamaBackend) Health(ctx context.Context, url string) EndpointHealth {
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}

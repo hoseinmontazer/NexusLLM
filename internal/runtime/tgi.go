@@ -30,6 +30,11 @@ func NewTGIBackend(client *http.Client) Backend {
 
 func (b *tgiBackend) Type() BackendType { return BackendTGI }
 
+// PrepareStartupArgs — TGI has no server-level reasoning flag; args unchanged.
+func (b *tgiBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
+	return extraArgs
+}
+
 func (b *tgiBackend) Health(ctx context.Context, url string) EndpointHealth {
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()

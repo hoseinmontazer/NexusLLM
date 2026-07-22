@@ -239,15 +239,15 @@ func (a *Agent) register(ctx context.Context) (nodeID, token string, err error) 
 	}
 
 	capabilities := map[string]interface{}{
+		// Infrastructure capabilities — the only things a node should report.
+		// AI workload types (whisper, tts, embedding, etc.) belong to deployed
+		// models, not nodes. Nodes report hardware and runtime support only.
 		"docker":    a.hasDocker(),
-		"vllm":      false, // will be confirmed by successful task
 		"ollama":    a.hasOllama(),
-		"tgi":       false,
-		"whisper":   false,
-		"tts":       false,
-		"embedding": false,
 		"gpu":       len(gpus) > 0,
 		"gpu_count": len(gpus),
+		// Supported backend types are reported via node_capabilities.supported_backends
+		// (written by the agent's inventory push), not here in the registration payload.
 	}
 
 	body := map[string]interface{}{

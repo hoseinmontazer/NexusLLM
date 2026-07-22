@@ -221,7 +221,7 @@ func DefaultConfig() Config {
 		HealthPollInterval:  3 * time.Second,
 		EvictCheckInterval:  30 * time.Second,
 		MaxRetries:          2,
-		DefaultModelsVolume: "llamacpp_models",
+		DefaultModelsVolume: "nexus_models", // generic name; override via NEXUS_RUNTIMEMGR_MODELSVOLUME
 		DefaultImage:        "ghcr.io/ggml-org/llama.cpp:server",
 	}
 }

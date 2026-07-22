@@ -1,3 +1,16 @@
+// Package scheduler — gpu_watcher.go
+//
+// DEPRECATED: GPUWatcher is vLLM-specific and polls vLLM Prometheus metric
+// names directly. It violates the workload-agnostic architecture.
+//
+// Pool capacity signalling is now handled generically by:
+//   - runtime.Watcher (health checks all backends, marks StatusDegraded on GPU saturation)
+//   - policy.Engine.SetPoolCapacity (redis key nexus:pool:<model>:at_capacity)
+//
+// GPUWatcher is retained for backward compatibility with the standalone
+// nexus-scheduler binary (cmd/scheduler/main.go). It should be removed once
+// that binary is deprecated and pool capacity is driven exclusively by the
+// runtime.Watcher path. Do not add new vLLM-specific logic here.
 package scheduler
 
 import (
@@ -203,13 +216,13 @@ func parsePrometheusText(text string) vLLMMetrics {
 			continue
 		}
 		if strings.HasPrefix(line, "vllm:num_requests_running") {
-			fmt.Sscanf(extractValue(line), "%d", &m.RunningRequests)
+			_, _ = fmt.Sscanf(extractValue(line), "%d", &m.RunningRequests)
 		}
 		if strings.HasPrefix(line, "vllm:num_requests_waiting") {
-			fmt.Sscanf(extractValue(line), "%d", &m.WaitingRequests)
+			_, _ = fmt.Sscanf(extractValue(line), "%d", &m.WaitingRequests)
 		}
 		if strings.HasPrefix(line, "vllm:gpu_cache_usage_perc") {
-			fmt.Sscanf(extractValue(line), "%f", &m.GPUCacheUsage)
+			_, _ = fmt.Sscanf(extractValue(line), "%f", &m.GPUCacheUsage)
 		}
 	}
 	return m

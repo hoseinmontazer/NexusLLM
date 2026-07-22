@@ -19,9 +19,9 @@ import (
 type BackendType string
 
 const (
-	BackendVLLM        BackendType = "vllm"
-	BackendOllama      BackendType = "ollama"
-	BackendTGI         BackendType = "tgi"
+	BackendVLLM         BackendType = "vllm"
+	BackendOllama       BackendType = "ollama"
+	BackendTGI          BackendType = "tgi"
 	BackendOpenAICompat BackendType = "openai_compat"
 )
 
@@ -34,8 +34,8 @@ type EndpointHealth struct {
 	Error        string
 	CheckedAt    time.Time
 	ActiveReqs   int
-	RunningReqs  int  // vLLM-specific
-	WaitingReqs  int  // vLLM-specific
+	RunningReqs  int // vLLM-specific
+	WaitingReqs  int // vLLM-specific
 	GPUCacheUtil float64
 }
 
@@ -61,7 +61,7 @@ type BackendModel struct {
 // ChatRequest is the canonical request passed to a backend's Chat method.
 // It carries the original InferenceRequest plus routing metadata.
 type ChatRequest struct {
-	Req        *models.InferenceRequest
+	Req         *models.InferenceRequest
 	EndpointURL string
 }
 
@@ -77,6 +77,12 @@ type EmbedRequest struct {
 
 // Backend is the abstraction over a model runtime.
 // All methods are context-aware so callers can set deadlines and cancel.
+//
+// Design: every model type (LLM, STT, TTS, OCR, Embedding, Rerank, Vision,
+// ImageGen, ...) uses the same Backend interface. Type-specific endpoints
+// (Transcriptions, Speech, OCR, etc.) call ForwardRaw() which proxies the
+// request verbatim to the backend at the given path. Only Chat and Embeddings
+// have typed methods because they require request/response transformation.
 type Backend interface {
 	// Type returns the backend type identifier.
 	Type() BackendType
@@ -96,6 +102,80 @@ type Backend interface {
 
 	// Embeddings sends an embeddings request and returns the parsed response.
 	Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error)
+
+	// PrepareStartupArgs allows a backend adapter to inject or modify the
+	// extra_args that are sent in a START_MODEL task payload.
+	//
+	// The RuntimeManager calls this once per startup event, passing the
+	// current extra_args and the model's capability flags. The adapter may
+	// prepend, append, or leave the args unchanged based purely on its own
+	// knowledge — no backend-specific logic belongs in the caller.
+	//
+	// caps holds model-level flags declared in the models table. Adapters
+	// that have no startup customisation should return extraArgs unchanged.
+	PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string
+}
+
+// ModelStartupCaps carries model-level capability flags that backend adapters
+// may consult in PrepareStartupArgs. This is the only context the adapter
+// receives about the model — it must not receive workload-type strings.
+type ModelStartupCaps struct {
+	// SupportsThinking indicates the model has an internal reasoning chain
+	// (e.g. Qwen3-thinking, DeepSeek-R1). Backend adapters that have a
+	// server-level flag to disable reasoning should check this.
+	SupportsThinking bool
+	// ThinkingEnabled is the operator-configured deployment default.
+	// When SupportsThinking=true and ThinkingEnabled=false, the adapter
+	// should emit whatever flag disables reasoning at the server level.
+	ThinkingEnabled bool
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capability identifiers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Capability is an API endpoint that a model supports.
+// These match the values stored in models.capabilities JSONB column.
+type Capability string
+
+const (
+	CapabilityChat            Capability = "chat"
+	CapabilityCompletion      Capability = "completion"
+	CapabilityEmbedding       Capability = "embedding"
+	CapabilityRerank          Capability = "rerank"
+	CapabilityTranscription   Capability = "transcription"
+	CapabilitySpeech          Capability = "speech"
+	CapabilityOCR             Capability = "ocr"
+	CapabilityVision          Capability = "vision"
+	CapabilityImageGeneration Capability = "image_generation"
+	CapabilityModeration      Capability = "moderation"
+)
+
+// DefaultCapabilities returns the capabilities implied by a service_type.
+// Used to seed the capabilities column and for fallback validation.
+func DefaultCapabilities(serviceType string) []Capability {
+	switch serviceType {
+	case "CHAT":
+		return []Capability{CapabilityChat, CapabilityCompletion}
+	case "EMBEDDING":
+		return []Capability{CapabilityEmbedding}
+	case "RERANK":
+		return []Capability{CapabilityRerank}
+	case "STT":
+		return []Capability{CapabilityTranscription}
+	case "TTS":
+		return []Capability{CapabilitySpeech}
+	case "OCR":
+		return []Capability{CapabilityOCR}
+	case "VISION":
+		return []Capability{CapabilityChat, CapabilityVision}
+	case "IMAGE_GENERATION":
+		return []Capability{CapabilityImageGeneration}
+	case "AGENT", "MCP":
+		return []Capability{CapabilityChat, CapabilityCompletion}
+	default:
+		return []Capability{}
+	}
 }
 
 // BackendResponse wraps the raw HTTP response so callers can proxy it directly.

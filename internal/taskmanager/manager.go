@@ -171,36 +171,11 @@ type StartModelPayload struct {
 	StaleContainerNames []string `json:"stale_container_names,omitempty"`
 }
 
-// DeployRuntimePayload is an alias kept for backward compatibility with any
-// in-flight DEPLOY_RUNTIME tasks already in the queue.  New code must use
-// StartModelPayload with TaskStartModel exclusively.
-//
-// Deprecated: use StartModelPayload.
-type DeployRuntimePayload = StartModelPayload
-
 // StopRuntimePayload is the payload for STOP_RUNTIME.
 type StopRuntimePayload struct {
 	RuntimeID   string `json:"runtime_id"`
 	ContainerID string `json:"container_id"`
 	DrainSecs   int    `json:"drain_secs"` // graceful drain window
-}
-
-// WarmRuntimePayload is deprecated. Use StartModelPayload with TaskStartModel.
-// Kept for backward compatibility with in-flight tasks only.
-//
-// Deprecated: use StartModelPayload.
-type WarmRuntimePayload struct {
-	RuntimeID   string `json:"runtime_id"`
-	ContainerID string `json:"container_id"`
-}
-
-// RestartRuntimePayload is deprecated. Use StartModelPayload with TaskStartModel.
-// Kept for backward compatibility with in-flight tasks only.
-//
-// Deprecated: use StartModelPayload.
-type RestartRuntimePayload struct {
-	RuntimeID   string `json:"runtime_id"`
-	ContainerID string `json:"container_id"`
 }
 
 // DeleteRuntimePayload for DELETE_RUNTIME.

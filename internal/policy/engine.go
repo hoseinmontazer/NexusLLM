@@ -344,19 +344,24 @@ func (e *Engine) IncrementProjectInflight(ctx context.Context, projectID string)
 }
 
 // DecrementProjectInflight atomically decrements the project-level in-flight counter.
+// The counter is clamped to 0 to guard against counter drift from missed decrements
+// (e.g. client disconnect before the defer fires).
 func (e *Engine) DecrementProjectInflight(ctx context.Context, projectID string) error {
 	if projectID == "" {
 		return nil
 	}
 	key := projectPrefix + projectID + ":inflight"
-	val, err := e.rdb.Decr(ctx, key).Result()
-	if err != nil {
-		return err
-	}
-	if val < 0 {
-		e.rdb.Set(ctx, key, 0, 10*time.Minute)
-	}
-	return nil
+	// Decrement and clamp atomically so a concurrent Increment doesn't get
+	// clobbered by a subsequent Set(0).
+	clampScript := redis.NewScript(`
+		local v = redis.call('DECR', KEYS[1])
+		if v < 0 then
+			redis.call('SET', KEYS[1], 0, 'KEEPTTL')
+		end
+		return v
+	`)
+	_, err := clampScript.Run(ctx, e.rdb, []string{key}).Int64()
+	return err
 }
 
 // IncrementInflight increments the legacy team-level in-flight counter.
@@ -373,14 +378,15 @@ func (e *Engine) IncrementInflight(ctx context.Context, teamID string) error {
 // DecrementInflight decrements the legacy team-level in-flight counter.
 func (e *Engine) DecrementInflight(ctx context.Context, teamID string) error {
 	key := inflightPrefix + teamID
-	val, err := e.rdb.Decr(ctx, key).Result()
-	if err != nil {
-		return err
-	}
-	if val < 0 {
-		e.rdb.Set(ctx, key, 0, 10*time.Minute)
-	}
-	return nil
+	clampScript := redis.NewScript(`
+		local v = redis.call('DECR', KEYS[1])
+		if v < 0 then
+			redis.call('SET', KEYS[1], 0, 'KEEPTTL')
+		end
+		return v
+	`)
+	_, err := clampScript.Run(ctx, e.rdb, []string{key}).Int64()
+	return err
 }
 
 // ─── Token usage recording ────────────────────────────────────────────────────

@@ -31,10 +31,10 @@ type EndpointRecord struct {
 	Quantization   string  `db:"quantization"`
 	RuntimeImage   string  `db:"runtime_image"`
 	// Placement fields (populated from migration 005 columns)
-	RuntimeType    string  `db:"runtime_type"`
-	CPUThreads     int     `db:"cpu_threads"`
-	NUMANode       int     `db:"numa_node"`
-	MemoryLimit    string  `db:"memory_limit"`
+	RuntimeType string `db:"runtime_type"`
+	CPUThreads  int    `db:"cpu_threads"`
+	NUMANode    int    `db:"numa_node"`
+	MemoryLimit string `db:"memory_limit"`
 }
 
 // ModelController manages runtime lifecycle operations.
@@ -271,7 +271,7 @@ func (c *ModelController) loadEndpoint(ctx context.Context, endpointID string) (
 			COALESCE(me.lifecycle_state,'registered') AS lifecycle_state,
 			COALESCE(mrc.tensor_parallel, 1)      AS tensor_parallel,
 			COALESCE(mrc.gpu_memory_util, 0.9)    AS gpu_memory_util,
-			COALESCE(mrc.max_batch_size, 256)     AS max_model_len,
+			COALESCE(mrc.max_model_len, 0)       AS max_model_len,
 			COALESCE(mrc.dtype, 'auto')           AS dtype,
 			COALESCE(mrc.quantization, '')        AS quantization,
 			COALESCE(me.runtime_image, 'vllm/vllm-openai:latest') AS runtime_image,

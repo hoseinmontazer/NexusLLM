@@ -22,7 +22,6 @@ const nav: NavItem[] = [
   { href: '/models',    label: 'Models',         icon: Cpu },
   { href: '/runtimes',  label: 'Runtimes',       icon: Activity },
   { href: '/ha',        label: 'High Availability', icon: Shield },
-  { href: '/services',  label: 'AI Services',    icon: Box },
 
   { section: 'header',  label: 'EXECUTION' },
   { href: '/projects',  label: 'Projects',       icon: FolderKanban },

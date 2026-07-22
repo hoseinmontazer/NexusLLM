@@ -30,6 +30,12 @@ func NewOpenAICompatBackend(client *http.Client) Backend {
 
 func (b *openAICompatBackend) Type() BackendType { return BackendOpenAICompat }
 
+// PrepareStartupArgs — generic OpenAI-compat servers have no known
+// server-level reasoning flag; args returned unchanged.
+func (b *openAICompatBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
+	return extraArgs
+}
+
 // Health performs a lightweight GET /v1/models to verify the endpoint is alive.
 func (b *openAICompatBackend) Health(ctx context.Context, url string) EndpointHealth {
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
@@ -48,10 +54,14 @@ func (b *openAICompatBackend) Health(ctx context.Context, url string) EndpointHe
 	}
 	resp.Body.Close()
 
-	if resp.StatusCode < 500 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		h.Status = StatusHealthy
-	} else {
+	} else if resp.StatusCode < 500 {
+		// 4xx — server is reachable but not behaving as expected.
 		h.Status = StatusDegraded
+		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	} else {
+		h.Status = StatusDown
 		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	}
 	return h

@@ -137,7 +137,7 @@ func main() {
 	// Continuously compares desired replica count (model_replica_specs) vs actual
 	// (agent_runtimes). Automatically triggers START_MODEL tasks for lost/missing
 	// replicas. Respects placement_policy (spread|pack|anti_affinity).
-	haReconciler := ha.NewReconciler(db, taskMgr, log)
+	haReconciler := ha.NewReconciler(db, taskMgr, registry, log)
 	go haReconciler.Start(usageCtx)
 	log.Info("HA reconciler started")
 
@@ -177,7 +177,7 @@ func main() {
 	usageH := handlers.NewUsageHandler(usageTracker)
 	aliasH := handlers.NewAliasHandler(aliasResolver)
 	ppH := handlers.NewPromptPolicyHandler(ppEngine)
-	serviceH := handlers.NewServiceHandler(db, svcRegistry, placementEng, registry, modelCtrl)
+	serviceH := handlers.NewServiceHandler(db, svcRegistry, runtimeH)
 	nodeH := handlers.NewNodeHandler(db)
 	placementH := handlers.NewPlacementHandler(db, placementEng)
 	agentH := handlers.NewAgentHandler(db, agentAuthSvc, taskMgr, log)
@@ -671,7 +671,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		containerName := fmt.Sprintf("nexus-%s-r-%s", sanitize(row.ModelName), suffix)
 
 		if cfg.ModelsVolume == "" {
-			cfg.ModelsVolume = "llamacpp_models"
+			cfg.ModelsVolume = "nexus_models"
 		}
 		if cfg.CtxSize == 0 {
 			cfg.CtxSize = 4096
@@ -684,7 +684,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
 			   requested_mode, effective_mode, workload_policy)
 			SELECT $1, $2, me.id, $3, $4, $5,
-			       'pending', '[]'::jsonb, me.host, me.port, '', -1,
+			       'pending', '[]'::jsonb, me.host, 0, '', -1,
 			       $6, $6, $7
 			FROM model_endpoints me
 			WHERE me.model_id = $3
@@ -711,7 +711,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			ModelName:      row.ModelName,
 			ServedAs:       row.ModelName,
 			BindHost:       row.BindHost,
-			BindPort:       row.BindPort,
+			BindPort:       0, // let the agent allocate a free port
 			GGUFPath:       cfg.GGUFPath,
 			HFRepo:         cfg.HFRepo,
 			HFFile:         cfg.HFFile,
