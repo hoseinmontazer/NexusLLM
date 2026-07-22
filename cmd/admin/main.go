@@ -338,6 +338,7 @@ func main() {
 	a.GET("/models/:id/lazy-config", lazyH.GetLazyConfig)
 	a.GET("/models/:id/runtime-status", lazyH.GetRuntimeStatus)
 	a.PUT("/models/:id/thinking", runtimeH.SetThinkingMode)
+	a.PUT("/models/:id/capabilities", runtimeH.UpdateCapabilities) // model capability validation
 
 	// ── Projects ──────────────────────────────────────────────────────────────
 	a.POST("/projects", projectH.CreateProject)

@@ -44,6 +44,7 @@ type Handler struct {
 	registry      *runtime.Registry
 	activator     runtimemgr.Activator
 	usageTracker  *usage.Tracker
+	capValidator  *CapabilityValidator // nil-safe: skipped when not set
 	log           *zap.Logger
 	mu            sync.RWMutex
 	teamPolicies  map[string]*policy.TeamPolicy
@@ -106,6 +107,15 @@ func (h *Handler) WithColdStartTimeout(d time.Duration) *Handler {
 func (h *Handler) WithDB(db *sqlx.DB) *Handler {
 	h.db = db
 	h.thinkingRes = thinking.NewResolver(db)
+	return h
+}
+
+// WithCapabilityValidator attaches a CapabilityValidator to the handler.
+// When set, every inference request is checked for model-endpoint compatibility
+// before routing. Requests to endpoints the model does not support receive
+// HTTP 400 with a structured error response before any backend interaction.
+func (h *Handler) WithCapabilityValidator(cv *CapabilityValidator) *Handler {
+	h.capValidator = cv
 	return h
 }
 
@@ -185,6 +195,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	req.Model = realModel
 	c.Set("model", realModel)
+
+	// ── 1c. Capability validation ─────────────────────────────────────────
+	// Ensure the model supports the requested endpoint before any policy,
+	// quota, or backend interaction. The validator is engine-independent and
+	// uses the registry's DB-backed capability metadata as the single source
+	// of truth. This prevents e.g. a Whisper model from receiving a chat request.
+	if h.capValidator != nil {
+		if !h.capValidator.CheckAndAbort(c, realModel, c.FullPath()) {
+			return
+		}
+	}
 
 	// ── 1b. Project override via X-Nexus-Project header ──────────────────
 	// Allows callers to specify which project this request belongs to,

@@ -74,6 +74,16 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 	realModel, _ := h.aliasResolver.Resolve(c.Request.Context(), rawModel, claims.TeamID, claims.OrgID)
 	c.Set("model", realModel)
 
+	// ── 2b. Capability validation ─────────────────────────────────────────────
+	// Check that the model supports this endpoint before policy evaluation,
+	// quota checks, or any backend interaction. Engine-independent — uses the
+	// registry DB metadata as single source of truth.
+	if h.capValidator != nil {
+		if !h.capValidator.CheckAndAbort(c, realModel, c.FullPath()) {
+			return pipelineResult{}, false
+		}
+	}
+
 	// ── 3. Gateway policy ─────────────────────────────────────────────────────
 	// Build a minimal InferenceRequest for gateway policy; non-chat endpoints
 	// don't have full message arrays so we pass nil — gateway policy will only

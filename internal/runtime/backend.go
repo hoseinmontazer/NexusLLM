@@ -141,6 +141,7 @@ type Capability string
 const (
 	CapabilityChat            Capability = "chat"
 	CapabilityCompletion      Capability = "completion"
+	CapabilityResponses       Capability = "responses"
 	CapabilityEmbedding       Capability = "embedding"
 	CapabilityRerank          Capability = "rerank"
 	CapabilityTranscription   Capability = "transcription"
@@ -152,7 +153,8 @@ const (
 )
 
 // DefaultCapabilities returns the capabilities implied by a service_type.
-// Used to seed the capabilities column and for fallback validation.
+// Used to seed the capabilities column and for fallback validation when a
+// model's capabilities JSONB column is empty.
 func DefaultCapabilities(serviceType string) []Capability {
 	switch serviceType {
 	case "CHAT":
@@ -171,6 +173,8 @@ func DefaultCapabilities(serviceType string) []Capability {
 		return []Capability{CapabilityChat, CapabilityVision}
 	case "IMAGE_GENERATION":
 		return []Capability{CapabilityImageGeneration}
+	case "MODERATION":
+		return []Capability{CapabilityModeration}
 	case "AGENT", "MCP":
 		return []Capability{CapabilityChat, CapabilityCompletion}
 	default:

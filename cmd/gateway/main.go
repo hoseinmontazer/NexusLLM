@@ -147,10 +147,12 @@ func main() {
 	seedProjectPolicies(ctx, db, policyEngine, log)
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
+	capValidator := proxy.NewCapabilityValidator(registry)
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		registry, usageTracker, teamPolicies, log,
-	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout)
+	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout).
+		WithCapabilityValidator(capValidator)
 
 	// ── Policy live reload every 60s ──────────────────────────────────────────
 	// Uses a sync.RWMutex-protected wrapper to avoid data races between the

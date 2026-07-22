@@ -128,6 +128,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		SupportsThinking  bool `json:"supports_thinking"`
 		ThinkingEnabled   bool `json:"thinking_enabled"`
 		MinThinkingTokens int  `json:"min_thinking_tokens"`
+
+		// Capabilities explicitly declares which API endpoints this model supports.
+		// When omitted, capabilities are derived automatically from ServiceType.
+		// Example: ["chat","completion"] for a chat model, ["transcription"] for Whisper.
+		Capabilities []string `json:"capabilities"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -199,15 +204,21 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	if minThinkTok == 0 {
 		minThinkTok = 500
 	}
+
+	// Resolve capabilities: use explicit input if provided, otherwise derive
+	// from service_type so the column is always populated on insert.
+	capabilitiesJSON := capabilitiesFromInput(input.Capabilities, input.ServiceType)
+
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type, service_type,
-		   max_context, max_output, enabled, tags,
+		   max_context, max_output, enabled, tags, capabilities,
 		   supports_thinking, thinking_enabled, min_thinking_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10,$11,$12)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11,$12,$13,$14)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
+		capabilitiesJSON,
 		input.SupportsThinking, input.ThinkingEnabled, minThinkTok,
 	)
 	if err != nil {
@@ -215,11 +226,12 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		_, err = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO models
 			  (id, name, display_name, provider, backend_type, service_type,
-			   max_context, max_output, enabled, tags)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)`,
+			   max_context, max_output, enabled, tags, capabilities)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb)`,
 			mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 			input.MaxContext, input.MaxOutput,
 			tagsJSON(input.Tags),
+			capabilitiesJSON,
 		)
 		if err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -589,11 +601,15 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		DisplayName string   `json:"display_name" binding:"required"`
 		Provider    string   `json:"provider"`
 		BackendType string   `json:"backend_type" binding:"required"`
+		ServiceType string   `json:"service_type"`
 		Host        string   `json:"host"         binding:"required"`
 		Port        int      `json:"port"         binding:"required"`
 		MaxContext  int      `json:"max_context"`
 		MaxOutput   int      `json:"max_output"`
 		Tags        []string `json:"tags"`
+		// Capabilities explicitly declares which API endpoints this model supports.
+		// When omitted, derived automatically from service_type.
+		Capabilities []string `json:"capabilities"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -608,16 +624,22 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	if input.Provider == "" {
 		input.Provider = "local"
 	}
+	if input.ServiceType == "" {
+		input.ServiceType = "CHAT"
+	}
+
+	capabilitiesJSON := capabilitiesFromInput(input.Capabilities, input.ServiceType)
 
 	mID := uuid.New().String()
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
-		  (id, name, display_name, provider, backend_type,
-		   max_context, max_output, enabled, tags)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8)`,
-		mID, input.Name, input.DisplayName, input.Provider, input.BackendType,
+		  (id, name, display_name, provider, backend_type, service_type,
+		   max_context, max_output, enabled, tags, capabilities)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb)`,
+		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
+		capabilitiesJSON,
 	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -639,10 +661,11 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusCreated, gin.H{
-		"model_id":    mID,
-		"model_name":  input.Name,
-		"endpoint_id": epID,
-		"note":        "registered as external model — NexusLLM will not manage its container lifecycle",
+		"model_id":     mID,
+		"model_name":   input.Name,
+		"endpoint_id":  epID,
+		"capabilities": capabilitiesJSON,
+		"note":         "registered as external model — NexusLLM will not manage its container lifecycle",
 	})
 }
 
@@ -897,7 +920,76 @@ func (h *RuntimeHandler) SetThinkingMode(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "thinking mode updated", "model_id": modelID})
 }
 
+// UpdateCapabilities handles PUT /admin/v1/models/:id/capabilities
+//
+// Replaces the capabilities list for a model. After this call the gateway
+// immediately enforces the new list — no restart required.
+//
+// Example request body:
+//
+//	{"capabilities": ["chat", "completion"]}
+//
+// Setting capabilities to an empty array ([]) is valid and means the model
+// will reject all endpoint-guarded requests until capabilities are re-added.
+func (h *RuntimeHandler) UpdateCapabilities(c *gin.Context) {
+	modelID := c.Param("id")
+	var input struct {
+		Capabilities []string `json:"capabilities" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	capJSON, err := json.Marshal(input.Capabilities)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode capabilities"})
+		return
+	}
+
+	res, err := h.db.ExecContext(c.Request.Context(), `
+		UPDATE models SET capabilities = $2::jsonb, updated_at = NOW()
+		WHERE id = $1`, modelID, string(capJSON))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+		return
+	}
+
+	_ = h.registry.Reload(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{
+		"model_id":     modelID,
+		"capabilities": input.Capabilities,
+		"message":      "capabilities updated — gateway is now enforcing the new list",
+	})
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
+
+// capabilitiesFromInput resolves the capability JSON string to store in the DB.
+// When an explicit list is provided it is used as-is (after JSON-encoding).
+// When the list is empty/nil it falls back to DefaultCapabilities(serviceType).
+func capabilitiesFromInput(explicit []string, serviceType string) string {
+	if len(explicit) > 0 {
+		b, _ := json.Marshal(explicit)
+		return string(b)
+	}
+	// Derive from service_type using the same rules as migration 033.
+	caps := runtime.DefaultCapabilities(serviceType)
+	if len(caps) == 0 {
+		return "[]"
+	}
+	strs := make([]string, len(caps))
+	for i, c := range caps {
+		strs[i] = string(c)
+	}
+	b, _ := json.Marshal(strs)
+	return string(b)
+}
 
 func tagsJSON(tags []string) string {
 	if len(tags) == 0 {

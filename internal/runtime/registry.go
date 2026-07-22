@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -388,6 +389,60 @@ func (r *Registry) StartPeriodicReload(ctx context.Context, interval time.Durati
 		}
 	}
 }
+
+// GetModelCapabilities returns the capabilities declared for a model.
+// It queries the models.capabilities JSONB column and falls back to
+// DefaultCapabilities(service_type) for models that pre-date migration 033
+// (capabilities column is an empty array).
+//
+// Returns (nil, false) when the model is not found in the database at all.
+// A model that exists but has no capabilities returns ([]Capability{}, true)
+// so callers can distinguish "model unknown" from "model has no capabilities".
+func (r *Registry) GetModelCapabilities(ctx context.Context, modelName string) ([]Capability, bool) {
+	var row struct {
+		Capabilities string `db:"capabilities"`
+		ServiceType  string `db:"service_type"`
+	}
+	err := r.db.GetContext(ctx, &row, `
+		SELECT COALESCE(capabilities::text, '[]') AS capabilities,
+		       COALESCE(service_type, '')          AS service_type
+		FROM models
+		WHERE name = $1 AND enabled = TRUE
+		LIMIT 1`, modelName)
+	if err != nil {
+		// Model not found or DB error — return not-found so the caller lets
+		// the downstream pipeline handle the missing-model case.
+		return nil, false
+	}
+
+	// Decode the JSONB capability list.
+	if row.Capabilities != "" && row.Capabilities != "null" && row.Capabilities != "[]" {
+		var capStrs []string
+		if jsonErr := jsonDecodeStrings([]byte(row.Capabilities), &capStrs); jsonErr == nil && len(capStrs) > 0 {
+			caps := make([]Capability, len(capStrs))
+			for i, s := range capStrs {
+				caps[i] = Capability(s)
+			}
+			return caps, true
+		}
+	}
+
+	// Empty capabilities column — fall back to service_type derivation.
+	// This keeps existing models working without requiring an explicit
+	// capabilities backfill beyond what migration 033 already ran.
+	if row.ServiceType != "" {
+		return DefaultCapabilities(row.ServiceType), true
+	}
+
+	return []Capability{}, true
+}
+
+// jsonDecodeStrings decodes a JSON byte slice into a string slice.
+func jsonDecodeStrings(data []byte, out *[]string) error {
+	return json.Unmarshal(data, out)
+}
+
+// BackendForEndpoint returns a Backend instance for the given endpoint.
 func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
 	r.mu.RLock()
 	b, ok := r.bends[string(ep.BackendType)]
