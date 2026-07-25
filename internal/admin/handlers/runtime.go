@@ -1231,8 +1231,8 @@ func (h *RuntimeHandler) ImportOllamaModels(c *gin.Context) {
 		_, _ = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO model_endpoints
 			  (id, model_id, host, port, base_path, weight, priority,
-			   health_status, is_enabled, lifecycle_state, runtime_image, runtime_type)
-			VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active','ollama/ollama:latest','CPU_RUNTIME')`,
+			   health_status, is_enabled, lifecycle_state, runtime_image)
+			VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active','ollama/ollama:latest')`,
 			epID, mID, input.Host, input.Port,
 		)
 

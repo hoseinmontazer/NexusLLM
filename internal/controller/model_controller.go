@@ -29,12 +29,11 @@ type EndpointRecord struct {
 	MaxModelLen    int     `db:"max_model_len"`
 	Dtype          string  `db:"dtype"`
 	Quantization   string  `db:"quantization"`
-	RuntimeImage   string  `db:"runtime_image"`
-	// Placement fields (populated from migration 005 columns)
-	RuntimeType string `db:"runtime_type"`
-	CPUThreads  int    `db:"cpu_threads"`
-	NUMANode    int    `db:"numa_node"`
-	MemoryLimit string `db:"memory_limit"`
+	RuntimeImage  string `db:"runtime_image"`
+	ExecutionMode string `db:"execution_mode"` // cpu | gpu | auto (from mrc)
+	CPUThreads    int    `db:"cpu_threads"`
+	NUMANode      int    `db:"numa_node"`
+	MemoryLimit   string `db:"memory_limit"`
 }
 
 // ModelController manages runtime lifecycle operations.
@@ -275,7 +274,7 @@ func (c *ModelController) loadEndpoint(ctx context.Context, endpointID string) (
 			COALESCE(mrc.dtype, 'auto')           AS dtype,
 			COALESCE(mrc.quantization, '')        AS quantization,
 			COALESCE(me.runtime_image, 'vllm/vllm-openai:latest') AS runtime_image,
-			COALESCE(me.runtime_type, 'GPU_RUNTIME') AS runtime_type,
+			COALESCE(mrc.execution_mode, 'auto')  AS execution_mode,
 			COALESCE(mrc.cpu_threads, 0)          AS cpu_threads,
 			COALESCE(mrc.numa_node, -1)           AS numa_node,
 			COALESCE(mrc.memory_limit, '')        AS memory_limit
@@ -287,6 +286,13 @@ func (c *ModelController) loadEndpoint(ctx context.Context, endpointID string) (
 }
 
 func (c *ModelController) buildSpec(ep EndpointRecord) RuntimeSpec {
+	// Derive legacy RuntimeType from execution_mode.
+	// "cpu" → CPU_RUNTIME; gpu / auto / "" → GPU_RUNTIME.
+	runtimeType := "GPU_RUNTIME"
+	if ep.ExecutionMode == "cpu" {
+		runtimeType = "CPU_RUNTIME"
+	}
+
 	return RuntimeSpec{
 		ModelName:       ep.ModelName,
 		ServedModelName: ep.ModelName,
@@ -300,7 +306,7 @@ func (c *ModelController) buildSpec(ep EndpointRecord) RuntimeSpec {
 		MaxModelLen:     ep.MaxModelLen,
 		Dtype:           ep.Dtype,
 		Quantization:    ep.Quantization,
-		RuntimeType:     ep.RuntimeType,
+		RuntimeType:     runtimeType,
 		NUMANode:        ep.NUMANode,
 		MemoryLimit:     ep.MemoryLimit,
 		Env:             map[string]string{},
