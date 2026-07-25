@@ -176,7 +176,7 @@ func main() {
 	apikeyH := handlers.NewAPIKeyHandler(db, rdb)
 	orgGovH := handlers.NewOrgGovernanceHandler(db, rdb, policyEngine)
 	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithScheduler(sched).WithTaskManager(taskMgr)
-	controllerH := handlers.NewControllerHandler(modelCtrl)
+	controllerH := handlers.NewControllerHandler(db, taskMgr, log)
 	gpuH := handlers.NewGPUHandler(gpuInventory)
 	usageH := handlers.NewUsageHandler(usageTracker)
 	aliasH := handlers.NewAliasHandler(aliasResolver)
