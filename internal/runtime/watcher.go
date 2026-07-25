@@ -170,10 +170,10 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 			ep.ID)
 
 		// Re-enable model_endpoints if this runtime is now healthy.
-		// The endpoint may have been disabled by a previous health check failure
-		// during the loading period (connection refused while model was loading).
-		// Now that the model is healthy, re-enable it and sync the port/host from
-		// the actual agent_runtime row.
+		// ep.ID may be either a model_endpoints.id (legacy path) or an
+		// agent_runtimes.id (agent-managed path). Handle both:
+		//   • Direct match:   me.id = ep.ID  (legacy model_endpoints row)
+		//   • Via runtime:    me.id = ar.endpoint_id WHERE ar.id = ep.ID
 		_, _ = w.db.ExecContext(ctx, `
 			UPDATE model_endpoints me
 			SET is_enabled     = TRUE,
@@ -183,11 +183,21 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 			    host            = CASE WHEN ar.bind_host != '' THEN ar.bind_host ELSE me.host END,
 			    updated_at      = NOW()
 			FROM (
-			    SELECT bind_port, bind_host
-			    FROM agent_runtimes
-			    WHERE id = $1 AND bind_port > 0
+			    -- ep.ID is an agent_runtimes.id — resolve to its endpoint
+			    SELECT ar.bind_port, ar.bind_host, ar.endpoint_id AS me_id
+			    FROM agent_runtimes ar
+			    WHERE ar.id = $1 AND ar.bind_port > 0 AND ar.endpoint_id IS NOT NULL
+			    UNION ALL
+			    -- ep.ID is a model_endpoints.id directly (legacy / no runtime row)
+			    SELECT 0 AS bind_port, '' AS bind_host, me2.id AS me_id
+			    FROM model_endpoints me2
+			    WHERE me2.id = $1
+			      AND NOT EXISTS (
+			          SELECT 1 FROM agent_runtimes ar2
+			          WHERE ar2.id = $1
+			      )
 			) ar
-			WHERE me.id = $1`,
+			WHERE me.id = ar.me_id`,
 			ep.ID)
 	}
 
@@ -202,6 +212,21 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	// after the model weights are fully loaded into VRAM. Disabling here would
 	// prevent the endpoint from ever becoming routable.
 	if result.Status == StatusDown {
+		// Resolve ep.ID to both the agent_runtimes.id and model_endpoints.id.
+		// ep.ID may be either depending on which registry path loaded this endpoint.
+		var runtimeID, endpointMEID string
+		_ = w.db.QueryRowContext(ctx, `
+			SELECT
+			    ar.id::text,
+			    COALESCE(ar.endpoint_id::text, '')
+			FROM agent_runtimes ar
+			WHERE ar.id = $1
+			LIMIT 1`, ep.ID).Scan(&runtimeID, &endpointMEID)
+		if runtimeID == "" {
+			// ep.ID is a model_endpoints.id (legacy path — no agent_runtime row)
+			endpointMEID = ep.ID
+		}
+
 		// Check if the runtime is still loading — if so, skip the disable.
 		var loadingCount int
 		_ = w.db.QueryRowContext(ctx, `
@@ -213,30 +238,41 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 
 		if loadingCount == 0 {
 			// Runtime is not in a loading state — genuinely down.
-			_, _ = w.db.ExecContext(ctx, `
-				UPDATE model_endpoints
-				SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
-				WHERE id = $1 AND is_enabled = TRUE`, ep.ID)
+			if endpointMEID != "" {
+				_, _ = w.db.ExecContext(ctx, `
+					UPDATE model_endpoints
+					SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
+					WHERE id = $1 AND is_enabled = TRUE`, endpointMEID)
+			}
 
-			// Transition to 'unhealthy' so the reconciler can perform a safe rolling
-			// replacement. Only update runtimes explicitly linked to this endpoint.
-			// HA replicas (endpoint_id IS NULL) are handled separately.
-			_, _ = w.db.ExecContext(ctx, `
-				UPDATE agent_runtimes
-				SET state     = 'unhealthy',
-				    error_msg = 'health check failed 3 consecutive times',
-				    updated_at = NOW()
-				WHERE endpoint_id = $1
-				  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
-				ep.ID)
+			// Transition runtime to 'unhealthy'.
+			if runtimeID != "" {
+				_, _ = w.db.ExecContext(ctx, `
+					UPDATE agent_runtimes
+					SET state     = 'unhealthy',
+					    error_msg = 'health check failed 3 consecutive times',
+					    updated_at = NOW()
+					WHERE id = $1
+					  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
+					runtimeID)
+			} else if endpointMEID != "" {
+				// Legacy path: no runtime row, mark by endpoint_id.
+				_, _ = w.db.ExecContext(ctx, `
+					UPDATE agent_runtimes
+					SET state     = 'unhealthy',
+					    error_msg = 'health check failed 3 consecutive times',
+					    updated_at = NOW()
+					WHERE endpoint_id = $1
+					  AND state IN ('ready','active','warm','idle','loading_model','waiting_ready')`,
+					endpointMEID)
+			}
 		}
-		// If still loading: update health_status in DB to 'down' for observability
-		// but keep is_enabled=TRUE so the endpoint stays in routing after it becomes healthy.
-		if loadingCount > 0 {
+		// If still loading: update health_status for observability but keep is_enabled=TRUE.
+		if loadingCount > 0 && endpointMEID != "" {
 			_, _ = w.db.ExecContext(ctx, `
 				UPDATE model_endpoints
 				SET health_status = 'down', updated_at = NOW()
-				WHERE id = $1`, ep.ID)
+				WHERE id = $1`, endpointMEID)
 		}
 	}
 
