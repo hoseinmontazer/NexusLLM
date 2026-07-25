@@ -16,6 +16,7 @@ type Config struct {
 	Scheduler  SchedulerConfig
 	VLLM       VLLMConfig
 	RuntimeMgr RuntimeMgrConfig
+	Upstream   UpstreamConfig
 }
 
 // ServerConfig controls the HTTP listener.
@@ -85,6 +86,15 @@ type RuntimeMgrConfig struct {
 	DefaultImage string
 }
 
+// UpstreamConfig holds proxy settings for outbound cloud AI calls.
+type UpstreamConfig struct {
+	// Proxy is the default HTTP/SOCKS5 proxy URL used for all cloud endpoints
+	// that do not set their own upstream_proxy in model_endpoints.
+	// Empty string = direct connection (no proxy).
+	// Env: NEXUS_UPSTREAM_PROXY  (e.g. http://squid.corp:3128)
+	Proxy string
+}
+
 // Load reads configuration from environment variables (prefix NEXUS_) and any
 // config file found on the search path, then applies sensible defaults.
 func Load() (*Config, error) {
@@ -122,6 +132,8 @@ func Load() (*Config, error) {
 	v.SetDefault("runtimemgr.coldstarttimeout", "20m")
 	v.SetDefault("runtimemgr.modelsvolume", "nexus_models")
 	v.SetDefault("runtimemgr.defaultimage", "ghcr.io/ggml-org/llama.cpp:server")
+
+	v.SetDefault("upstream.proxy", "")
 
 	// --- env ---
 	v.SetEnvPrefix("NEXUS")
@@ -179,6 +191,9 @@ func Load() (*Config, error) {
 	cfg.RuntimeMgr.ColdStartTimeout = v.GetDuration("runtimemgr.coldstarttimeout")
 	cfg.RuntimeMgr.DefaultModelsVolume = v.GetString("runtimemgr.modelsvolume")
 	cfg.RuntimeMgr.DefaultImage = v.GetString("runtimemgr.defaultimage")
+
+	// Upstream
+	cfg.Upstream.Proxy = v.GetString("upstream.proxy")
 
 	return cfg, nil
 }

@@ -187,8 +187,10 @@ export interface DeployModelInput {
   // Cloud / external API credentials — leave blank for local self-hosted models.
   // upstream_api_key is injected as Authorization: Bearer on every upstream request.
   // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+  // upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
   upstream_api_key?: string
   upstream_base_url?: string
+  upstream_proxy?: string
 }
 
 export interface LazyConfig {
@@ -228,8 +230,10 @@ export interface RegisterModelInput {
   // Cloud / external API credentials — leave blank for local self-hosted models.
   // upstream_api_key is injected as Authorization: Bearer on every upstream request.
   // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+  // upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
   upstream_api_key?: string
   upstream_base_url?: string
+  upstream_proxy?: string
 }
 
 // ── Project types ─────────────────────────────────────────────────────────────
@@ -592,6 +596,12 @@ export const api = {
       cpu_cores?: number; numa_node_pref?: number; ram_mb?: number
       preferred_runtime?: string
     }) => req<{ message: string }>('PUT', `/models/${id}/reservation`, b),
+    updateUpstream: (id: string, b: {
+      upstream_api_key?: string
+      upstream_base_url?: string
+      upstream_proxy?: string
+    }) => req<{ message: string; model_id: string; proxy_set: boolean }>(
+      'PUT', `/models/${id}/upstream`, b),
   },
 
   gpu: {

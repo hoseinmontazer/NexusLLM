@@ -35,6 +35,7 @@ type RegistryEndpoint struct {
 	// Cloud / external model credentials. NULL for local models.
 	UpstreamAPIKey  string `db:"upstream_api_key"`
 	UpstreamBaseURL string `db:"upstream_base_url"`
+	UpstreamProxy   string `db:"upstream_proxy"`
 }
 
 // URL builds the base URL from host and port (no base_path).
@@ -121,6 +122,7 @@ func (r *Registry) Reload(ctx context.Context) error {
 			Status:          row.HealthStatus,
 			UpstreamAPIKey:  row.UpstreamAPIKey,
 			UpstreamBaseURL: row.UpstreamBaseURL,
+			UpstreamProxy:   row.UpstreamProxy,
 		}
 		pool.Add(ep)
 
@@ -314,7 +316,8 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    me.is_enabled,
 		    me.consecutive_failures,
 		    COALESCE(me.upstream_api_key, '')  AS upstream_api_key,
-		    COALESCE(me.upstream_base_url, '') AS upstream_base_url
+		    COALESCE(me.upstream_base_url, '') AS upstream_base_url,
+		    COALESCE(me.upstream_proxy, '')    AS upstream_proxy
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
 		WHERE me.is_enabled = TRUE
@@ -353,7 +356,8 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    TRUE                                     AS is_enabled,
 		    0                                        AS consecutive_failures,
 		    ''                                       AS upstream_api_key,
-		    ''                                       AS upstream_base_url
+		    ''                                       AS upstream_base_url,
+		    ''                                       AS upstream_proxy
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')

@@ -72,6 +72,10 @@ func main() {
 		},
 	}
 	factory := runtime.NewFactory(httpClient)
+	if cfg.Upstream.Proxy != "" {
+		factory.SetGlobalProxy(cfg.Upstream.Proxy)
+		log.Info("global upstream proxy configured", zap.String("proxy", cfg.Upstream.Proxy))
+	}
 	registry, err := runtime.NewRegistry(db, rdb, factory, log)
 	if err != nil {
 		log.Warn("runtime registry init failed — starting with empty registry (run migrations)",
@@ -152,7 +156,7 @@ func main() {
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		registry, usageTracker, teamPolicies, log,
 	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout).
-		WithCapabilityValidator(capValidator)
+		WithCapabilityValidator(capValidator).WithFactory(factory)
 
 	// ── Policy live reload every 60s ──────────────────────────────────────────
 	// Uses a sync.RWMutex-protected wrapper to avoid data races between the

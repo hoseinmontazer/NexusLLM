@@ -245,6 +245,7 @@ func main() {
 	a.POST("/models/:id/reset-health", runtimeH.ResetHealth)
 	a.PUT("/models/:id/runtime-config", runtimeH.UpdateRuntimeConfig)
 	a.PUT("/models/:id/pool-strategy", runtimeH.UpdatePoolStrategy)
+	a.PUT("/models/:id/upstream", runtimeH.UpdateUpstream)
 	a.GET("/models/:id/health", runtimeH.GetModelHealth)
 	a.DELETE("/models/:id", runtimeH.DeleteModel)
 	a.GET("/models/:id/deploy-status", runtimeH.GetDeployStatus)

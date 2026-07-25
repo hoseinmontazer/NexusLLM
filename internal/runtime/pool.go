@@ -33,9 +33,12 @@ type Endpoint struct {
 	// When non-empty, the openai_compat backend injects these on upstream requests.
 	// UpstreamBaseURL overrides the URL for routing (e.g. https://api.openai.com).
 	// UpstreamAPIKey is sent as Authorization: Bearer <key>.
-	// Both are empty for local models — default behaviour unchanged.
+	// UpstreamProxy, when set, routes outbound HTTP through this proxy URL
+	// (e.g. http://squid.corp:3128 or socks5://proxy:1080).
+	// All three are empty for local models — default behaviour unchanged.
 	UpstreamAPIKey  string
 	UpstreamBaseURL string
+	UpstreamProxy   string
 	mu              sync.RWMutex
 }
 

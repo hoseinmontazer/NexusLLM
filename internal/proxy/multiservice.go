@@ -246,7 +246,7 @@ func (h *Handler) Rerank(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.httpClient.Do(httpReq)
+	resp, err := h.clientFor(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -288,7 +288,7 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	}
 	start := time.Now()
 
-	if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey); err != nil {
+	if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey, ep.UpstreamProxy); err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -342,7 +342,7 @@ func (h *Handler) Speech(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.httpClient.Do(httpReq)
+	resp, err := h.clientFor(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -406,7 +406,7 @@ func (h *Handler) OCR(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.httpClient.Do(httpReq)
+	resp, err := h.clientFor(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -431,7 +431,8 @@ func (h *Handler) OCR(c *gin.Context) {
 // targetURL and writes the response back. Used for binary/multipart requests
 // where we must not buffer or reparse the body (e.g. STT audio upload).
 // upstreamAPIKey, when non-empty, is injected as Authorization: Bearer.
-func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey string) error {
+// proxyURL, when non-empty, routes the outbound request through that proxy.
+func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL string) error {
 	httpReq, err := http.NewRequestWithContext(
 		c.Request.Context(), c.Request.Method, targetURL, c.Request.Body)
 	if err != nil {
@@ -449,7 +450,11 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey string) e
 	if upstreamAPIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+upstreamAPIKey)
 	}
-	resp, err := h.httpClient.Do(httpReq)
+	client := h.httpClient
+	if h.factory != nil {
+		client = h.factory.ClientFor(proxyURL)
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return err
 	}

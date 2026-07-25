@@ -137,9 +137,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// Cloud / external API credentials — for models not run by NexusLLM containers.
 		// upstream_api_key is injected as Authorization: Bearer on every upstream request.
 		// upstream_base_url overrides host:port (e.g. "https://api.openai.com").
+		// upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
 		// Leave blank for local self-hosted models.
 		UpstreamAPIKey  string `json:"upstream_api_key"`
 		UpstreamBaseURL string `json:"upstream_base_url"`
+		UpstreamProxy   string `json:"upstream_proxy"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -284,11 +286,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		INSERT INTO model_endpoints
 		  (id, model_id, host, port, base_path, weight, priority,
 		   health_status, is_enabled, lifecycle_state, runtime_image,
-		   upstream_api_key, upstream_base_url)
+		   upstream_api_key, upstream_base_url, upstream_proxy)
 		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'registered',$5,
-		        NULLIF($6,''), NULLIF($7,''))`,
+		        NULLIF($6,''), NULLIF($7,''), NULLIF($8,''))`,
 		epID, mID, bindHost, input.Port, runtimeImage,
-		input.UpstreamAPIKey, input.UpstreamBaseURL,
+		input.UpstreamAPIKey, input.UpstreamBaseURL, input.UpstreamProxy,
 	)
 	if err != nil {
 		// Rollback model row
@@ -623,9 +625,11 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		// Cloud / external API credentials.
 		// upstream_api_key is injected as Authorization: Bearer on every upstream request.
 		// upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
+		// upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
 		// Leave blank for local self-hosted models.
 		UpstreamAPIKey  string `json:"upstream_api_key"`
 		UpstreamBaseURL string `json:"upstream_base_url"`
+		UpstreamProxy   string `json:"upstream_proxy"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -671,11 +675,11 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		INSERT INTO model_endpoints
 		  (id, model_id, host, port, base_path, weight, priority,
 		   health_status, is_enabled, lifecycle_state,
-		   upstream_api_key, upstream_base_url)
+		   upstream_api_key, upstream_base_url, upstream_proxy)
 		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active',
-		        NULLIF($5,''), NULLIF($6,''))`,
+		        NULLIF($5,''), NULLIF($6,''), NULLIF($7,''))`,
 		epID, mID, input.Host, input.Port,
-		input.UpstreamAPIKey, input.UpstreamBaseURL,
+		input.UpstreamAPIKey, input.UpstreamBaseURL, input.UpstreamProxy,
 	)
 
 	_ = h.registry.Reload(c.Request.Context())
@@ -779,6 +783,59 @@ func (h *RuntimeHandler) DisableModel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "model disabled"})
 }
 
+// UpdateUpstream handles PUT /admin/v1/models/:id/upstream
+// Updates the upstream credentials and proxy for a cloud/external model endpoint.
+// All fields are optional — only provided (non-null pointer) fields are updated.
+// To clear a field, send an explicit empty string "".
+func (h *RuntimeHandler) UpdateUpstream(c *gin.Context) {
+	modelID := c.Param("id")
+	var input struct {
+		// APIKey replaces the upstream Authorization: Bearer token.
+		// Send "" to clear (direct / no auth upstream).
+		APIKey *string `json:"upstream_api_key"`
+		// BaseURL replaces the upstream host:port override.
+		// Send "" to fall back to the endpoint's host:port.
+		BaseURL *string `json:"upstream_base_url"`
+		// Proxy sets the HTTP/SOCKS5 proxy for outbound calls to this endpoint.
+		// Send "" to remove the proxy and connect directly.
+		// Example: "http://squid.corp:3128" or "socks5://proxy:1080"
+		Proxy *string `json:"upstream_proxy"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.APIKey == nil && input.BaseURL == nil && input.Proxy == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "at least one of upstream_api_key, upstream_base_url, upstream_proxy must be provided",
+		})
+		return
+	}
+
+	if input.APIKey != nil {
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET upstream_api_key = NULLIF($1,''), updated_at = NOW()
+			 WHERE model_id = $2`, *input.APIKey, modelID)
+	}
+	if input.BaseURL != nil {
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET upstream_base_url = NULLIF($1,''), updated_at = NOW()
+			 WHERE model_id = $2`, *input.BaseURL, modelID)
+	}
+	if input.Proxy != nil {
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET upstream_proxy = $1, updated_at = NOW()
+			 WHERE model_id = $2`, *input.Proxy, modelID)
+	}
+
+	_ = h.registry.Reload(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "upstream config updated",
+		"model_id":  modelID,
+		"proxy_set": input.Proxy != nil && *input.Proxy != "",
+	})
+}
+
 func (h *RuntimeHandler) UpdateRuntimeConfig(c *gin.Context) {
 	modelID := c.Param("id")
 	var input struct {
@@ -837,11 +894,20 @@ func (h *RuntimeHandler) GetModelHealth(c *gin.Context) {
 		ConsecutiveFailures int        `db:"consecutive_failures" json:"consecutive_failures"`
 		ResponseTimeMs      *int       `db:"response_time_ms"     json:"response_time_ms"`
 		LastCheckedAt       *time.Time `db:"last_checked_at"      json:"last_checked_at"`
+		ModelID             string     `db:"model_id"             json:"model_id"`
+		UpstreamBaseURL     string     `db:"upstream_base_url"    json:"upstream_base_url"`
+		UpstreamProxy       string     `db:"upstream_proxy"       json:"upstream_proxy"`
+		// upstream_api_key is never returned — only its presence is indicated.
+		UpstreamAPIKeySet   bool       `db:"upstream_api_key_set" json:"upstream_api_key_set"`
 	}
 	rows := make([]epRow, 0)
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `
 		SELECT id, host, port, health_status, lifecycle_state, container_id,
-		       consecutive_failures, response_time_ms, last_checked_at
+		       consecutive_failures, response_time_ms, last_checked_at,
+		       model_id,
+		       COALESCE(upstream_base_url, '') AS upstream_base_url,
+		       COALESCE(upstream_proxy, '')    AS upstream_proxy,
+		       (upstream_api_key IS NOT NULL AND upstream_api_key != '') AS upstream_api_key_set
 		FROM model_endpoints WHERE model_id = $1 ORDER BY priority`, modelID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

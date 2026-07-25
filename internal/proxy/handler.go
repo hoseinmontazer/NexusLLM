@@ -48,7 +48,8 @@ type Handler struct {
 	log           *zap.Logger
 	mu            sync.RWMutex
 	teamPolicies  map[string]*policy.TeamPolicy
-	httpClient    *http.Client
+	httpClient    *http.Client // direct client (local endpoints + fallback)
+	factory       *runtime.Factory // nil-safe; provides proxy-aware clients
 	db            *sqlx.DB
 	thinkingRes   *thinking.Resolver
 	coldStartDur  time.Duration // 0 = use default (20 min)
@@ -117,6 +118,30 @@ func (h *Handler) WithDB(db *sqlx.DB) *Handler {
 func (h *Handler) WithCapabilityValidator(cv *CapabilityValidator) *Handler {
 	h.capValidator = cv
 	return h
+}
+
+// WithFactory attaches a runtime.Factory so the handler can use proxy-aware
+// HTTP clients for cloud endpoints. Call this when NEXUS_UPSTREAM_PROXY or
+// per-model upstream_proxy may be set.
+func (h *Handler) WithFactory(f *runtime.Factory) *Handler {
+	h.factory = f
+	return h
+}
+
+// clientFor returns the *http.Client to use for an upstream call.
+//
+//  1. ep.UpstreamProxy set           → proxy-aware client from factory
+//  2. factory has a GlobalProxy set   → global proxy client (NEXUS_UPSTREAM_PROXY)
+//  3. no proxy configured             → direct httpClient
+func (h *Handler) clientFor(ep *runtime.Endpoint) *http.Client {
+	if h.factory == nil {
+		return h.httpClient
+	}
+	proxyURL := ep.UpstreamProxy
+	if proxyURL == "" {
+		proxyURL = h.factory.GlobalProxy()
+	}
+	return h.factory.ClientFor(proxyURL)
 }
 
 // lookupProjectContext returns project_id, project_name, project_priority, project_priority_weight.
