@@ -288,7 +288,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		   health_status, is_enabled, lifecycle_state, runtime_image,
 		   upstream_api_key, upstream_base_url, upstream_proxy)
 		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'registered',$5,
-		        NULLIF($6,''), NULLIF($7,''), NULLIF($8,''))`,
+		        NULLIF($6,''), NULLIF($7,''), COALESCE(NULLIF($8,''),''))`,
 		epID, mID, bindHost, input.Port, runtimeImage,
 		input.UpstreamAPIKey, input.UpstreamBaseURL, input.UpstreamProxy,
 	)
@@ -677,7 +677,7 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		   health_status, is_enabled, lifecycle_state,
 		   upstream_api_key, upstream_base_url, upstream_proxy)
 		VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active',
-		        NULLIF($5,''), NULLIF($6,''), NULLIF($7,''))`,
+		        NULLIF($5,''), NULLIF($6,''), COALESCE(NULLIF($7,''),''))`,
 		epID, mID, input.Host, input.Port,
 		input.UpstreamAPIKey, input.UpstreamBaseURL, input.UpstreamProxy,
 	)

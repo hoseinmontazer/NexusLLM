@@ -188,9 +188,11 @@ export interface DeployModelInput {
   // upstream_api_key is injected as Authorization: Bearer on every upstream request.
   // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
   // upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
+  // upstream_model_name overrides req.model sent to the upstream provider.
   upstream_api_key?: string
   upstream_base_url?: string
   upstream_proxy?: string
+  upstream_model_name?: string
 }
 
 export interface LazyConfig {
@@ -231,9 +233,11 @@ export interface RegisterModelInput {
   // upstream_api_key is injected as Authorization: Bearer on every upstream request.
   // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
   // upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
+  // upstream_model_name overrides req.model sent to the upstream provider.
   upstream_api_key?: string
   upstream_base_url?: string
   upstream_proxy?: string
+  upstream_model_name?: string
 }
 
 // ── Project types ─────────────────────────────────────────────────────────────
@@ -600,6 +604,7 @@ export const api = {
       upstream_api_key?: string
       upstream_base_url?: string
       upstream_proxy?: string
+      upstream_model_name?: string
     }) => req<{ message: string; model_id: string; proxy_set: boolean }>(
       'PUT', `/models/${id}/upstream`, b),
   },
