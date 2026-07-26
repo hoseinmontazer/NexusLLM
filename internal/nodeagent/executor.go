@@ -1088,8 +1088,11 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		} else {
 			args = append(args, "--gpus", "all")
 		}
+	} else {
+		// Explicitly override the daemon's default-runtime (which may be "nvidia"
+		// on GPU nodes) so CPU containers always run with the standard runc runtime.
+		args = append(args, "--runtime", "runc")
 	}
-	// wantsGPU == false → no --gpus flag at all; container runs on CPU
 
 	// CPU affinity.
 	if p.CPUSetCPUs != "" {
