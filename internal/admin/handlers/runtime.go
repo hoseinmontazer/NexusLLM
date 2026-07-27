@@ -228,7 +228,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		  (id, name, display_name, provider, backend_type, service_type,
 		   max_context, max_output, enabled, tags, capabilities,
 		   supports_thinking, thinking_enabled, min_thinking_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11,$12,$13,$14)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11,$12,$13)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
