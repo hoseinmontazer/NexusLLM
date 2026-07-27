@@ -134,8 +134,8 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 
 	args = append(args, spec.Image)
 
-	// Pass port if the image uses a configurable port via env
-	// Most CPU-native images respect PORT or --port flag
+	// Pass port if the image uses a configurable port via --port flag
+	// Most CPU-native images respect PORT env (set by executor) or --port flag
 	if spec.BindPort > 0 {
 		args = append(args, "--port", strconv.Itoa(spec.BindPort))
 	}

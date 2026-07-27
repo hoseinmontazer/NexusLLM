@@ -627,6 +627,13 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 	}
 
+	// Update the PORT env var after port allocation/scanning.
+	// This ensures backends that respect $PORT (faster-whisper-server, uvicorn-based
+	// services) bind to the correct dynamically-allocated port.
+	if p.BindPort > 0 {
+		p.Env["PORT"] = strconv.Itoa(p.BindPort)
+	}
+
 	// Remove any stale container with this name, then start fresh.
 	// This covers: first deploy, re-deploy, crash recovery, idle restart.
 	if out, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", p.RuntimeName).CombinedOutput(); rmErr != nil {
