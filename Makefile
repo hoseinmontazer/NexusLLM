@@ -189,7 +189,9 @@ MIGRATIONS := \
 	038_recover_stuck_runtimes.sql \
 	039_register_orphan_gpt_oss_120b.sql \
 	040_model_endpoint_upstream_auth.sql \
-	041_upstream_proxy.sql
+	041_upstream_proxy.sql \
+	042_upstream_model_name.sql \
+	043_model_runtime_env.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

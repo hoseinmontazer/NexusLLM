@@ -69,6 +69,13 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		//   ["--no-warmup"]        — skip warmup inference on startup
 		ExtraArgs []string `json:"extra_args"`
 
+		// Env vars passed to the container at startup via -e KEY=VALUE.
+		// Useful for CPU-native services like faster-whisper:
+		//   {"WHISPER__MODEL":"Systran/faster-whisper-large-v3","UVICORN_PORT":"8100"}
+		// The agent always overrides PORT after port scanning, so use the
+		// service-specific var (e.g. UVICORN_PORT) to request a preferred port.
+		Env map[string]string `json:"env"`
+
 		// Idle behaviour (0 = use cluster default)
 		IdleTimeoutSecs *int `json:"idle_timeout_secs"`
 	}
@@ -93,6 +100,14 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		}
 	}
 
+	// Encode env as JSON object for storage.
+	envJSON := "{}"
+	if len(input.Env) > 0 {
+		if b, err := json.Marshal(input.Env); err == nil {
+			envJSON = string(b)
+		}
+	}
+
 	// Upsert into model_runtime_configs.
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_runtime_configs
@@ -100,12 +115,12 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		   gguf_path, hf_repo, hf_file, hf_token,
 		   ctx_size, n_gpu_layers, cpu_threads, memory_limit, models_volume,
 		   gpu_devices, node_id,
-		   idle_timeout_secs, execution_mode, extra_args, updated_at)
+		   idle_timeout_secs, execution_mode, extra_args, env, updated_at)
 		VALUES (gen_random_uuid(), $1,
 		        $2, $3, $4, $5,
 		        $6, $7, COALESCE($8, 0), $9, $10,
 		        $11::jsonb, $12::uuid,
-		        $13, $14, $15::jsonb, NOW())
+		        $13, $14, $15::jsonb, $16::jsonb, NOW())
 		ON CONFLICT (model_id) DO UPDATE SET
 		  gguf_path         = COALESCE(EXCLUDED.gguf_path,         model_runtime_configs.gguf_path),
 		  hf_repo           = COALESCE(EXCLUDED.hf_repo,           model_runtime_configs.hf_repo),
@@ -121,6 +136,7 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		  idle_timeout_secs = EXCLUDED.idle_timeout_secs,
 		  execution_mode    = COALESCE(NULLIF(EXCLUDED.execution_mode,''), model_runtime_configs.execution_mode, 'auto'),
 		  extra_args        = EXCLUDED.extra_args,
+		  env               = EXCLUDED.env,
 		  updated_at        = NOW()`,
 		modelID,
 		nilableStr(input.GGUFPath), nilableStr(input.HFRepo), nilableStr(input.HFFile), nilableStr(input.HFToken),
@@ -129,6 +145,7 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		input.IdleTimeoutSecs,
 		orDefault(input.ExecutionMode, "auto"),
 		extraArgsJSON,
+		envJSON,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -154,6 +171,7 @@ func (h *LazyRuntimeHandler) GetLazyConfig(c *gin.Context) {
 		IdleTimeout   *int            `db:"idle_timeout_secs"  json:"idle_timeout_secs"`
 		ExecutionMode string          `db:"execution_mode"     json:"execution_mode"`
 		ExtraArgs     json.RawMessage `db:"extra_args"         json:"extra_args"`
+		Env           json.RawMessage `db:"env"                json:"env"`
 		UpdatedAt     time.Time       `db:"updated_at"         json:"updated_at"`
 	}
 	if err := h.db.GetContext(c.Request.Context(), &row, `
@@ -172,6 +190,9 @@ func (h *LazyRuntimeHandler) GetLazyConfig(c *gin.Context) {
 		       CASE WHEN jsonb_typeof(COALESCE(extra_args, '[]'::jsonb)) = 'array'
 		            THEN COALESCE(extra_args, '[]'::jsonb)
 		            ELSE '[]'::jsonb END AS extra_args,
+		       CASE WHEN jsonb_typeof(COALESCE(env, '{}'::jsonb)) = 'object'
+		            THEN COALESCE(env, '{}'::jsonb)
+		            ELSE '{}'::jsonb END AS env,
 		       updated_at
 		FROM model_runtime_configs WHERE model_id = $1`, modelID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no lazy config found for this model"})

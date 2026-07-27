@@ -182,6 +182,13 @@ type ModelConfig struct {
 	CPUSetCPUs string // e.g. "0-31"
 	NUMANode   int    // -1 = no affinity
 
+	// ── Environment variables ─────────────────────────────────────────────
+	// Passed verbatim to the container at startup via -e KEY=VALUE.
+	// Stored in model_runtime_configs.env JSONB.
+	// The agent always overrides PORT after port scanning, so use the
+	// service-specific port var (e.g. UVICORN_PORT) to request a preferred port.
+	Env map[string]string
+
 	// ── Idle behaviour ────────────────────────────────────────────────────
 	IdleTimeout time.Duration // 0 = use cluster default from Config
 }

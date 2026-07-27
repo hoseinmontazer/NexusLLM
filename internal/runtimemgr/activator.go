@@ -550,7 +550,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		ExtraArgs:           a.registry.BackendForType(backend).PrepareStartupArgs(startupCaps, cfg.ExtraArgs),
 		ExecutionMode:       effectiveMode,
 		WorkloadPolicy:      workloadPolicy,
-		Env:                 map[string]string{},
+		Env:                 cfg.Env,
 		StaleContainerNames: staleContainerNames,
 	}
 
@@ -1008,6 +1008,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		ExecutionMode  string  `db:"execution_mode"`
 		WorkloadPolicy string  `db:"workload_policy"`
 		ExtraArgsJSON  string  `db:"extra_args_json"`
+		EnvJSON        string  `db:"env_json"`
 	}
 	// Node assignment priority:
 	//   1. model_endpoints.node_id  — set by admin deploy or placement engine
@@ -1040,7 +1041,8 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    mrc.idle_timeout_secs,
 		    %s                                             AS execution_mode,
 		    %s                                             AS workload_policy,
-		    %s                                             AS extra_args_json
+		    %s                                             AS extra_args_json,
+		    %s                                             AS env_json
 		FROM models m
 		LEFT JOIN model_endpoints me
 		       ON me.model_id = m.id
@@ -1062,12 +1064,14 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 	execModeExpr := `COALESCE(mrc.execution_mode, 'auto')`
 	policyExpr := `COALESCE(mrc.workload_policy, 'lazy_load')`
 	extraArgsExpr := `COALESCE(mrc.extra_args::text, '[]')`
+	envExpr := `COALESCE(mrc.env::text, '{}')`
 	if !withExecutionMode {
 		execModeExpr = `'auto'`
 		policyExpr = `'lazy_load'`
 		extraArgsExpr = `'[]'`
+		envExpr = `'{}'`
 	}
-	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr, extraArgsExpr)
+	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr, extraArgsExpr, envExpr)
 
 	err := a.db.GetContext(ctx, &row, q, modelName)
 	if err != nil {
@@ -1081,6 +1085,10 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 	var extraArgs []string
 	if row.ExtraArgsJSON != "" && row.ExtraArgsJSON != "[]" {
 		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
+	}
+	var env map[string]string
+	if row.EnvJSON != "" && row.EnvJSON != "{}" {
+		_ = json.Unmarshal([]byte(row.EnvJSON), &env)
 	}
 	cpuThreads := row.CPUThreads
 	if cpuThreads == "0" {
@@ -1114,6 +1122,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		ExecutionMode:  row.ExecutionMode,
 		WorkloadPolicy: row.WorkloadPolicy,
 		ExtraArgs:      extraArgs,
+		Env:            env,
 	}
 	if row.IdleTimeout != nil {
 		cfg.IdleTimeout = time.Duration(*row.IdleTimeout) * time.Second
