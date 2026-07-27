@@ -186,6 +186,8 @@ export interface DeployModelInput {
   supports_thinking?: boolean
   thinking_enabled?: boolean
   min_thinking_tokens?: number
+  // Execution mode: cpu | gpu | auto — controls whether nvidia runtime is used
+  execution_mode?: string
   // Cloud / external API credentials — leave blank for local self-hosted models.
   // upstream_api_key is injected as Authorization: Bearer on every upstream request.
   // upstream_base_url overrides host:port routing (e.g. "https://api.openai.com").
