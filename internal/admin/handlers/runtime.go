@@ -477,6 +477,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			NGPULayers:    input.LlamaCppNGPULayers,
 			ModelsVolume:  input.LlamaCppModelsVolume,
 			ExecutionMode: orDefault(input.ExecutionMode, "auto"),
+			// NUMANode: -1 means no affinity (don't add --cpuset-mems).
+			// 0 would add --cpuset-mems 0 which restricts the container to NUMA
+			// node 0 — undesirable for generic CPU services like STT/Embedding.
+			NUMANode: -1,
 		}
 
 		// Task priority — derived from project priority_weight (0–1000 → 50–95 task scale)

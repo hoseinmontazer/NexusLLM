@@ -20,7 +20,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -268,7 +271,41 @@ func (h *Handler) Rerank(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) Transcriptions(c *gin.Context) {
-	rawModel := c.PostForm("model")
+	// Read and buffer the entire request body so we can:
+	//   1. Extract the "model" field from the multipart form
+	//   2. Forward the complete original body (including the audio file) upstream
+	//
+	// We MUST NOT use c.PostForm() directly because it parses + consumes the
+	// multipart body, leaving c.Request.Body empty for the upstream forward.
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		abortErr(c, http.StatusBadRequest, "read_error", "failed to read request body")
+		return
+	}
+	// Restore the body so forwardRaw can read it.
+	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	// Parse multipart from the buffered copy to extract the model field.
+	// Replace the body again after parsing so the forward still gets the full body.
+	rawModel := ""
+	mr := multipart.NewReader(
+		bytes.NewReader(bodyBytes),
+		extractBoundary(c.Request.Header.Get("Content-Type")),
+	)
+	for {
+		part, partErr := mr.NextPart()
+		if partErr != nil {
+			break
+		}
+		if part.FormName() == "model" {
+			val, _ := io.ReadAll(part)
+			rawModel = strings.TrimSpace(string(val))
+			part.Close()
+			break
+		}
+		part.Close()
+	}
+
 	if rawModel == "" {
 		abortErr(c, http.StatusBadRequest, "missing_model", "Field 'model' is required")
 		return
@@ -484,4 +521,14 @@ func statusFromHTTP(code int) string {
 		return "success"
 	}
 	return fmt.Sprintf("error_%d", code)
+}
+
+// extractBoundary parses the multipart boundary from a Content-Type header.
+// Returns "" if the header is not multipart/form-data or has no boundary.
+func extractBoundary(contentType string) string {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return ""
+	}
+	return params["boundary"]
 }

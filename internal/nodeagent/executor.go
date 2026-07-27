@@ -591,8 +591,17 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 			)
 		}
 
-		// Case C — configured port is busy, scan forward
-		if !isPortAvailable(p.BindPort) {
+		// Case C — configured port is busy, scan forward.
+		// Exception: if the env map explicitly sets UVICORN_PORT (or similar
+		// server-specific port vars), the container will bind to that port
+		// regardless of what the agent checked — so honour the configured port
+		// and let the container fail if it truly can't bind.
+		envPortOverride := p.Env["UVICORN_PORT"] != "" ||
+			p.Env["PORT"] != "" ||
+			p.Env["SERVER_PORT"] != "" ||
+			p.Env["HTTP_PORT"] != ""
+
+		if !isPortAvailable(p.BindPort) && !envPortOverride {
 			e.log.Warn("startModel: configured port busy, scanning for free port",
 				zap.String("runtime", p.RuntimeName),
 				zap.Int("configured_port", p.BindPort),
