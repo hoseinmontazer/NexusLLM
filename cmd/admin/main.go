@@ -485,8 +485,16 @@ func startInProcessAgent(ctx context.Context, db *sqlx.DB, log *zap.Logger, runC
 //   - The container started but never became healthy (OOM, bad image, etc.).
 //   - The node agent crashed between reporting "loading_model" and "ready".
 func runStuckRuntimeSweeper(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.Manager, log *zap.Logger) {
-	const stuckThreshold = 3 * time.Minute
-	const sweepInterval = 60 * time.Second
+	// stuckThreshold: how long a runtime can sit in a startup state before the
+	// sweeper considers it stuck and triggers recovery.
+	//
+	// 20 minutes matches the cold-start timeout and accommodates:
+	//   - First-time model downloads (faster-whisper-base ~145 MB,
+	//     large-v3 ~3 GB on a slow connection)
+	//   - GPU memory loading for large models
+	//   - Container image pulls on first deploy
+	const stuckThreshold = 20 * time.Minute
+	const sweepInterval  = 60 * time.Second
 
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
@@ -534,15 +542,24 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 	err := db.SelectContext(ctx, &rows, `
 		-- Only startup-stuck runtimes: stuck in a transient state beyond threshold.
 		-- READY/ACTIVE/WARM/IDLE runtimes are NEVER touched by this sweeper.
+		-- Use a longer grace period for downloading/pending states since model
+		-- downloads and image pulls can legitimately take 20+ minutes.
 		SELECT ar.id, ar.model_id::text, m.name AS model_name,
 		       ar.node_id::text, ar.state, ar.backend,
 		       ar.runtime_name, ar.bind_host, ar.bind_port, ar.updated_at
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		WHERE ar.state IN ('loading_model','waiting_ready','starting','pending','validating','downloading')
-		  AND ar.updated_at < NOW() - ($1 || ' seconds')::interval
+		  AND (
+		      -- Normal startup states: use the configured threshold (20 min)
+		      (ar.state NOT IN ('downloading','pending') AND ar.updated_at < NOW() - ($1 || ' seconds')::interval)
+		      OR
+		      -- Download/pending: double the threshold to allow slow connections
+		      (ar.state IN ('downloading','pending') AND ar.updated_at < NOW() - ($2 || ' seconds')::interval)
+		  )
 		  AND m.enabled = TRUE`,
 		int(threshold.Seconds()),
+		int((threshold * 2).Seconds()),
 	)
 	if err != nil {
 		log.Warn("stuck-runtime sweep: query failed", zap.Error(err))
