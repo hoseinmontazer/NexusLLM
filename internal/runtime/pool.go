@@ -35,10 +35,13 @@ type Endpoint struct {
 	// UpstreamAPIKey is sent as Authorization: Bearer <key>.
 	// UpstreamProxy, when set, routes outbound HTTP through this proxy URL
 	// (e.g. http://squid.corp:3128 or socks5://proxy:1080).
-	// All three are empty for local models — default behaviour unchanged.
-	UpstreamAPIKey  string
-	UpstreamBaseURL string
-	UpstreamProxy   string
+	// UpstreamModelName, when set, replaces the model field in requests forwarded
+	// to the upstream (e.g. "whisper" → "large-v3" for faster-whisper-server).
+	// All four are empty for local models — default behaviour unchanged.
+	UpstreamAPIKey    string
+	UpstreamBaseURL   string
+	UpstreamProxy     string
+	UpstreamModelName string
 	mu              sync.RWMutex
 }
 

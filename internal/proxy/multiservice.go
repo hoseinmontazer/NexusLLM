@@ -325,9 +325,21 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	}
 	start := time.Now()
 
-	if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey, ep.UpstreamProxy); err != nil {
-		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
-		return
+	// If the endpoint has an UpstreamModelName configured, we need to rewrite
+	// the multipart form data to replace the model field before forwarding.
+	if ep.UpstreamModelName != "" {
+		if err := h.forwardMultipartWithModelSubstitution(c, epEffectiveURL(ep)+"/v1/audio/transcriptions",
+			ep.UpstreamAPIKey, ep.UpstreamProxy, ep.UpstreamModelName, bodyBytes); err != nil {
+			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
+			return
+		}
+	} else {
+		// Restore body for forwardRaw
+		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey, ep.UpstreamProxy); err != nil {
+			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
+			return
+		}
 	}
 
 	h.usageTracker.Record(context.Background(), usage.Event{
@@ -496,6 +508,94 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL
 		return err
 	}
 	defer resp.Body.Close()
+	for key, vals := range resp.Header {
+		for _, v := range vals {
+			c.Writer.Header().Add(key, v)
+		}
+	}
+	c.Status(resp.StatusCode)
+	_, _ = io.Copy(c.Writer, resp.Body)
+	return nil
+}
+
+// forwardMultipartWithModelSubstitution rebuilds a multipart form request,
+// replacing the "model" field value with upstreamModelName before forwarding.
+// Used when the backend expects a different model identifier than the gateway
+// (e.g. "whisper" → "large-v3" for faster-whisper-server).
+func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetURL, upstreamAPIKey, proxyURL, upstreamModelName string, originalBody []byte) error {
+	// Parse the original multipart form
+	boundary := extractBoundary(c.Request.Header.Get("Content-Type"))
+	mr := multipart.NewReader(bytes.NewReader(originalBody), boundary)
+
+	// Build a new multipart form with the substituted model name
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("parse multipart: %w", err)
+		}
+
+		// Create corresponding part in the new form
+		var pw io.Writer
+		fieldName := part.FormName()
+
+		if fieldName == "model" {
+			// Replace the model value with upstreamModelName
+			pw, _ = mw.CreateFormField(fieldName)
+			_, _ = io.WriteString(pw, upstreamModelName)
+		} else if part.FileName() != "" {
+			// File upload part (e.g. audio file)
+			pw, _ = mw.CreateFormFile(fieldName, part.FileName())
+			_, _ = io.Copy(pw, part)
+		} else {
+			// Regular form field
+			pw, _ = mw.CreateFormField(fieldName)
+			_, _ = io.Copy(pw, part)
+		}
+		part.Close()
+	}
+	mw.Close()
+
+	// Create the HTTP request with the rewritten body
+	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, targetURL, &buf)
+	if err != nil {
+		return err
+	}
+
+	// Copy headers except Authorization and Content-Type (which we set below)
+	for key, vals := range c.Request.Header {
+		if key == "Authorization" || key == "Content-Type" {
+			continue
+		}
+		for _, v := range vals {
+			httpReq.Header.Add(key, v)
+		}
+	}
+
+	// Set the new Content-Type with the new boundary
+	httpReq.Header.Set("Content-Type", mw.FormDataContentType())
+
+	if upstreamAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+upstreamAPIKey)
+	}
+
+	client := h.httpClient
+	if h.factory != nil {
+		client = h.factory.ClientFor(proxyURL)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Forward response back to client
 	for key, vals := range resp.Header {
 		for _, v := range vals {
 			c.Writer.Header().Add(key, v)

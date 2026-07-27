@@ -820,14 +820,18 @@ func (h *RuntimeHandler) UpdateUpstream(c *gin.Context) {
 		// Send "" to remove the proxy and connect directly.
 		// Example: "http://squid.corp:3128" or "socks5://proxy:1080"
 		Proxy *string `json:"upstream_proxy"`
+		// ModelName sets the model identifier sent to the upstream backend.
+		// Send "" to forward the NexusLLM model name unchanged.
+		// Example: "large-v3" for faster-whisper-server when the NexusLLM model is "whisper"
+		ModelName *string `json:"upstream_model_name"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if input.APIKey == nil && input.BaseURL == nil && input.Proxy == nil {
+	if input.APIKey == nil && input.BaseURL == nil && input.Proxy == nil && input.ModelName == nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "at least one of upstream_api_key, upstream_base_url, upstream_proxy must be provided",
+			"error": "at least one of upstream_api_key, upstream_base_url, upstream_proxy, upstream_model_name must be provided",
 		})
 		return
 	}
@@ -847,12 +851,18 @@ func (h *RuntimeHandler) UpdateUpstream(c *gin.Context) {
 			`UPDATE model_endpoints SET upstream_proxy = $1, updated_at = NOW()
 			 WHERE model_id = $2`, *input.Proxy, modelID)
 	}
+	if input.ModelName != nil {
+		_, _ = h.db.ExecContext(c.Request.Context(),
+			`UPDATE model_endpoints SET upstream_model_name = $1, updated_at = NOW()
+			 WHERE model_id = $2`, *input.ModelName, modelID)
+	}
 
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{
-		"message":   "upstream config updated",
-		"model_id":  modelID,
-		"proxy_set": input.Proxy != nil && *input.Proxy != "",
+		"message":         "upstream config updated",
+		"model_id":        modelID,
+		"proxy_set":       input.Proxy != nil && *input.Proxy != "",
+		"model_name_set":  input.ModelName != nil && *input.ModelName != "",
 	})
 }
 
