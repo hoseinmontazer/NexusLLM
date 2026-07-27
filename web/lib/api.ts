@@ -152,7 +152,9 @@ export interface DeployModelInput {
   // Extra args forwarded verbatim to the container entrypoint.
   // Used for non-llamacpp backends (faster-whisper, kokoro, surya, etc.)
   extra_args?: string[]
-  // Environment variables injected into the container
+  // Environment variables injected into the container (key=value map)
+  env?: Record<string, string>
+  // env_vars is a legacy alias — use env instead
   env_vars?: Record<string, string>
   // Volume mounts beyond the default models volume: [{host:"/data", container:"/app/data"}]
   volume_mounts?: { host: string; container: string }[]

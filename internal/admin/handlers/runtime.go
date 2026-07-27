@@ -134,14 +134,19 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		// Example: ["chat","completion"] for a chat model, ["transcription"] for Whisper.
 		Capabilities []string `json:"capabilities"`
 
+		// Env contains additional environment variables injected into the container.
+		// Used for service-specific configuration (e.g. WHISPER__MODEL, UVICORN_PORT).
+		Env map[string]string `json:"env"`
+
 		// Cloud / external API credentials — for models not run by NexusLLM containers.
 		// upstream_api_key is injected as Authorization: Bearer on every upstream request.
 		// upstream_base_url overrides host:port (e.g. "https://api.openai.com").
 		// upstream_proxy routes outbound calls through an HTTP/SOCKS5 proxy.
 		// Leave blank for local self-hosted models.
-		UpstreamAPIKey  string `json:"upstream_api_key"`
-		UpstreamBaseURL string `json:"upstream_base_url"`
-		UpstreamProxy   string `json:"upstream_proxy"`
+		UpstreamAPIKey    string `json:"upstream_api_key"`
+		UpstreamBaseURL   string `json:"upstream_base_url"`
+		UpstreamProxy     string `json:"upstream_proxy"`
+		UpstreamModelName string `json:"upstream_model_name"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -433,6 +438,17 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			}
 		}
 
+		// Merge input.Env with any implicitly derived env vars (e.g. HF token).
+		// Start with a fresh map so we never mutate the input.
+		deployEnv := make(map[string]string, len(input.Env))
+		for k, v := range input.Env {
+			deployEnv[k] = v
+		}
+		// HFToken takes precedence over any HUGGING_FACE_HUB_TOKEN set in input.Env.
+		if input.HFToken != "" {
+			deployEnv["HUGGING_FACE_HUB_TOKEN"] = input.HFToken
+		}
+
 		payload := taskmanager.StartModelPayload{
 			RuntimeID:      runtimeID,
 			EndpointID:     epID,
@@ -452,7 +468,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			Quantization:   input.Quantization,
 			ExtraArgs:      effectiveExtraArgs,
 			HFToken:        input.HFToken,
-			Env:            map[string]string{},
+			Env:            deployEnv,
 			// llamacpp model source
 			GGUFPath:      input.LlamaCppModelPath,
 			HFRepo:        input.LlamaCppHFRepo,
