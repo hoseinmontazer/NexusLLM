@@ -273,7 +273,8 @@ func (h *Handler) Rerank(c *gin.Context) {
 func (h *Handler) Transcriptions(c *gin.Context) {
 	// Read and buffer the entire request body so we can:
 	//   1. Extract the "model" field from the multipart form
-	//   2. Forward the complete original body (including the audio file) upstream
+	//   2. Extract the optional "upstream_model" field (user-specified model size)
+	//   3. Forward the complete original body (including the audio file) upstream
 	//
 	// We MUST NOT use c.PostForm() directly because it parses + consumes the
 	// multipart body, leaving c.Request.Body empty for the upstream forward.
@@ -285,9 +286,9 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	// Restore the body so forwardRaw can read it.
 	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-	// Parse multipart from the buffered copy to extract the model field.
-	// Replace the body again after parsing so the forward still gets the full body.
+	// Parse multipart from the buffered copy to extract the model and upstream_model fields.
 	rawModel := ""
+	upstreamModel := ""
 	mr := multipart.NewReader(
 		bytes.NewReader(bodyBytes),
 		extractBoundary(c.Request.Header.Get("Content-Type")),
@@ -297,13 +298,19 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 		if partErr != nil {
 			break
 		}
-		if part.FormName() == "model" {
+		fieldName := part.FormName()
+		if fieldName == "model" {
 			val, _ := io.ReadAll(part)
 			rawModel = strings.TrimSpace(string(val))
-			part.Close()
-			break
+		} else if fieldName == "upstream_model" {
+			val, _ := io.ReadAll(part)
+			upstreamModel = strings.TrimSpace(string(val))
 		}
 		part.Close()
+		// Stop early if we have both fields
+		if rawModel != "" && upstreamModel != "" {
+			break
+		}
 	}
 
 	if rawModel == "" {
@@ -325,16 +332,24 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	}
 	start := time.Now()
 
-	// If the endpoint has an UpstreamModelName configured, we need to rewrite
-	// the multipart form data to replace the model field before forwarding.
-	if ep.UpstreamModelName != "" {
+	// Determine which upstream model name to use:
+	// 1. User-provided upstream_model in request (highest priority)
+	// 2. Endpoint's configured UpstreamModelName (DB config)
+	// 3. No substitution (forward as-is)
+	effectiveUpstreamModel := upstreamModel
+	if effectiveUpstreamModel == "" {
+		effectiveUpstreamModel = ep.UpstreamModelName
+	}
+
+	// If we have an upstream model name (from request or config), rewrite the form.
+	if effectiveUpstreamModel != "" {
 		if err := h.forwardMultipartWithModelSubstitution(c, epEffectiveURL(ep)+"/v1/audio/transcriptions",
-			ep.UpstreamAPIKey, ep.UpstreamProxy, ep.UpstreamModelName, bodyBytes); err != nil {
+			ep.UpstreamAPIKey, ep.UpstreamProxy, effectiveUpstreamModel, bodyBytes, true); err != nil {
 			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
 	} else {
-		// Restore body for forwardRaw
+		// No model name substitution needed - forward as-is
 		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey, ep.UpstreamProxy); err != nil {
 			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
@@ -522,7 +537,9 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL
 // replacing the "model" field value with upstreamModelName before forwarding.
 // Used when the backend expects a different model identifier than the gateway
 // (e.g. "whisper" → "large-v3" for faster-whisper-server).
-func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetURL, upstreamAPIKey, proxyURL, upstreamModelName string, originalBody []byte) error {
+// If stripUpstreamModel is true, the "upstream_model" field is removed from the
+// forwarded request (it's a gateway-only field, not sent to the backend).
+func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetURL, upstreamAPIKey, proxyURL, upstreamModelName string, originalBody []byte, stripUpstreamModel bool) error {
 	// Parse the original multipart form
 	boundary := extractBoundary(c.Request.Header.Get("Content-Type"))
 	mr := multipart.NewReader(bytes.NewReader(originalBody), boundary)
@@ -548,6 +565,10 @@ func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetUR
 			// Replace the model value with upstreamModelName
 			pw, _ = mw.CreateFormField(fieldName)
 			_, _ = io.WriteString(pw, upstreamModelName)
+		} else if fieldName == "upstream_model" && stripUpstreamModel {
+			// Skip the upstream_model field - it's gateway-only, not for the backend
+			part.Close()
+			continue
 		} else if part.FileName() != "" {
 			// File upload part (e.g. audio file)
 			pw, _ = mw.CreateFormFile(fieldName, part.FileName())

@@ -7,151 +7,187 @@ ERROR: ValueError: Invalid model size 'whisper', expected one of: tiny.en, tiny,
 base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large...
 ```
 
-## The Solution (3 steps)
+## The Solution - Two Options!
 
-### Step 1: Find Your Model ID
+### Option 1: Per-Request Control (Recommended! ⭐)
 
-```bash
-psql -d nexusllm -c "SELECT id, name FROM models WHERE name = 'whisper';"
-```
-
-Or if you named it something else:
-```bash
-psql -d nexusllm -c "SELECT id, name FROM models WHERE enabled = TRUE;"
-```
-
-### Step 2: Set the Upstream Model Name
-
-Replace `{model_id}` with the UUID from Step 1, and choose the correct model size for your faster-whisper-server:
-
-**Option A: Using the Admin API**
-```bash
-curl -X PUT http://localhost:8081/admin/v1/models/{model_id}/upstream \
-  -H "Content-Type: application/json" \
-  -d '{"upstream_model_name": "large-v3"}'
-```
-
-**Option B: Using SQL**
-```bash
-psql -d nexusllm -c "UPDATE model_endpoints 
-SET upstream_model_name = 'large-v3', updated_at = NOW()
-WHERE model_id = '{model_id}';"
-```
-
-### Step 3: Wait & Test (10 seconds)
-
-The gateway auto-reloads every 10 seconds. Then test:
+Let users specify the model size dynamically in each request:
 
 ```bash
+# Use large-v3 for high quality
 curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -F "model=whisper" \
-  -F "file=@test_audio.mp3"
+  -F "upstream_model=large-v3" \
+  -F "file=@audio.mp3"
+
+# Use small for faster processing
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "model=whisper" \
+  -F "upstream_model=small" \
+  -F "file=@audio.mp3"
+
+# Use base for quick transcription
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "model=whisper" \
+  -F "upstream_model=base" \
+  -F "file=@audio.mp3"
 ```
 
-## Which Model Size to Use?
+**No configuration needed!** Just add the `upstream_model` field to your request.
 
-Check what model your faster-whisper-server is running:
+### Option 2: Fixed Configuration
+
+Set a default upstream model in the database (users can't change it per-request):
 
 ```bash
-# SSH into the server or check docker logs
-docker logs faster-whisper-container 2>&1 | grep -i "model"
+# Get your model ID
+psql -d nexusllm -c "SELECT id FROM models WHERE name = 'whisper';"
+
+# Set default upstream model
+curl -X PUT http://localhost:8081/admin/v1/models/{model_id}/upstream \
+  -H "Content-Type: application/json" \
+  -d '{"upstream_model_name": "large-v3"}'
+
+# Now all requests use large-v3 automatically
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "model=whisper" \
+  -F "file=@audio.mp3"
 ```
 
-Common choices:
-- `base` - Fast, lower quality (~145 MB)
-- `medium` - Balanced (~1.5 GB)  
-- `large-v3` - Best quality (~3 GB)
+## Priority Order
 
-## Verify It's Working
+When determining which upstream model to use:
 
-```sql
--- Check the configuration
-SELECT 
-    m.name,
-    me.host,
-    me.port,
-    me.upstream_model_name,
-    me.health_status
-FROM model_endpoints me
-JOIN models m ON m.id = me.model_id
-WHERE m.name = 'whisper';
+1. **`upstream_model` in request** (highest priority) ← User choice
+2. **`upstream_model_name` in DB config** ← Admin default
+3. **Forward as-is** ← No translation (will fail for faster-whisper)
+
+## Examples
+
+### Flexible Setup (Best for Multiple Model Sizes)
+
+```bash
+# No DB config needed - users choose per request
+
+# User 1 wants quality
+curl ... -F "model=whisper" -F "upstream_model=large-v3" -F "file=@audio.mp3"
+
+# User 2 wants speed
+curl ... -F "model=whisper" -F "upstream_model=base" -F "file=@audio.mp3"
+
+# User 3 wants balance
+curl ... -F "model=whisper" -F "upstream_model=medium" -F "file=@audio.mp3"
 ```
 
-You should see something like:
-```
- name    | host           | port | upstream_model_name | health_status
----------+----------------+------+---------------------+--------------
- whisper | 192.168.0.200 | 8000 | large-v3           | healthy
+All work! The gateway routes to your faster-whisper-server and translates the model name.
+
+### Fixed Setup (Enforce One Model Size)
+
+```bash
+# Admin sets large-v3 as default
+curl -X PUT http://localhost:8081/admin/v1/models/{model_id}/upstream \
+  -d '{"upstream_model_name": "large-v3"}'
+
+# Users just send model=whisper (no upstream_model needed)
+curl ... -F "model=whisper" -F "file=@audio.mp3"
+# Gateway automatically uses large-v3
 ```
 
-## What This Fix Does
+### Hybrid Setup (Default + Override)
 
-**Before:**
-```
-Client → Gateway → faster-whisper (receives "whisper") → ERROR
+```bash
+# Admin sets a default
+curl -X PUT http://localhost:8081/admin/v1/models/{model_id}/upstream \
+  -d '{"upstream_model_name": "medium"}'
+
+# Most users don't specify upstream_model (get medium)
+curl ... -F "model=whisper" -F "file=@audio.mp3"
+
+# Power users can override
+curl ... -F "model=whisper" -F "upstream_model=large-v3" -F "file=@audio.mp3"
 ```
 
-**After:**
+## Available faster-whisper Model Sizes
+
+- `tiny`, `tiny.en` - Fastest, lowest quality
+- `base`, `base.en` - Fast, decent quality
+- `small`, `small.en` - Balanced
+- `medium`, `medium.en` - High quality
+- `large-v1`, `large-v2`, `large-v3`, `large` - Best quality
+- `distil-large-v2`, `distil-large-v3` - Optimized versions
+- `distil-medium.en`, `distil-small.en` - Distilled variants
+
+## How It Works
+
 ```
-Client sends "whisper" → Gateway translates to "large-v3" → faster-whisper → SUCCESS
+Client Request:
+  model=whisper
+  upstream_model=large-v3
+  file=audio.mp3
+         ↓
+Gateway extracts upstream_model field
+         ↓
+Rewrites multipart form:
+  model=large-v3  ← Changed!
+  file=audio.mp3  ← Unchanged
+         ↓
+Forwards to faster-whisper-server
+         ↓
+SUCCESS! ✓
 ```
 
-The gateway now automatically rewrites the model field in multipart form requests before forwarding them.
+The `upstream_model` field is:
+- ✅ Extracted by the gateway
+- ✅ Used to replace the model field
+- ✅ **Stripped from the upstream request** (faster-whisper doesn't need it)
 
 ## Troubleshooting
 
-### Still getting the error after 10 seconds?
+### Still getting "Invalid model size" error?
 
-Manually reload the gateway:
+Make sure you're sending the `upstream_model` field:
+
 ```bash
-# Restart the gateway service
-docker restart nexus-gateway
-# OR if running directly
-systemctl restart nexus-gateway
+# ❌ Wrong - missing upstream_model
+curl ... -F "model=whisper" -F "file=@audio.mp3"
+
+# ✅ Correct - includes upstream_model
+curl ... -F "model=whisper" -F "upstream_model=large-v3" -F "file=@audio.mp3"
 ```
 
-### Want to verify the gateway has the new code?
+Or set a default in the DB (see Option 2 above).
+
+### Which model size should I use?
+
+Test with a sample file:
 
 ```bash
-# Check if the column exists
-psql -d nexusllm -c "\d model_endpoints" | grep upstream_model_name
-
-# Should show:
-# upstream_model_name | character varying(512) | not null | default ''::character varying
+# Try different sizes
+for size in tiny base small medium large-v3; do
+  echo "Testing $size..."
+  time curl ... -F "model=whisper" -F "upstream_model=$size" -F "file=@test.mp3"
+done
 ```
 
-### Multiple Whisper models?
+Pick based on your speed vs. quality needs.
 
-If you have different models for different sizes:
+### Can I use multiple faster-whisper servers?
+
+Yes! Set up multiple model endpoints, each pointing to a different faster-whisper instance:
 
 ```bash
-# Create separate models
-curl -X POST http://localhost:8081/admin/v1/models \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "whisper-base",
-    "display_name": "Whisper Base",
-    "backend_type": "cpu_native",
-    "service_type": "transcription",
-    "capabilities": ["transcription"]
-  }'
+# faster-whisper-1 (small models): 192.168.0.200:8000
+# faster-whisper-2 (large models): 192.168.0.201:8000
 
-# Then set upstream name
-curl -X PUT http://localhost:8081/admin/v1/models/{model_id}/upstream \
-  -H "Content-Type: application/json" \
-  -d '{"upstream_model_name": "base"}'
+# Both registered under model="whisper"
+# Gateway will load-balance between them
 ```
 
 ## Need More Help?
 
-See the full documentation:
 - `/docs/24-upstream-model-name.md` - Complete feature guide
-- `/examples/configure-whisper-upstream.sql` - More SQL examples
 - `/UPSTREAM_MODEL_NAME_FIX.md` - Technical implementation details
-
-## Available faster-whisper Model Sizes
-
-tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, **large-v3**, large, distil-large-v2, distil-large-v3, distil-medium.en, distil-small.en
-
-Choose the one that matches your faster-whisper-server deployment.
