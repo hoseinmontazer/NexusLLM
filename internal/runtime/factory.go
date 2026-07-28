@@ -28,6 +28,8 @@ func NewFactory(client *http.Client) *Factory {
 		client:       client,
 		proxyClients: make(map[string]*http.Client),
 	}
+
+	// ── Local / self-hosted backends ──────────────────────────────────────
 	f.Register(BackendVLLM, NewVLLMBackend)
 	f.Register(BackendTGI, NewTGIBackend)
 	f.Register(BackendOpenAICompat, NewOpenAICompatBackend)
@@ -37,6 +39,28 @@ func NewFactory(client *http.Client) *Factory {
 	// HTTP wire format is OpenAI-compatible, but PrepareStartupArgs handles
 	// llamacpp-specific flags (e.g. --reasoning off for thinking models).
 	f.Register(BackendLlamaCpp, NewLlamaCppBackend)
+	// Text Embeddings Inference — HuggingFace embedding server.
+	// Exposes /v1/embeddings (OpenAI-compatible) and /health.
+	// Port is passed via --port CMD arg; model cache lives at /data.
+	f.Register(BackendTEI, NewTEIBackend)
+
+	// ── External / cloud provider backends ───────────────────────────────
+	// Each provider implements the same Backend interface.
+	// Lifecycle methods (ContainerPort, ContainerPortEnvVars,
+	// PrepareStartupArgs) are no-ops — providers have no container lifecycle.
+	// Auth, policy, rate limits, quota, audit, and usage tracking are
+	// identical to local backends — nothing is bypassed.
+	f.Register(BackendOpenAI, NewOpenAIProviderBackend)
+	f.Register(BackendAnthropic, NewAnthropicProviderBackend)
+	f.Register(BackendGemini, NewGeminiProviderBackend)
+	f.Register(BackendAzureOpenAI, NewAzureOpenAIProviderBackend)
+	f.Register(BackendOpenRouter, NewOpenRouterProviderBackend)
+	f.Register(BackendGroq, NewGroqProviderBackend)
+	f.Register(BackendTogether, NewTogetherProviderBackend)
+	f.Register(BackendMistral, NewMistralProviderBackend)
+	f.Register(BackendCohere, NewCohereProviderBackend)
+	f.Register(BackendDeepSeek, NewDeepSeekProviderBackend)
+
 	return f
 }
 

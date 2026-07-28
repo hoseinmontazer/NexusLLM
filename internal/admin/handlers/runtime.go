@@ -710,6 +710,275 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	})
 }
 
+// ─── External / cloud provider model registration ────────────────────────────
+
+// RegisterExternalModel handles POST /admin/v1/models/external
+//
+// Registers an external AI provider model as a first-class model.
+// The model enters the single model registry and is immediately routable.
+// No container is started; no scheduler or placement decisions are made.
+// Everything else — policy, rate limits, quota, audit, usage — runs
+// identically to a locally managed model.
+//
+// Architecture note: the backend_type field determines which Backend
+// implementation handles requests (e.g. "anthropic_provider" → AnthropicBackend).
+// The provider_name column mirrors backend_type for query convenience.
+// upstream_base_url is pre-filled from provider_defaults when omitted.
+//
+// Security: upstream_api_key is stored in the DB column added by migration 040.
+// In production, use a secrets manager reference (e.g. "vault://secret/openai-key")
+// and resolve it at runtime. The gateway never returns the key in API responses.
+func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
+	var input struct {
+		// Model identity
+		Name        string   `json:"name"         binding:"required"`
+		DisplayName string   `json:"display_name" binding:"required"`
+		ServiceType string   `json:"service_type"`
+		MaxContext  int      `json:"max_context"`
+		MaxOutput   int      `json:"max_output"`
+		Tags        []string `json:"tags"`
+		Capabilities []string `json:"capabilities"`
+
+		// Provider — must match a BackendType constant with IsProviderBackend()==true.
+		// Examples: "openai_provider", "anthropic_provider", "google_provider",
+		//           "azure_openai_provider", "openrouter_provider", "groq_provider",
+		//           "together_provider", "mistral_provider", "cohere_provider",
+		//           "deepseek_provider"
+		ProviderBackendType string `json:"provider_backend_type" binding:"required"`
+
+		// upstream_api_key — API key for the provider. Never returned in responses.
+		UpstreamAPIKey string `json:"upstream_api_key"`
+
+		// upstream_base_url — provider endpoint base URL.
+		// When empty, the canonical default from provider_defaults is used.
+		// Required for Azure OpenAI (resource-specific URL).
+		UpstreamBaseURL string `json:"upstream_base_url"`
+
+		// upstream_model_name — the model identifier sent to the provider.
+		// When empty the NexusLLM model name is forwarded unchanged.
+		// Example: NexusLLM name "gpt4" → upstream_model_name "gpt-4o"
+		UpstreamModelName string `json:"upstream_model_name"`
+
+		// upstream_proxy — optional HTTP/SOCKS5 proxy for outbound calls.
+		UpstreamProxy string `json:"upstream_proxy"`
+
+		// provider_api_version — used by Azure OpenAI (e.g. "2024-08-01-preview").
+		ProviderAPIVersion string `json:"provider_api_version"`
+
+		// provider_extra_config — arbitrary JSONB for provider-specific settings.
+		// Examples: {"organization":"org-xxx"}, {"http_referer":"https://myapp.com"}
+		ProviderExtraConfig map[string]interface{} `json:"provider_extra_config"`
+
+		// provider_timeout_seconds — request timeout for this provider (default 120).
+		ProviderTimeoutSeconds int `json:"provider_timeout_seconds"`
+
+		// provider_max_retries — automatic retries on 429/5xx (default 2).
+		ProviderMaxRetries int `json:"provider_max_retries"`
+
+		// provider_extra_headers — additional HTTP headers injected on every request.
+		// Example: {"HTTP-Referer":"https://nexusllm.example.com","X-Title":"NexusLLM"}
+		ProviderExtraHeaders map[string]string `json:"provider_extra_headers"`
+
+		// Allowed projects and teams for model ACL (optional).
+		// When empty the model is accessible to all projects/teams in the org.
+		AllowedProjectIDs []string `json:"allowed_project_ids"`
+		AllowedTeamIDs    []string `json:"allowed_team_ids"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate provider backend type.
+	providerType := runtime.BackendType(input.ProviderBackendType)
+	if !runtime.IsProviderBackend(providerType) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("unknown provider backend type %q — valid values: "+
+				"openai_provider, anthropic_provider, google_provider, azure_openai_provider, "+
+				"openrouter_provider, groq_provider, together_provider, mistral_provider, "+
+				"cohere_provider, deepseek_provider", input.ProviderBackendType),
+		})
+		return
+	}
+
+	// Apply defaults.
+	if input.ServiceType == "" {
+		input.ServiceType = "CHAT"
+	}
+	if input.MaxContext == 0 {
+		input.MaxContext = 128000
+	}
+	if input.MaxOutput == 0 {
+		input.MaxOutput = 16384
+	}
+	if input.ProviderTimeoutSeconds == 0 {
+		input.ProviderTimeoutSeconds = 120
+	}
+	if input.ProviderMaxRetries == 0 {
+		input.ProviderMaxRetries = 2
+	}
+
+	// Resolve upstream_base_url from provider_defaults when not supplied.
+	if input.UpstreamBaseURL == "" {
+		var defaultURL string
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT default_base_url FROM provider_defaults WHERE provider_name = $1`,
+			input.ProviderBackendType,
+		).Scan(&defaultURL)
+		input.UpstreamBaseURL = defaultURL
+	}
+
+	// Azure OpenAI requires an explicit base URL (resource-specific).
+	if providerType == runtime.BackendAzureOpenAI && input.UpstreamBaseURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "upstream_base_url is required for azure_openai_provider " +
+				"(format: https://YOUR_RESOURCE.openai.azure.com)",
+		})
+		return
+	}
+
+	capabilitiesJSON := capabilitiesFromInput(input.Capabilities, input.ServiceType)
+
+	extraConfigJSON := "{}"
+	if len(input.ProviderExtraConfig) > 0 {
+		if b, err := json.Marshal(input.ProviderExtraConfig); err == nil {
+			extraConfigJSON = string(b)
+		}
+	}
+	extraHeadersJSON := "{}"
+	if len(input.ProviderExtraHeaders) > 0 {
+		if b, err := json.Marshal(input.ProviderExtraHeaders); err == nil {
+			extraHeadersJSON = string(b)
+		}
+	}
+
+	// Insert model row — uses provider columns added by migration 044.
+	mID := uuid.New().String()
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO models
+		  (id, name, display_name, provider, backend_type, service_type,
+		   max_context, max_output, enabled, tags, capabilities,
+		   provider_name, provider_is_external, provider_api_version, provider_extra_config)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,
+		        $11,$12,$13,$14::jsonb)`,
+		mID,
+		input.Name,
+		input.DisplayName,
+		input.ProviderBackendType, // provider display column
+		string(providerType),      // backend_type
+		input.ServiceType,
+		input.MaxContext,
+		input.MaxOutput,
+		tagsJSON(input.Tags),
+		capabilitiesJSON,
+		// provider columns
+		input.ProviderBackendType,
+		true,
+		nilableStr(input.ProviderAPIVersion),
+		extraConfigJSON,
+	)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists or DB error: " + err.Error()})
+		return
+	}
+
+	_, _ = h.db.ExecContext(c.Request.Context(),
+		`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
+		uuid.New().String(), mID)
+
+	// Insert endpoint row — immediately active, no container lifecycle.
+	// host/port are placeholders (0.0.0.0:0) since routing uses upstream_base_url.
+	// health_status starts as 'unknown'; the watcher will probe on the next tick.
+	epID := uuid.New().String()
+	_, epErr := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO model_endpoints
+		  (id, model_id, host, port, base_path, weight, priority,
+		   health_status, is_enabled, lifecycle_state,
+		   upstream_api_key, upstream_base_url, upstream_proxy, upstream_model_name,
+		   provider_timeout_seconds, provider_max_retries, provider_extra_headers)
+		VALUES ($1,$2,'0.0.0.0',0,'/v1',100,1,'unknown',TRUE,'active',
+		        NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), NULLIF($6,''),
+		        $7,$8,$9::jsonb)`,
+		epID, mID,
+		input.UpstreamAPIKey,
+		input.UpstreamBaseURL,
+		input.UpstreamProxy,
+		input.UpstreamModelName,
+		input.ProviderTimeoutSeconds,
+		input.ProviderMaxRetries,
+		extraHeadersJSON,
+	)
+	if epErr != nil {
+		// Roll back model row if endpoint insert failed.
+		_, _ = h.db.ExecContext(c.Request.Context(), `DELETE FROM models WHERE id=$1`, mID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create endpoint: " + epErr.Error()})
+		return
+	}
+
+	_ = h.registry.Reload(c.Request.Context())
+
+	c.JSON(http.StatusCreated, gin.H{
+		"model_id":              mID,
+		"model_name":            input.Name,
+		"endpoint_id":           epID,
+		"provider_backend_type": input.ProviderBackendType,
+		"upstream_base_url":     input.UpstreamBaseURL,
+		"upstream_model_name":   input.UpstreamModelName,
+		"upstream_api_key_set":  input.UpstreamAPIKey != "",
+		"capabilities":          capabilitiesJSON,
+		"status":                "active",
+		"note": "provider model registered and immediately routable — " +
+			"full policy pipeline applies (auth, rate limits, quota, audit, usage)",
+	})
+}
+
+// ListProviderDefaults handles GET /admin/v1/providers
+// Returns the canonical defaults for every supported external provider.
+// Used by the admin UI to pre-fill the registration form.
+func (h *RuntimeHandler) ListProviderDefaults(c *gin.Context) {
+	type row struct {
+		ProviderName      string `db:"provider_name"       json:"provider_name"`
+		DisplayName       string `db:"display_name"        json:"display_name"`
+		DefaultBaseURL    string `db:"default_base_url"    json:"default_base_url"`
+		HealthPath        string `db:"health_path"         json:"health_path"`
+		DocsURL           string `db:"docs_url"            json:"docs_url"`
+		SupportsStreaming  bool   `db:"supports_streaming"  json:"supports_streaming"`
+		SupportsFunctions bool   `db:"supports_functions"  json:"supports_functions"`
+		SupportsVision    bool   `db:"supports_vision"     json:"supports_vision"`
+		SupportsEmbedding bool   `db:"supports_embedding"  json:"supports_embedding"`
+	}
+	var rows []row
+	if err := h.db.SelectContext(c.Request.Context(), &rows,
+		`SELECT provider_name, display_name, default_base_url, health_path,
+		        COALESCE(docs_url,'') AS docs_url,
+		        supports_streaming, supports_functions, supports_vision, supports_embedding
+		 FROM provider_defaults
+		 ORDER BY display_name`); err != nil {
+		// Table may not exist yet (migration 044 not run) — return hardcoded fallback.
+		c.JSON(http.StatusOK, gin.H{"data": builtinProviderDefaults(), "source": "builtin"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
+}
+
+// builtinProviderDefaults returns hardcoded provider info used when the
+// provider_defaults table has not been created yet (pre-migration-044 installs).
+func builtinProviderDefaults() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"provider_name": "openai_provider",       "display_name": "OpenAI",          "default_base_url": "https://api.openai.com"},
+		{"provider_name": "anthropic_provider",    "display_name": "Anthropic",        "default_base_url": "https://api.anthropic.com"},
+		{"provider_name": "google_provider",       "display_name": "Google Gemini",    "default_base_url": "https://generativelanguage.googleapis.com"},
+		{"provider_name": "azure_openai_provider", "display_name": "Azure OpenAI",     "default_base_url": ""},
+		{"provider_name": "openrouter_provider",   "display_name": "OpenRouter",       "default_base_url": "https://openrouter.ai"},
+		{"provider_name": "groq_provider",         "display_name": "Groq",             "default_base_url": "https://api.groq.com"},
+		{"provider_name": "together_provider",     "display_name": "Together AI",      "default_base_url": "https://api.together.xyz"},
+		{"provider_name": "mistral_provider",      "display_name": "Mistral AI",       "default_base_url": "https://api.mistral.ai"},
+		{"provider_name": "cohere_provider",       "display_name": "Cohere",           "default_base_url": "https://api.cohere.com"},
+		{"provider_name": "deepseek_provider",     "display_name": "DeepSeek",         "default_base_url": "https://api.deepseek.com"},
+	}
+}
+
 // ─── Endpoint management ──────────────────────────────────────────────────────
 
 // AddEndpoint handles POST /admin/v1/models/:id/endpoints
@@ -953,21 +1222,27 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 	}
 
 	type mRow struct {
-		ID                string `db:"id"                  json:"id"`
-		Name              string `db:"name"                json:"name"`
-		DisplayName       string `db:"display_name"        json:"display_name"`
-		Provider          string `db:"provider"            json:"provider"`
-		BackendType       string `db:"backend_type"        json:"backend_type"`
-		ServiceType       string `db:"service_type"        json:"service_type"`
-		MaxContext        int    `db:"max_context"         json:"max_context"`
-		MaxOutput         int    `db:"max_output"          json:"max_output"`
-		Enabled           bool   `db:"enabled"             json:"enabled"`
-		Lifecycle         string `db:"lifecycle"           json:"lifecycle"`
-		EndpointCnt       int    `db:"endpoint_cnt"        json:"endpoint_count"`
-		HealthyCnt        int    `db:"healthy_cnt"         json:"healthy_count"`
-		SupportsThinking  bool   `db:"supports_thinking"   json:"supports_thinking"`
-		ThinkingEnabled   bool   `db:"thinking_enabled"    json:"thinking_enabled"`
-		MinThinkingTokens int    `db:"min_thinking_tokens" json:"min_thinking_tokens"`
+		ID                 string `db:"id"                  json:"id"`
+		Name               string `db:"name"                json:"name"`
+		DisplayName        string `db:"display_name"        json:"display_name"`
+		Provider           string `db:"provider"            json:"provider"`
+		BackendType        string `db:"backend_type"        json:"backend_type"`
+		ServiceType        string `db:"service_type"        json:"service_type"`
+		MaxContext         int    `db:"max_context"         json:"max_context"`
+		MaxOutput          int    `db:"max_output"          json:"max_output"`
+		Enabled            bool   `db:"enabled"             json:"enabled"`
+		Lifecycle          string `db:"lifecycle"           json:"lifecycle"`
+		EndpointCnt        int    `db:"endpoint_cnt"        json:"endpoint_count"`
+		HealthyCnt         int    `db:"healthy_cnt"         json:"healthy_count"`
+		SupportsThinking   bool   `db:"supports_thinking"   json:"supports_thinking"`
+		ThinkingEnabled    bool   `db:"thinking_enabled"    json:"thinking_enabled"`
+		MinThinkingTokens  int    `db:"min_thinking_tokens" json:"min_thinking_tokens"`
+		// Provider columns (migration 044) — zero/false for local models.
+		ProviderIsExternal bool   `db:"provider_is_external" json:"provider_is_external"`
+		ProviderName       string `db:"provider_name"        json:"provider_name,omitempty"`
+		UpstreamBaseURL    string `db:"upstream_base_url"    json:"upstream_base_url,omitempty"`
+		UpstreamModelName  string `db:"upstream_model_name"  json:"upstream_model_name,omitempty"`
+		HasUpstreamKey     bool   `db:"has_upstream_key"     json:"upstream_api_key_set"`
 	}
 	rows := make([]mRow, 0)
 
@@ -980,7 +1255,12 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		       COUNT(me.id) FILTER (WHERE me.health_status='healthy') AS healthy_cnt,
 		       COALESCE(m.supports_thinking, FALSE)  AS supports_thinking,
 		       COALESCE(m.thinking_enabled,  FALSE)  AS thinking_enabled,
-		       COALESCE(m.min_thinking_tokens, 500)  AS min_thinking_tokens
+		       COALESCE(m.min_thinking_tokens, 500)  AS min_thinking_tokens,
+		       COALESCE(m.provider_is_external, FALSE) AS provider_is_external,
+		       COALESCE(m.provider_name, '')            AS provider_name,
+		       COALESCE(MIN(me.upstream_base_url), '')  AS upstream_base_url,
+		       COALESCE(MIN(me.upstream_model_name), '') AS upstream_model_name,
+		       BOOL_OR(me.upstream_api_key IS NOT NULL AND me.upstream_api_key != '') AS has_upstream_key
 		FROM models m
 		LEFT JOIN model_endpoints me ON me.model_id = m.id AND me.is_enabled = TRUE`
 

@@ -235,10 +235,13 @@ func main() {
 	a.PUT("/api-keys/:id/project", apikeyH.SetKeyProject) // scope key to a project
 
 	// ── Models ────────────────────────────────────────────────────────────────
-	// POST /admin/v1/models/deploy  ← must come before /models/:id to avoid conflict
+	// POST /admin/v1/models/deploy    ← must come before /models/:id to avoid conflict
+	// POST /admin/v1/models/external  ← dedicated external/cloud provider registration
 	a.POST("/models/deploy", runtimeH.DeployModel)
+	a.POST("/models/external", runtimeH.RegisterExternalModel) // cloud/provider models
 	a.POST("/models", runtimeH.RegisterModel)
 	a.GET("/models", runtimeH.ListModels)
+	a.GET("/providers", runtimeH.ListProviderDefaults) // provider catalog + defaults
 	a.POST("/models/:id/endpoints", runtimeH.AddEndpoint)
 	a.DELETE("/models/:id/endpoints/:ep", runtimeH.RemoveEndpoint)
 	a.POST("/models/:id/drain", runtimeH.DrainModel)

@@ -132,7 +132,16 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 	hCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	result := backend.Health(hCtx, ep.URL)
+	// ── Resolve health-check URL ───────────────────────────────────────────
+	// Provider endpoints store "http://0.0.0.0:0" as a routing placeholder in
+	// ep.URL because all traffic goes via UpstreamBaseURL. Always use
+	// UpstreamBaseURL when present so the health probe reaches the actual API.
+	healthURL := ep.URL
+	if ep.UpstreamBaseURL != "" {
+		healthURL = ep.UpstreamBaseURL
+	}
+
+	result := backend.Health(hCtx, healthURL)
 	result.EndpointID = ep.ID
 
 	// ── Circuit breaker ────────────────────────────────────────────────────
@@ -153,6 +162,39 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 
 	// ── Persist to PostgreSQL ──────────────────────────────────────────────
 	w.persistHealthResult(ctx, ep.ID, result)
+
+	// ── Provider backends: no container lifecycle management ───────────────
+	// Provider endpoints (openai_provider, anthropic_provider, etc.) have no
+	// container, no agent_runtime row, and no scheduler. We only update
+	// health_status (done above by persistHealthResult) and emit metrics.
+	// All agent_runtimes mutations below are skipped.
+	if IsProviderBackend(ep.BackendType) {
+		upVal := 0.0
+		if result.Status == StatusHealthy || result.Status == StatusDegraded {
+			upVal = 1.0
+		}
+		w.endpointUp.With(prometheus.Labels{
+			"model": modelName, "endpoint_id": ep.ID, "host": healthURL,
+		}).Set(upVal)
+		w.endpointLatency.With(prometheus.Labels{
+			"model": modelName, "endpoint_id": ep.ID,
+		}).Set(float64(result.LatencyMs))
+		w.checkTotal.With(prometheus.Labels{
+			"model": modelName, "endpoint_id": ep.ID, "status": string(result.Status),
+		}).Inc()
+		w.log.Debug("provider health check",
+			zap.String("provider", string(ep.BackendType)),
+			zap.String("model", modelName),
+			zap.String("url", healthURL),
+			zap.String("status", string(result.Status)),
+			zap.Int("latency_ms", result.LatencyMs),
+		)
+		return
+	}
+
+	// ── Local model lifecycle management ──────────────────────────────────
+	// Everything below only applies to locally managed backends (vllm, tgi,
+	// llamacpp, cpu_native, openai_compat). Provider backends returned above.
 
 	// ── Promote loading_model/waiting_ready → ready on first successful health check ────
 	// Covers both deployment paths:
@@ -298,7 +340,6 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 		zap.Int("latency_ms", result.LatencyMs),
 	)
 }
-
 func (w *Watcher) persistHealthResult(ctx context.Context, epID string, h EndpointHealth) {
 	isHealthy := h.Status == StatusHealthy
 

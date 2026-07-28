@@ -43,6 +43,19 @@ type Event struct {
 	ProjectName           *string `json:"project_name,omitempty"            db:"project_name"`
 	ProjectPriority       *string `json:"project_priority,omitempty"        db:"project_priority"`
 	ProjectPriorityWeight *int    `json:"project_priority_weight,omitempty" db:"project_priority_weight"`
+
+	// Provider-specific fields (added by migration 045).
+	// All nullable — zero values are used for local/self-hosted models.
+	// CachedTokens     — tokens served from provider-side prompt cache (lower cost).
+	// ReasoningTokens  — internal reasoning tokens (o-series, Claude extended thinking).
+	// ProviderName     — BackendType string (e.g. "openai_provider"). Empty for local.
+	// ProviderRequestID — provider's own request/trace ID for cross-referencing invoices.
+	// CostCurrency     — always "USD"; retained for future multi-currency support.
+	CachedTokens      int    `json:"cached_tokens"       db:"cached_tokens"`
+	ReasoningTokens   int    `json:"reasoning_tokens"    db:"reasoning_tokens"`
+	ProviderName      string `json:"provider_name"       db:"provider_name"`
+	ProviderRequestID string `json:"provider_request_id" db:"provider_request_id"`
+	CostCurrency      string `json:"cost_currency"       db:"cost_currency"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,19 +74,21 @@ type Tracker struct {
 	rdb *redis.Client
 	log *zap.Logger
 
-	// Cost per 1M tokens (configurable per model in production)
-	inputCostPer1M  float64
-	outputCostPer1M float64
+	// Fallback cost rates used when no model_cost_config row exists.
+	// Override via NewTrackerWithDefaults for environments without migration 045.
+	defaultInputCostPer1M  float64
+	defaultOutputCostPer1M float64
 }
 
-// NewTracker constructs a Tracker.
+// NewTracker constructs a Tracker with conservative default cost rates.
+// Per-model costs from model_cost_config always take precedence at record time.
 func NewTracker(db *sqlx.DB, rdb *redis.Client, log *zap.Logger) *Tracker {
 	return &Tracker{
-		db:              db,
-		rdb:             rdb,
-		log:             log,
-		inputCostPer1M:  0.50, // $0.50 / 1M input tokens (example)
-		outputCostPer1M: 1.50, // $1.50 / 1M output tokens
+		db:                     db,
+		rdb:                    rdb,
+		log:                    log,
+		defaultInputCostPer1M:  0.50, // $0.50 / 1M input tokens (fallback)
+		defaultOutputCostPer1M: 1.50, // $1.50 / 1M output tokens (fallback)
 	}
 }
 
@@ -85,8 +100,19 @@ func (t *Tracker) Record(ctx context.Context, e Event) {
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now()
 	}
+	if e.CostCurrency == "" {
+		e.CostCurrency = "USD"
+	}
 	e.TotalTokens = e.PromptTokens + e.CompletionTokens
-	e.CostUSD = t.computeCost(e.PromptTokens, e.CompletionTokens)
+
+	// Compute cost using per-model rates from model_cost_config (migration 045).
+	// Falls back to flat default rates when no config exists (local models, or
+	// pre-045 deployments). CostUSD may be pre-set by the caller (e.g. when
+	// the provider returns a usage.cost field) — respect that.
+	if e.CostUSD == 0 {
+		e.CostUSD = t.computeCostForModel(ctx, e.ModelID,
+			e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.ReasoningTokens)
+	}
 
 	data, err := json.Marshal(e)
 	if err != nil {
@@ -158,6 +184,12 @@ func (t *Tracker) persist(ctx context.Context, e Event) {
 	apiKeyID := nilIfEmpty(e.APIKeyID)
 	modelID := nilIfEmpty(e.ModelID)
 	endpointID := nilIfEmpty(e.EndpointID)
+	providerName := nilIfEmpty(e.ProviderName)
+	providerRequestID := nilIfEmpty(e.ProviderRequestID)
+	currency := e.CostCurrency
+	if currency == "" {
+		currency = "USD"
+	}
 
 	_, err := t.db.ExecContext(ctx, `
 		INSERT INTO usage_events
@@ -165,13 +197,16 @@ func (t *Tracker) persist(ctx context.Context, e Event) {
 		   request_id, prompt_tokens, completion_tokens, total_tokens,
 		   latency_ms, ttft_ms, queue_wait_ms, status, error_code, cost_usd,
 		   gpu_time_ms, created_at, project_id, project_name, project_priority,
-		   project_priority_weight)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		   project_priority_weight,
+		   cached_tokens, reasoning_tokens, provider_name, provider_request_id, cost_currency)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+		        $24,$25,$26,$27,$28)`,
 		e.ID, e.OrgID, e.TeamID, apiKeyID, modelID, e.ModelName, endpointID,
 		e.RequestID, e.PromptTokens, e.CompletionTokens, e.TotalTokens,
 		e.LatencyMs, e.TTFTMs, e.QueueWaitMs, e.Status, e.ErrorCode, e.CostUSD,
 		e.GPUTimeMs, e.CreatedAt, e.ProjectID, e.ProjectName, e.ProjectPriority,
 		e.ProjectPriorityWeight,
+		e.CachedTokens, e.ReasoningTokens, providerName, providerRequestID, currency,
 	)
 	if err != nil {
 		t.log.Error("usage persist error", zap.Error(err), zap.String("event_id", e.ID))
@@ -509,7 +544,59 @@ func (t *Tracker) GetTeamRealtimeUsage(ctx context.Context, teamID, from, to str
 	return rows, err
 }
 
-func (t *Tracker) computeCost(promptTokens, completionTokens int) float64 {
-	return float64(promptTokens)/1_000_000*t.inputCostPer1M +
-		float64(completionTokens)/1_000_000*t.outputCostPer1M
+// computeCostForModel looks up the active cost config for the model from the
+// model_cost_config table (migration 045) and returns the total cost in USD.
+// When no config row exists (local model, or pre-045 deployment) it falls back
+// to the Tracker's default per-1M-token rates.
+//
+// Token priority for cost:
+//   cachedTokens   → cached_input_cost_per_1m  (lower rate, provider discount)
+//   reasoningTokens → reasoning_cost_per_1m     (may differ from output rate)
+//   promptTokens   → input_cost_per_1m          (remaining input tokens)
+//   completionTokens → output_cost_per_1m
+func (t *Tracker) computeCostForModel(ctx context.Context, modelID string, prompt, completion, cached, reasoning int) float64 {
+	if modelID == "" {
+		return t.computeCostDefault(prompt, completion)
+	}
+
+	type costRow struct {
+		InputPer1M    float64 `db:"input_cost_per_1m"`
+		OutputPer1M   float64 `db:"output_cost_per_1m"`
+		CachedPer1M   float64 `db:"cached_input_cost_per_1m"`
+		ReasonPer1M   float64 `db:"reasoning_cost_per_1m"`
+		PerRequest    float64 `db:"per_request_cost_usd"`
+	}
+	var row costRow
+	err := t.db.GetContext(ctx, &row, `
+		SELECT input_cost_per_1m, output_cost_per_1m,
+		       cached_input_cost_per_1m, reasoning_cost_per_1m,
+		       per_request_cost_usd
+		FROM model_cost_config
+		WHERE model_id = $1::uuid
+		  AND effective_from <= NOW()
+		  AND (effective_until IS NULL OR effective_until > NOW())
+		ORDER BY effective_from DESC
+		LIMIT 1`, modelID)
+	if err != nil {
+		// No cost config — fall back to defaults (local models, unconfigured providers).
+		return t.computeCostDefault(prompt, completion)
+	}
+
+	cost := row.PerRequest
+	cost += float64(cached) / 1_000_000 * row.CachedPer1M
+	cost += float64(reasoning) / 1_000_000 * row.ReasonPer1M
+	// Remaining input tokens (non-cached) at full input rate.
+	nonCachedInput := prompt - cached
+	if nonCachedInput < 0 {
+		nonCachedInput = 0
+	}
+	cost += float64(nonCachedInput) / 1_000_000 * row.InputPer1M
+	cost += float64(completion) / 1_000_000 * row.OutputPer1M
+	return cost
+}
+
+// computeCostDefault uses the Tracker's flat fallback rates.
+func (t *Tracker) computeCostDefault(promptTokens, completionTokens int) float64 {
+	return float64(promptTokens)/1_000_000*t.defaultInputCostPer1M +
+		float64(completionTokens)/1_000_000*t.defaultOutputCostPer1M
 }

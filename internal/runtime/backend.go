@@ -19,10 +19,72 @@ import (
 type BackendType string
 
 const (
+	// ── Local / self-hosted backends ──────────────────────────────────────
+	// Note: BackendLlamaCpp and BackendCPUNative are declared in their own files.
 	BackendVLLM         BackendType = "vllm"
 	BackendTGI          BackendType = "tgi"
 	BackendOpenAICompat BackendType = "openai_compat"
+	// BackendTEI is declared in tei.go.
+
+	// ── External / cloud provider backends ────────────────────────────────
+	// These implement the same Backend interface.
+	// Lifecycle methods (ContainerPort, ContainerPortEnvVars, PrepareStartupArgs)
+	// are all no-ops. The gateway never starts, stops, or schedules these.
+	// Everything flows through the single model registry and policy engine.
+
+	// BackendOpenAI routes to api.openai.com.
+	// Wire format: OpenAI Chat Completions API (native).
+	BackendOpenAI BackendType = "openai_provider"
+
+	// BackendAnthropic routes to api.anthropic.com.
+	// Wire format: Anthropic Messages API → translated to OpenAI response format.
+	BackendAnthropic BackendType = "anthropic_provider"
+
+	// BackendGemini routes to generativelanguage.googleapis.com.
+	// Wire format: Gemini API (OpenAI-compat endpoint at /v1beta/openai/).
+	BackendGemini BackendType = "google_provider"
+
+	// BackendAzureOpenAI routes to <resource>.openai.azure.com.
+	// Wire format: Azure OpenAI REST API with api-version query param.
+	BackendAzureOpenAI BackendType = "azure_openai_provider"
+
+	// BackendOpenRouter routes to openrouter.ai.
+	// Wire format: OpenAI-compatible (OpenRouter is a proxy/aggregator).
+	BackendOpenRouter BackendType = "openrouter_provider"
+
+	// BackendGroq routes to api.groq.com.
+	// Wire format: OpenAI-compatible.
+	BackendGroq BackendType = "groq_provider"
+
+	// BackendTogether routes to api.together.xyz.
+	// Wire format: OpenAI-compatible.
+	BackendTogether BackendType = "together_provider"
+
+	// BackendMistral routes to api.mistral.ai.
+	// Wire format: OpenAI-compatible.
+	BackendMistral BackendType = "mistral_provider"
+
+	// BackendCohere routes to api.cohere.com.
+	// Wire format: OpenAI-compatible (/v2/chat → chat/completions alias).
+	BackendCohere BackendType = "cohere_provider"
+
+	// BackendDeepSeek routes to api.deepseek.com.
+	// Wire format: OpenAI-compatible.
+	BackendDeepSeek BackendType = "deepseek_provider"
 )
+
+// IsProviderBackend reports whether a BackendType is an external cloud provider.
+// Provider backends skip all lifecycle operations (EnsureRunning, scheduler,
+// container management). They are always considered "running".
+func IsProviderBackend(t BackendType) bool {
+	switch t {
+	case BackendOpenAI, BackendAnthropic, BackendGemini, BackendAzureOpenAI,
+		BackendOpenRouter, BackendGroq, BackendTogether, BackendMistral,
+		BackendCohere, BackendDeepSeek:
+		return true
+	}
+	return false
+}
 
 // EndpointHealth represents the health state of a single backend endpoint.
 type EndpointHealth struct {

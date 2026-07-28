@@ -51,6 +51,13 @@ export interface Model {
   supports_thinking: boolean
   thinking_enabled: boolean
   min_thinking_tokens: number
+  // Provider / external model fields (migration 044).
+  // All undefined for local self-hosted models.
+  provider_is_external?: boolean
+  provider_name?: string          // e.g. "openai_provider"
+  upstream_base_url?: string
+  upstream_model_name?: string
+  upstream_api_key_set?: boolean  // true = key stored, never the key itself
 }
 
 export interface RuntimeRequirements {
@@ -547,6 +554,31 @@ export const api = {
       req<{ model_id: string; endpoint_id: string; started: boolean; note?: string; task_id?: string }>('POST', '/models/deploy', b),
     register: (b: RegisterModelInput) =>
       req<{ model_id: string; endpoint_id: string }>('POST', '/models', b),
+    registerExternal: (b: {
+      name: string
+      display_name: string
+      provider_backend_type: string
+      service_type?: string
+      max_context?: number
+      max_output?: number
+      upstream_api_key?: string
+      upstream_base_url?: string
+      upstream_model_name?: string
+      upstream_proxy?: string
+      provider_api_version?: string
+      provider_timeout_seconds?: number
+      provider_max_retries?: number
+      provider_extra_headers?: Record<string, string>
+      capabilities?: string[]
+      tags?: string[]
+    }) => req<{
+      model_id: string; endpoint_id: string
+      provider_backend_type: string
+      upstream_base_url: string
+      upstream_api_key_set: boolean
+      capabilities: string
+      status: string; note: string
+    }>('POST', '/models/external', b),
     health: (id: string) =>
       req<{ model_id: string; endpoints: Endpoint[] }>('GET', `/models/${id}/health`),
     resetHealth: (id: string, epId?: string) =>
