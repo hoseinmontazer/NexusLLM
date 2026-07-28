@@ -305,7 +305,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	}
 
 	// ── 3. Deploy the runtime ─────────────────────────────────────────────────
-	canDeploy := input.BackendType == "vllm" || input.BackendType == "ollama" ||
+	canDeploy := input.BackendType == "vllm" ||
 		input.BackendType == "tgi" || input.BackendType == "llamacpp" || input.BackendType == "cpu_native"
 	shouldStart := startNow && canDeploy && input.Image != ""
 
@@ -598,7 +598,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			if shouldStart && containerID != "" {
 				return "loading"
 			}
-			if input.BackendType == "ollama" || input.BackendType == "openai_compat" {
+			if input.BackendType == "openai_compat" {
 				return "active"
 			}
 			return "registered"
@@ -606,9 +606,6 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		"note": func() string {
 			if shouldStart && containerID != "" {
 				return ""
-			}
-			if input.BackendType == "ollama" && !shouldStart {
-				return fmt.Sprintf("Ollama backend registered as external. Make sure Ollama is running on %s:%d", input.Host, input.Port)
 			}
 			if !shouldStart {
 				return "Model registered. Use POST /admin/v1/models/:id/start?endpoint_id=" + epID + " to start the container."
@@ -1247,100 +1244,6 @@ func (h *RuntimeHandler) ResetHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":           "health state reset — watcher will re-check on next tick",
 		"endpoints_updated": rows,
-	})
-}
-
-// ImportOllamaModels handles POST /admin/v1/models/import-ollama
-// Queries a running Ollama instance and bulk-registers all models it has loaded.
-// Already-registered models (by name) are skipped — safe to call repeatedly.
-func (h *RuntimeHandler) ImportOllamaModels(c *gin.Context) {
-	var input struct {
-		Host string `json:"host"` // default: localhost
-		Port int    `json:"port"` // default: 11434
-	}
-	_ = c.ShouldBindJSON(&input)
-	if input.Host == "" {
-		input.Host = "localhost"
-	}
-	if input.Port == 0 {
-		input.Port = 11434
-	}
-
-	// Query /api/tags from the running Ollama instance
-	ollamaURL := fmt.Sprintf("http://%s:%d/api/tags", input.Host, input.Port)
-	resp, err := http.Get(ollamaURL) //nolint:gosec // internal admin call
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": fmt.Sprintf("could not reach Ollama at %s:%d — is it running? (%s)",
-				input.Host, input.Port, err.Error()),
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	var payload struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to parse Ollama response: " + err.Error()})
-		return
-	}
-
-	type result struct {
-		Name    string `json:"name"`
-		Status  string `json:"status"`
-		ModelID string `json:"model_id,omitempty"`
-	}
-	var results []result
-
-	for _, m := range payload.Models {
-		// Skip if already registered
-		var existingID string
-		err := h.db.QueryRowContext(c.Request.Context(),
-			`SELECT id FROM models WHERE name = $1`, m.Name).Scan(&existingID)
-		if err == nil {
-			results = append(results, result{Name: m.Name, Status: "already_registered", ModelID: existingID})
-			continue
-		}
-
-		// Register the model
-		mID := uuid.New().String()
-		_, err = h.db.ExecContext(c.Request.Context(), `
-			INSERT INTO models
-			  (id, name, display_name, provider, backend_type, service_type,
-			   max_context, max_output, enabled, tags)
-			VALUES ($1,$2,$3,'local','ollama','CHAT',8192,4096,TRUE,'[]')`,
-			mID, m.Name, m.Name,
-		)
-		if err != nil {
-			results = append(results, result{Name: m.Name, Status: "error: " + err.Error()})
-			continue
-		}
-
-		_, _ = h.db.ExecContext(c.Request.Context(),
-			`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
-			uuid.New().String(), mID)
-
-		epID := uuid.New().String()
-		_, _ = h.db.ExecContext(c.Request.Context(), `
-			INSERT INTO model_endpoints
-			  (id, model_id, host, port, base_path, weight, priority,
-			   health_status, is_enabled, lifecycle_state, runtime_image)
-			VALUES ($1,$2,$3,$4,'/v1',100,1,'unknown',TRUE,'active','ollama/ollama:latest')`,
-			epID, mID, input.Host, input.Port,
-		)
-
-		results = append(results, result{Name: m.Name, Status: "registered", ModelID: mID})
-	}
-
-	_ = h.registry.Reload(c.Request.Context())
-	c.JSON(http.StatusOK, gin.H{
-		"host":    input.Host,
-		"port":    input.Port,
-		"results": results,
-		"total":   len(results),
 	})
 }
 

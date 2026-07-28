@@ -63,7 +63,7 @@ curl -X PUT http://localhost:8081/admin/v1/teams/TEAM_ID/policy \
 
 **Fix:**
 1. Check model health: `curl http://localhost:8081/admin/v1/models/MODEL_ID/health`
-2. Is the backend running? For Ollama: `ollama list && curl http://localhost:11434/`
+2. Is the backend running? `curl http://localhost:PORT/health`
 3. Reset health state: `curl -X POST http://localhost:8081/admin/v1/models/MODEL_ID/reset-health`
 4. Wait 5–10 seconds for the watcher to re-check
 
@@ -96,7 +96,7 @@ curl -X PUT http://localhost:8081/admin/v1/teams/TEAM_ID/policy \
 
 **Error:** `could not select device driver "" with capabilities: [[gpu]]`
 
-**Fix for dev machines:** Use Ollama instead. vLLM requires a physical NVIDIA GPU.
+**Fix for dev machines:** Use llama.cpp with `execution_mode: cpu` instead. vLLM requires a physical NVIDIA GPU.
 
 **Fix for GPU servers:**
 ```bash
@@ -135,20 +135,6 @@ Look for `Loading model weights...` or download progress.
 ```json
 {"hf_token": "hf_YOUR_TOKEN"}
 ```
-
----
-
-### Ollama model not found after `import-ollama`
-
-**Cause:** Ollama is running but the model hasn't been pulled yet.
-
-**Fix:**
-```bash
-ollama pull gemma2:2b
-ollama list    # verify it's there
-```
-
-Then retry import.
 
 ---
 
@@ -254,12 +240,7 @@ Check if the Next.js dev server is proxying correctly — open browser DevTools 
 
 ### Import from Ollama returns empty results
 
-```bash
-# Test Ollama directly
-curl http://localhost:11434/api/tags
-```
-
-If this returns an error, Ollama isn't running. Start it with `ollama serve`.
+This endpoint no longer exists. Use **Deploy Model** in the web UI or `POST /admin/v1/models/deploy` to add models via Docker.
 
 ---
 
@@ -276,9 +257,4 @@ echo ""
 echo "=== Models ==="
 curl -s http://localhost:8081/admin/v1/models | python3 -c \
   "import sys,json; [print(f'  {m[\"name\"]:30} {m[\"backend_type\"]:15} {m[\"healthy_count\"]}/{m[\"endpoint_count\"]} healthy') for m in json.load(sys.stdin)['data']]"
-
-echo ""
-echo "=== Ollama ==="
-curl -s http://localhost:11434/ && echo " Running"
-ollama list 2>/dev/null || echo " Not available"
 ```

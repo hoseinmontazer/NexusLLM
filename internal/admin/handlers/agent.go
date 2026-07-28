@@ -802,7 +802,6 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 	// Also write to the typed node_capabilities table
 	docker, _ := caps["docker"].(bool)
 	vllm, _ := caps["vllm"].(bool)
-	ollama, _ := caps["ollama"].(bool)
 	tgi, _ := caps["tgi"].(bool)
 	whisper, _ := caps["whisper"].(bool)
 	tts, _ := caps["tts"].(bool)
@@ -821,9 +820,6 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 		var backends []string
 		if vllm {
 			backends = append(backends, `"vllm"`)
-		}
-		if ollama {
-			backends = append(backends, `"ollama"`)
 		}
 		if tgi {
 			backends = append(backends, `"tgi"`)
@@ -851,15 +847,15 @@ func (h *AgentHandler) upsertCapabilities(ctx context.Context, nodeID string, ca
 		  (node_id, has_docker, has_vllm, has_ollama, has_tgi,
 		   has_whisper, has_tts, has_embedding, has_gpu, gpu_count,
 		   gpu_available, gpu_vram_mb, supported_backends, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,NOW())
+		VALUES ($1,$2,$3,FALSE,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,NOW())
 		ON CONFLICT (node_id) DO UPDATE SET
-		  has_docker=$2, has_vllm=$3, has_ollama=$4, has_tgi=$5,
-		  has_whisper=$6, has_tts=$7, has_embedding=$8,
-		  has_gpu=$9, gpu_count=$10,
-		  gpu_available=$11, gpu_vram_mb=$12,
-		  supported_backends=$13::jsonb,
+		  has_docker=$2, has_vllm=$3, has_ollama=FALSE, has_tgi=$4,
+		  has_whisper=$5, has_tts=$6, has_embedding=$7,
+		  has_gpu=$8, gpu_count=$9,
+		  gpu_available=$10, gpu_vram_mb=$11,
+		  supported_backends=$11::jsonb,
 		  updated_at=NOW()`,
-		nodeID, docker, vllm, ollama, tgi, whisper, tts, embedding, hasGPU, gpuCount,
+		nodeID, docker, vllm, tgi, whisper, tts, embedding, hasGPU, gpuCount,
 		hasGPU, // gpu_available mirrors has_gpu
 		func() int64 {
 			if v, ok := caps["gpu_vram_mb"].(float64); ok {

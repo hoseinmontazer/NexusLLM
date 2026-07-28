@@ -59,7 +59,7 @@ export interface RuntimeRequirements {
   required_vram_mb: number; gpu_count: number
   required_cpu: number; required_memory_mb: number
   requires_docker: boolean; requires_gpu: boolean
-  requires_vllm: boolean; requires_ollama: boolean
+  requires_vllm: boolean
   requires_tts: boolean; requires_whisper: boolean
   priority: string
   updated_at: string

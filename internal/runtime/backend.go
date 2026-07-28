@@ -20,7 +20,6 @@ type BackendType string
 
 const (
 	BackendVLLM         BackendType = "vllm"
-	BackendOllama       BackendType = "ollama"
 	BackendTGI          BackendType = "tgi"
 	BackendOpenAICompat BackendType = "openai_compat"
 )
@@ -116,6 +115,39 @@ type Backend interface {
 	// caps holds model-level flags declared in the models table. Adapters
 	// that have no startup customisation should return extraArgs unchanged.
 	PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string
+
+	// ContainerPort returns the TCP port the backend process listens on
+	// inside the container by default, before any env-var override.
+	//
+	// This is the container-internal port — it is NOT the host port.
+	// The executor maps host_port → container_port via docker -p or by
+	// injecting the env vars returned by ContainerPortEnvVars so the
+	// process binds to the allocated host port instead.
+	//
+	// Backends that bind to a fixed well-known port that use
+	// docker -p host:container mapping return 0 — no fixed default.
+	ContainerPort() int
+
+	// ContainerPortEnvVars returns the environment variables that configure
+	// the backend process to listen on the given port inside the container.
+	//
+	// The RuntimeManager merges these into the START_MODEL task payload's
+	// Env map so the node agent passes them to `docker run -e`. When
+	// BindPort is pre-allocated at control-plane time these are injected
+	// before dispatch. When the agent allocates the port at runtime it
+	// re-applies the same env vars after port selection using the mirror
+	// table in executor.go (backendPortEnvVars).
+	//
+	// Rules for implementors:
+	//   - Return every env var the backend server reads to set its listen
+	//     port. Never rely on callers knowing which vars to set.
+	//   - Do NOT include generic vars like PORT unless the backend actually
+	//     reads PORT at startup.
+	//   - Backends that use CMD-line flags for port (llamacpp, vllm, tgi)
+	//     may return nil here; their port is passed via ExtraArgs instead.
+	//   - Backends with a fixed internal port that use
+	//     docker -p host:container mapping return nil.
+	ContainerPortEnvVars(port int) map[string]string
 }
 
 // ModelStartupCaps carries model-level capability flags that backend adapters

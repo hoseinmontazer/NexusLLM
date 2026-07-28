@@ -28,7 +28,7 @@ Overview of the platform:
 - Count cards: organizations, teams, LLM models, AI services, cluster nodes, GPU nodes
 - Model status table: all models with health counts
 - Cluster nodes table: hostname, CPUs, RAM, VRAM, status
-- Quick actions: import Ollama, deploy service, simulate placement, create team
+- Quick actions: deploy service, simulate placement, create team
 
 ### Organizations (`/orgs`)
 
@@ -54,19 +54,15 @@ Overview of the platform:
 
 Three ways to add models:
 
-**Import from Ollama** (button in top bar):
-- Queries local Ollama at `localhost:11434`
-- Registers all available models in one click
-- Already-registered models are skipped
-
-**Register External** (button):
-- For already-running models (Ollama, TGI, vLLM, any API)
-- Just needs: name, backend type, host, port
-
-**Deploy vLLM Model** (button):
-- Full vLLM deployment form
-- GPU devices, tensor parallel, memory util, HF token
+**Deploy Model** (button in top bar):
+- Full deployment form with wizard steps
+- Supports: llamacpp (CPU/GPU), vLLM (GPU), TGI, openai_compat, cpu_native
+- GPU devices, tensor parallel, memory util, HF token, execution mode
 - NexusLLM manages the Docker container lifecycle
+
+**Register Cloud/External** (button):
+- For already-running models (TGI, vLLM, any remote API)
+- Just needs: name, backend type, host, port, optional API key
 
 Per-model actions:
 - **Health** → shows endpoint health table with latency, failures, last check time
@@ -129,7 +125,7 @@ Per-model actions:
 ## Making the UI work with your own services
 
 The UI auto-discovers everything from the admin API. When you:
-1. Register an Ollama model → it appears in `/models`
+1. Deploy or register a model → it appears in `/models`
 2. Grant it to a team → appears in that team's permissions
 3. Watcher marks it healthy → health badge turns green
 

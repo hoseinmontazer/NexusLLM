@@ -36,6 +36,14 @@ func NewVLLMBackend(client *http.Client) Backend {
 
 func (b *vllmBackend) Type() BackendType { return BackendVLLM }
 
+// ContainerPort returns 0 — vLLM's listen port is set via the --port CMD arg,
+// not via an environment variable.  The executor passes --port <hostPort>
+// directly in buildDockerArgs.
+func (b *vllmBackend) ContainerPort() int { return 0 }
+
+// ContainerPortEnvVars returns nil — vLLM is configured via --port CMD arg.
+func (b *vllmBackend) ContainerPortEnvVars(_ int) map[string]string { return nil }
+
 // PrepareStartupArgs — vLLM has no server-level reasoning flag; args unchanged.
 func (b *vllmBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
 	return extraArgs

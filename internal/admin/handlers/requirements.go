@@ -39,7 +39,6 @@ func (h *RequirementsHandler) UpsertRequirements(c *gin.Context) {
 		RequiresDocker    bool   `json:"requires_docker"`
 		RequiresGPU       bool   `json:"requires_gpu"`
 		RequiresVLLM      bool   `json:"requires_vllm"`
-		RequiresOllama    bool   `json:"requires_ollama"`
 		RequiresTTS       bool   `json:"requires_tts"`
 		RequiresWhisper   bool   `json:"requires_whisper"`
 		Priority          string `json:"priority"`
@@ -67,7 +66,7 @@ func (h *RequirementsHandler) UpsertRequirements(c *gin.Context) {
 		   required_cpu, required_memory_mb,
 		   requires_docker, requires_gpu, requires_vllm, requires_ollama,
 		   requires_tts, requires_whisper, priority)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,$11,$12,$13)
 		ON CONFLICT (model_id) DO UPDATE SET
 		  execution_type    = EXCLUDED.execution_type,
 		  required_vram_mb  = EXCLUDED.required_vram_mb,
@@ -77,7 +76,7 @@ func (h *RequirementsHandler) UpsertRequirements(c *gin.Context) {
 		  requires_docker   = EXCLUDED.requires_docker,
 		  requires_gpu      = EXCLUDED.requires_gpu,
 		  requires_vllm     = EXCLUDED.requires_vllm,
-		  requires_ollama   = EXCLUDED.requires_ollama,
+		  requires_ollama   = FALSE,
 		  requires_tts      = EXCLUDED.requires_tts,
 		  requires_whisper  = EXCLUDED.requires_whisper,
 		  priority          = EXCLUDED.priority,
@@ -85,7 +84,7 @@ func (h *RequirementsHandler) UpsertRequirements(c *gin.Context) {
 		uuid.New().String(), modelID,
 		input.ExecutionType, input.RequiredVRAMMB, input.GPUCount,
 		input.RequiredCPU, input.RequiredMemoryMB,
-		input.RequiresDocker, input.RequiresGPU, input.RequiresVLLM, input.RequiresOllama,
+		input.RequiresDocker, input.RequiresGPU, input.RequiresVLLM,
 		input.RequiresTTS, input.RequiresWhisper, input.Priority,
 	)
 	if err != nil {
@@ -109,7 +108,6 @@ func (h *RequirementsHandler) GetRequirements(c *gin.Context) {
 		RequiresDocker   bool      `db:"requires_docker"   json:"requires_docker"`
 		RequiresGPU      bool      `db:"requires_gpu"      json:"requires_gpu"`
 		RequiresVLLM     bool      `db:"requires_vllm"     json:"requires_vllm"`
-		RequiresOllama   bool      `db:"requires_ollama"   json:"requires_ollama"`
 		RequiresTTS      bool      `db:"requires_tts"      json:"requires_tts"`
 		RequiresWhisper  bool      `db:"requires_whisper"  json:"requires_whisper"`
 		Priority         string    `db:"priority"          json:"priority"`
@@ -119,7 +117,7 @@ func (h *RequirementsHandler) GetRequirements(c *gin.Context) {
 	if err := h.db.GetContext(c.Request.Context(), &req, `
 		SELECT id, model_id, execution_type, required_vram_mb, gpu_count,
 		       required_cpu, required_memory_mb,
-		       requires_docker, requires_gpu, requires_vllm, requires_ollama,
+		       requires_docker, requires_gpu, requires_vllm,
 		       requires_tts, requires_whisper, priority, updated_at
 		FROM runtime_requirements WHERE model_id = $1`, modelID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no requirements set for this model"})
@@ -149,14 +147,13 @@ func (h *RequirementsHandler) CompatibleNodes(c *gin.Context) {
 		RequiredMemoryMB int64  `db:"required_memory_mb"`
 		RequiresGPU      bool   `db:"requires_gpu"`
 		RequiresVLLM     bool   `db:"requires_vllm"`
-		RequiresOllama   bool   `db:"requires_ollama"`
 		RequiresTTS      bool   `db:"requires_tts"`
 		RequiresWhisper  bool   `db:"requires_whisper"`
 	}
 	var row reqDB
 	if err := h.db.GetContext(c.Request.Context(), &row, `
 		SELECT execution_type, required_vram_mb, required_cpu, required_memory_mb,
-		       requires_gpu, requires_vllm, requires_ollama, requires_tts, requires_whisper
+		       requires_gpu, requires_vllm, requires_tts, requires_whisper
 		FROM runtime_requirements WHERE model_id = $1`, modelID); err == nil {
 		req = modelRequirements{
 			ExecutionType:    row.ExecutionType,
@@ -165,7 +162,6 @@ func (h *RequirementsHandler) CompatibleNodes(c *gin.Context) {
 			RequiredMemoryMB: row.RequiredMemoryMB,
 			RequiresGPU:      row.RequiresGPU,
 			RequiresVLLM:     row.RequiresVLLM,
-			RequiresOllama:   row.RequiresOllama,
 			RequiresTTS:      row.RequiresTTS,
 			RequiresWhisper:  row.RequiresWhisper,
 		}
@@ -208,7 +204,6 @@ func (h *RequirementsHandler) CompatibleNodes(c *gin.Context) {
 			RequiredMemoryMB: req.RequiredMemoryMB,
 			RequiresGPU:      req.RequiresGPU,
 			RequiresVLLM:     req.RequiresVLLM,
-			RequiresOllama:   req.RequiresOllama,
 			RequiresTTS:      req.RequiresTTS,
 			RequiresWhisper:  req.RequiresWhisper,
 		}
@@ -235,12 +230,11 @@ func (h *RequirementsHandler) CompatibleNodes(c *gin.Context) {
 }
 
 type capRow struct {
-	HasGPU      bool `db:"has_gpu"`
-	HasVLLM     bool `db:"has_vllm"`
-	HasOllama   bool `db:"has_ollama"`
-	HasTTS      bool `db:"has_tts"`
-	HasWhisper  bool `db:"has_whisper"`
-	GPUCount    int  `db:"gpu_count"`
+	HasGPU     bool `db:"has_gpu"`
+	HasVLLM    bool `db:"has_vllm"`
+	HasTTS     bool `db:"has_tts"`
+	HasWhisper bool `db:"has_whisper"`
+	GPUCount   int  `db:"gpu_count"`
 }
 
 type nodeCompat struct {
@@ -262,7 +256,6 @@ type modelRequirements struct {
 	RequiredMemoryMB int64
 	RequiresGPU      bool
 	RequiresVLLM     bool
-	RequiresOllama   bool
 	RequiresTTS      bool
 	RequiresWhisper  bool
 }
@@ -270,7 +263,7 @@ type modelRequirements struct {
 func (h *RequirementsHandler) loadCapabilities(ctx context.Context, nodeID string) capRow {
 	var cap capRow
 	_ = h.db.GetContext(ctx, &cap, `
-		SELECT has_gpu, has_vllm, has_ollama, has_tts, has_whisper, gpu_count
+		SELECT has_gpu, has_vllm, has_tts, has_whisper, gpu_count
 		FROM node_capabilities WHERE node_id = $1`, nodeID)
 	return cap
 }
@@ -294,9 +287,6 @@ func checkCompatibility(req modelRequirements, node nodeCompat, cap capRow) (boo
 	}
 	if req.RequiresVLLM && !cap.HasVLLM {
 		return false, "vllm not available on node"
-	}
-	if req.RequiresOllama && !cap.HasOllama {
-		return false, "ollama not available on node"
 	}
 	if req.RequiresTTS && !cap.HasTTS {
 		return false, "tts not available on node"

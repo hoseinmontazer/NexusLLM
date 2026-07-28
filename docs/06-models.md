@@ -6,41 +6,9 @@ This page covers CHAT models (LLMs). For other service types (embeddings, STT, T
 
 ## Three ways to add a model
 
-### 1. Import from Ollama (easiest)
+### 1. Register an external model (already running)
 
-If you have Ollama running locally with models already pulled, import them all at once:
-
-```bash
-curl -X POST http://localhost:8081/admin/v1/models/import-ollama \
-  -H "Content-Type: application/json" \
-  -d '{"host": "localhost", "port": 11434}'
-```
-
-Response:
-```json
-{
-  "results": [
-    {"name": "gemma2:2b",         "status": "registered", "model_id": "uuid-..."},
-    {"name": "phi3:mini",         "status": "registered", "model_id": "uuid-..."},
-    {"name": "qwen2.5-coder:7b",  "status": "already_registered"}
-  ]
-}
-```
-
-Or use the web UI: **Models → Import from Ollama**.
-
-After import, grant the model to a team:
-```bash
-curl -X POST http://localhost:8081/admin/v1/teams/TEAM_ID/models \
-  -H "Content-Type: application/json" \
-  -d '{"model_name": "gemma2:2b"}'
-```
-
----
-
-### 2. Register an external model (already running)
-
-Use this for any model that's already running somewhere (Ollama, TGI, an existing vLLM instance, a remote API):
+Use this for any model that's already running somewhere (TGI, an existing vLLM instance, a remote API):
 
 ```bash
 curl -X POST http://localhost:8081/admin/v1/models \
@@ -48,9 +16,9 @@ curl -X POST http://localhost:8081/admin/v1/models \
   -d '{
     "name":         "my-llm",
     "display_name": "My LLM",
-    "backend_type": "ollama",
+    "backend_type": "openai_compat",
     "host":         "localhost",
-    "port":         11434
+    "port":         8000
   }'
 ```
 
@@ -58,16 +26,17 @@ Supported `backend_type` values:
 
 | Value | Description |
 |---|---|
-| `ollama` | Ollama server — health via `GET /`, models via `/api/tags` |
 | `vllm` | vLLM server — health via `GET /health` + `/metrics` scrape |
 | `tgi` | HuggingFace TGI — health via `GET /health` |
+| `llamacpp` | llama.cpp server — health via `GET /health` |
+| `cpu_native` | CPU AI services (faster-whisper, Kokoro, Infinity) — health via `GET /health` |
 | `openai_compat` | Any OpenAI-compatible API — health via `GET /v1/models` |
 
 ---
 
-### 3. Deploy vLLM via Docker (NexusLLM manages the container)
+### 2. Deploy via Docker (NexusLLM manages the container)
 
-**Requires:** NVIDIA GPU + Docker + `nvidia-container-toolkit`.
+#### vLLM — requires NVIDIA GPU + nvidia-container-toolkit
 
 ```bash
 curl -X POST http://localhost:8081/admin/v1/models/deploy \
@@ -79,7 +48,7 @@ curl -X POST http://localhost:8081/admin/v1/models/deploy \
     "image":           "vllm/vllm-openai:v0.4.3",
     "hf_model_id":     "meta-llama/Meta-Llama-3-8B-Instruct",
     "host":            "localhost",
-    "port":            8000,
+    "port":            0,
     "gpu_devices":     [0],
     "tensor_parallel": 1,
     "gpu_memory_util": 0.90,
@@ -87,6 +56,25 @@ curl -X POST http://localhost:8081/admin/v1/models/deploy \
     "dtype":           "bfloat16",
     "hf_token":        "hf_...",
     "start_now":       true
+  }'
+```
+
+#### llama.cpp — CPU or GPU, no special runtime required
+
+```bash
+curl -X POST http://localhost:8081/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":           "gemma2-2b",
+    "display_name":   "Gemma 2 2B",
+    "backend_type":   "llamacpp",
+    "image":          "ghcr.io/ggml-org/llama.cpp:server",
+    "hf_repo":        "bartowski/gemma-2-2b-it-GGUF",
+    "hf_file":        "gemma-2-2b-it-Q4_K_M.gguf",
+    "host":           "localhost",
+    "port":           0,
+    "execution_mode": "cpu",
+    "start_now":      true
   }'
 ```
 
@@ -104,7 +92,7 @@ curl -X POST http://localhost:8081/admin/v1/models/deploy \
     "image":        "vllm/vllm-openai:latest",
     "hf_model_id":  "Qwen/Qwen3-32B-Instruct",
     "host":         "localhost",
-    "port":         8010,
+    "port":         0,
     "auto_place":   true,
     "min_vram_mb":  65536,
     "max_vram_mb":  122880,
@@ -117,7 +105,6 @@ The engine scores available GPUs by free VRAM, utilization, temperature, and NUM
 
 #### Multi-GPU (tensor parallel)
 
-For models that need multiple GPUs:
 ```json
 {
   "gpu_devices":     [0, 1],
@@ -128,9 +115,27 @@ For models that need multiple GPUs:
 
 ---
 
-## Model lifecycle states
+### 3. Register a cloud / external API
 
-After deployment, a model's endpoint goes through these states:
+For OpenAI, Anthropic, Google, or any hosted API — use the **Register Cloud/External** button in the web UI, or:
+
+```bash
+curl -X POST http://localhost:8081/admin/v1/models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":               "gpt-4o",
+    "display_name":       "GPT-4o",
+    "backend_type":       "openai_compat",
+    "host":               "cloud",
+    "port":               443,
+    "upstream_api_key":   "sk-...",
+    "upstream_base_url":  "https://api.openai.com"
+  }'
+```
+
+---
+
+## Model lifecycle states
 
 ```
 registered → downloading → loading → active/warm → idle → unloaded
@@ -142,10 +147,10 @@ registered → downloading → loading → active/warm → idle → unloaded
 |---|---|
 | `registered` | Recorded in DB, container not started |
 | `downloading` | Container starting, pulling weights |
-| `loading` | Container running, model loading into VRAM |
+| `loading` | Container running, model loading into VRAM/RAM |
 | `active` | Ready to serve requests |
 | `warm` | Ready but lower traffic recently |
-| `idle` | No requests for >30 min (gateway), may be evicted |
+| `idle` | No requests for >idle timeout, may be evicted |
 | `unloaded` | Container stopped |
 | `failed` | Container crashed or health checks all failed |
 | `draining` | Accepting no new requests, finishing in-flight |
@@ -168,13 +173,9 @@ curl http://localhost:8081/admin/v1/models/MODEL_ID/health
 
 ### Reset a failed endpoint
 
-If an endpoint is stuck in `failed` or `unknown` state (e.g., after restarting the service):
-
 ```bash
 curl -X POST http://localhost:8081/admin/v1/models/MODEL_ID/reset-health
 ```
-
-This sets `health_status='unknown'`, `lifecycle_state='active'`, `consecutive_failures=0` — the watcher will re-evaluate within 5 seconds.
 
 ### Enable / disable
 
@@ -183,12 +184,9 @@ curl -X POST http://localhost:8081/admin/v1/models/MODEL_ID/enable
 curl -X POST http://localhost:8081/admin/v1/models/MODEL_ID/disable
 ```
 
-Disabled models are removed from routing immediately. Existing in-flight requests are not affected.
-
 ### Start / stop / restart (Docker-managed only)
 
 ```bash
-# endpoint_id is from the health check response
 curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/start?endpoint_id=EP_ID"
 curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/stop?endpoint_id=EP_ID"
 curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/restart?endpoint_id=EP_ID"
@@ -200,14 +198,6 @@ curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/restart?endpoint_id
 curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/upgrade?endpoint_id=EP_ID" \
   -H "Content-Type: application/json" \
   -d '{"image": "vllm/vllm-openai:v0.5.0"}'
-```
-
-### Rollback
-
-```bash
-curl -X POST "http://localhost:8081/admin/v1/models/MODEL_ID/rollback?endpoint_id=EP_ID" \
-  -H "Content-Type: application/json" \
-  -d '{"previous_image": "vllm/vllm-openai:v0.4.3"}'
 ```
 
 ### View container logs
@@ -249,15 +239,14 @@ The watcher hasn't checked it yet, or the gateway hasn't reloaded. Wait 5–10 s
 
 The backend isn't reachable. Check:
 1. Is the container/process running? (`docker ps`)
-2. Is the port correct? (`curl http://localhost:PORT/`)
-3. For Ollama: `ollama list` — is the model pulled?
-4. Call reset-health to clear the failed state
+2. Is the port correct? (`curl http://localhost:PORT/health`)
+3. Call reset-health to clear the failed state
 
 ### vLLM container status is `Created` but not `Up`
 
 Your machine likely has no GPU or the NVIDIA Container Runtime isn't installed. Error: `could not select device driver "" with capabilities: [[gpu]]`.
 
-Fix: Install `nvidia-container-toolkit` or use Ollama for CPU-only dev.
+Fix: Install `nvidia-container-toolkit`, or use `llamacpp` with `execution_mode: cpu` for CPU-only dev.
 
 ### `model_not_allowed` error
 

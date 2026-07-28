@@ -30,6 +30,13 @@ func NewTGIBackend(client *http.Client) Backend {
 
 func (b *tgiBackend) Type() BackendType { return BackendTGI }
 
+// ContainerPort returns 0 — TGI's listen port is set via the --port CMD arg,
+// not via an environment variable.
+func (b *tgiBackend) ContainerPort() int { return 0 }
+
+// ContainerPortEnvVars returns nil — TGI is configured via --port CMD arg.
+func (b *tgiBackend) ContainerPortEnvVars(_ int) map[string]string { return nil }
+
 // PrepareStartupArgs — TGI has no server-level reasoning flag; args unchanged.
 func (b *tgiBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string {
 	return extraArgs

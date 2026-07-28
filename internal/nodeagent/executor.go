@@ -233,6 +233,75 @@ func (e *Executor) runningContainerPort(ctx context.Context, name string) int {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Backend port helpers — executor-local mirror of Backend interface methods
+// ─────────────────────────────────────────────────────────────────────────────
+
+// backendPortEnvVars returns the environment variables each backend process
+// reads to determine its HTTP listen port.
+//
+// This function is the executor-local mirror of Backend.ContainerPortEnvVars
+// in internal/runtime. The executor cannot import that package (different
+// binary boundary — the node agent binary must stay self-contained), so this
+// is the single authoritative location for backend port env var knowledge
+// inside the agent binary.
+//
+// IMPORTANT: Keep this in sync with the backend driver implementations in
+// internal/runtime/{cpu,openai_compat,vllm,tgi,llamacpp}.go.
+// When adding a new backend, update both this function AND the corresponding
+// Backend.ContainerPortEnvVars implementation.
+//
+// Backends whose port is set via CMD arg (--port <n>) return nil because the
+// executor's buildDockerArgs already appends --port to the command.
+func backendPortEnvVars(backend string, port int) map[string]string {
+	s := strconv.Itoa(port)
+	switch backend {
+	case "cpu_native":
+		// faster-whisper-server (UVICORN_PORT), Kokoro TTS, Infinity embeddings,
+		// and most Python AI servers built on uvicorn/FastAPI read one or more
+		// of these variables. All are set to the same value so whichever the
+		// image reads, it binds to the correct port.
+		return map[string]string{
+			"PORT":         s,
+			"HTTP_PORT":    s,
+			"UVICORN_PORT": s,
+		}
+	case "openai_compat":
+		// Generic OpenAI-compatible servers — covers PORT and HTTP_PORT.
+		// UVICORN_PORT is intentionally NOT set here; use cpu_native for
+		// uvicorn-based Python backends.
+		return map[string]string{
+			"PORT":      s,
+			"HTTP_PORT": s,
+		}
+	case "vllm", "tgi", "llamacpp":
+		// Port is controlled via --port <n> CMD arg in buildDockerArgs.
+		// No env var injection needed.
+		return nil
+	default:
+		// Unknown backend — apply the safe openai_compat default so at minimum
+		// $PORT is set correctly, which most HTTP frameworks honour.
+		return map[string]string{
+			"PORT":      s,
+			"HTTP_PORT": s,
+		}
+	}
+}
+
+// backendContainerPort returns the fixed internal port a backend listens on
+// inside the container, independent of any allocation or env var override.
+//
+// This is the executor-local mirror of Backend.ContainerPort in internal/runtime.
+// Returns 0 for backends whose internal port is driven by env vars or CMD args
+// (i.e. no fixed default).
+//
+// IMPORTANT: Keep in sync with Backend.ContainerPort implementations.
+func backendContainerPort(_ string) int {
+	// All supported backends either accept their port via --port CMD arg or
+	// via the env vars injected by backendPortEnvVars — no fixed internal port.
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Task types (mirrors taskmanager — no import to keep agent binary lean)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -465,7 +534,6 @@ func firstNonEmpty(vals ...string) string {
 //   - Required fields (runtime_name, image, bind_port) are missing.
 //   - Model source validation fails.
 //   - docker run exits with an error.
-//   - Ollama model pull fails.
 func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 	var p startModelPayload
 	if err := unmarshalPayload(task.Payload, &p); err != nil {
@@ -592,13 +660,12 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 
 		// Case C — configured port is busy, scan forward.
-		// Exception: if the env map explicitly sets UVICORN_PORT (or similar
-		// server-specific port vars), the container will bind to that port
-		// regardless of what the agent checked — so honour the configured port
-		// and let the container fail if it truly can't bind.
+		// Exception: if the env map already carries any backend-specific port
+		// variable (injected by the control plane before dispatch), the container
+		// will bind to that port regardless of what the agent checked — so honour
+		// the configured port and let the container fail if it truly can't bind.
 		envPortOverride := p.Env["UVICORN_PORT"] != "" ||
 			p.Env["PORT"] != "" ||
-			p.Env["SERVER_PORT"] != "" ||
 			p.Env["HTTP_PORT"] != ""
 
 		if !isPortAvailable(p.BindPort) && !envPortOverride {
@@ -627,11 +694,24 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 	}
 
-	// Update the PORT env var after port allocation/scanning.
-	// This ensures backends that respect $PORT (faster-whisper-server, uvicorn-based
-	// services) bind to the correct dynamically-allocated port.
+	// Inject backend-specific port environment variables after port allocation.
+	//
+	// Each backend process reads different env vars to learn which port to bind:
+	//   - openai_compat, cpu_native: PORT, HTTP_PORT, UVICORN_PORT
+	//   - vllm, tgi, llamacpp: port is passed via --port CMD arg (no env var needed)
+	//
+	// backendPortEnvVars is the executor-local mirror of Backend.ContainerPortEnvVars.
+	// It must stay in sync with the backend driver implementations in internal/runtime.
+	// The executor cannot import that package (different binary boundary), so this
+	// function is the single place in the executor that knows backend port env var names.
 	if p.BindPort > 0 {
-		p.Env["PORT"] = strconv.Itoa(p.BindPort)
+		for k, v := range backendPortEnvVars(p.Backend, p.BindPort) {
+			// Only set if not already overridden by the operator-supplied Env map.
+			// Operator overrides always win — they may be pinning a specific port.
+			if p.Env[k] == "" {
+				p.Env[k] = v
+			}
+		}
 	}
 
 	// Remove any stale container with this name, then start fresh.
@@ -714,23 +794,6 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		zap.String("container_id", containerID),
 		zap.Int("port", p.BindPort),
 	)
-
-	// For Ollama: pull the model image after the daemon starts.
-	// The 8-second sleep is the minimum time for the Ollama daemon to become ready.
-	if p.Backend == "ollama" && p.ServedAs != "" {
-		time.Sleep(8 * time.Second)
-		pullOut, pullErr := exec.CommandContext(ctx, "docker", "exec", containerID,
-			"ollama", "pull", p.ServedAs).CombinedOutput()
-		if pullErr != nil {
-			return TaskResult{
-				Success:      false,
-				RuntimeID:    p.RuntimeID,
-				ContainerID:  containerID,
-				RuntimeState: "failed",
-				Error:        fmt.Sprintf("ollama pull %q: %s — %s", p.ServedAs, pullErr.Error(), string(pullOut)),
-			}
-		}
-	}
 
 	// Return "loading_model" — the control plane's waitForReady() polls /health
 	// and transitions to "ready" when all four readiness conditions are satisfied.
@@ -1033,14 +1096,6 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 	args := []string{"run", "-d", "--name", p.RuntimeName, "--restart", "unless-stopped"}
 
 	switch p.Backend {
-	case "ollama":
-		host := p.BindHost
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		args = append(args, "-p", fmt.Sprintf("%s:%d:11434", host, p.BindPort))
-		args = append(args, "-v", "ollama_models:/root/.ollama")
-
 	case "llamacpp":
 		// p.ModelsVolume is resolved to the correct volume name by ensureModelCached
 		// before buildDockerArgs is called. Fall back to "llamacpp_models" only
@@ -1269,13 +1324,6 @@ func (e *Executor) pullModel(ctx context.Context, task RemoteTask) TaskResult {
 		return TaskResult{Success: false, Error: err.Error()}
 	}
 	switch p.Backend {
-	case "ollama":
-		out, err := exec.CommandContext(ctx, "ollama", "pull", p.HFRepo).CombinedOutput()
-		if err != nil {
-			return TaskResult{Success: false,
-				Error: fmt.Sprintf("ollama pull: %s — %s", err, string(out))}
-		}
-		return TaskResult{Success: true, Data: map[string]interface{}{"pulled": p.HFRepo}}
 	case "llamacpp":
 		localPath := firstNonEmpty(p.LocalPath, "/models")
 		args := []string{"run", "--rm", "-v", localPath + ":/models"}
@@ -1309,13 +1357,6 @@ func (e *Executor) deleteModel(ctx context.Context, task RemoteTask) TaskResult 
 	}
 	if err := unmarshalPayload(task.Payload, &p); err != nil {
 		return TaskResult{Success: false, Error: err.Error()}
-	}
-	if p.Backend == "ollama" {
-		out, err := exec.CommandContext(ctx, "ollama", "rm", p.HFRepo).CombinedOutput()
-		if err != nil {
-			return TaskResult{Success: false,
-				Error: fmt.Sprintf("ollama rm: %s — %s", err, string(out))}
-		}
 	}
 	return TaskResult{Success: true}
 }

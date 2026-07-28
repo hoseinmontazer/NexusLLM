@@ -234,7 +234,6 @@ func main() {
 	// ── Models ────────────────────────────────────────────────────────────────
 	// POST /admin/v1/models/deploy  ← must come before /models/:id to avoid conflict
 	a.POST("/models/deploy", runtimeH.DeployModel)
-	a.POST("/models/import-ollama", runtimeH.ImportOllamaModels)
 	a.POST("/models", runtimeH.RegisterModel)
 	a.GET("/models", runtimeH.ListModels)
 	a.POST("/models/:id/endpoints", runtimeH.AddEndpoint)

@@ -243,7 +243,6 @@ func (a *Agent) register(ctx context.Context) (nodeID, token string, err error) 
 		// AI workload types (whisper, tts, embedding, etc.) belong to deployed
 		// models, not nodes. Nodes report hardware and runtime support only.
 		"docker":    a.hasDocker(),
-		"ollama":    a.hasOllama(),
 		"gpu":       len(gpus) > 0,
 		"gpu_count": len(gpus),
 		// Supported backend types are reported via node_capabilities.supported_backends
@@ -807,11 +806,6 @@ func gpuNUMANode(pcieID string) int {
 
 func (a *Agent) hasDocker() bool {
 	_, err := exec.LookPath("docker")
-	return err == nil
-}
-
-func (a *Agent) hasOllama() bool {
-	_, err := exec.LookPath("ollama")
 	return err == nil
 }
 

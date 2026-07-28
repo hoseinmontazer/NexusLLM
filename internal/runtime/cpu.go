@@ -12,6 +12,7 @@ package runtime
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -40,6 +41,35 @@ func NewCPUNativeBackend(client *http.Client) Backend {
 }
 
 func (b *cpuNativeBackend) Type() BackendType { return BackendCPUNative }
+
+// ContainerPort returns 0 — cpu_native services (faster-whisper-server,
+// Kokoro, Infinity, custom Python AI servers) do not share a single fixed
+// internal port.  The listen port is driven entirely by ContainerPortEnvVars.
+func (b *cpuNativeBackend) ContainerPort() int { return 0 }
+
+// ContainerPortEnvVars injects every environment variable that cpu_native
+// backend processes may read to set their HTTP listen port.
+//
+// Variables injected (all set to the same value so any framework is covered):
+//   - PORT         — generic convention (PaaS, gunicorn, hypercorn)
+//   - HTTP_PORT    — used by some custom server wrappers
+//   - UVICORN_PORT — read by faster-whisper-server and most uvicorn-based
+//                    Python AI servers (the most common cpu_native runtime)
+//
+// All three are set to the same allocated host port so whichever variable the
+// server image reads, it binds to the correct port.
+//
+// If a future backend image reads a different variable, add it here.
+// Never add these variables outside this function — backend-specific port
+// knowledge belongs only in the backend driver.
+func (b *cpuNativeBackend) ContainerPortEnvVars(port int) map[string]string {
+	s := strconv.Itoa(port)
+	return map[string]string{
+		"PORT":         s,
+		"HTTP_PORT":    s,
+		"UVICORN_PORT": s,
+	}
+}
 
 // PrepareStartupArgs — CPU-native services have no server-level reasoning
 // flags; args returned unchanged.

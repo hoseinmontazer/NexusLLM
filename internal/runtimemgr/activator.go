@@ -520,6 +520,25 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		FROM models WHERE id = $1`, cfg.ModelID,
 	).Scan(&startupCaps.SupportsThinking, &startupCaps.ThinkingEnabled)
 
+	// Build the env map: start from any operator-supplied env vars, then merge
+	// backend-specific port env vars when BindPort is already known at dispatch
+	// time.  When BindPort == 0 the agent allocates a port at runtime and injects
+	// the equivalent env vars itself (see backendPortEnvVars in executor.go).
+	//
+	// Operator-supplied env vars always win — never overwrite them.
+	payloadEnv := make(map[string]string, len(cfg.Env))
+	for k, v := range cfg.Env {
+		payloadEnv[k] = v
+	}
+	if cfg.BindPort > 0 {
+		backendInstance := a.registry.BackendForType(backend)
+		for k, v := range backendInstance.ContainerPortEnvVars(cfg.BindPort) {
+			if _, alreadySet := payloadEnv[k]; !alreadySet {
+				payloadEnv[k] = v
+			}
+		}
+	}
+
 	payload := taskmanager.StartModelPayload{
 		RuntimeID:           runtimeID,
 		ModelID:             cfg.ModelID,
@@ -550,7 +569,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		ExtraArgs:           a.registry.BackendForType(backend).PrepareStartupArgs(startupCaps, cfg.ExtraArgs),
 		ExecutionMode:       effectiveMode,
 		WorkloadPolicy:      workloadPolicy,
-		Env:                 cfg.Env,
+		Env:                 payloadEnv,
 		StaleContainerNames: staleContainerNames,
 	}
 

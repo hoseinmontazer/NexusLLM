@@ -37,6 +37,13 @@ func NewLlamaCppBackend(client *http.Client) Backend {
 
 func (b *llamacppBackend) Type() BackendType { return BackendLlamaCpp }
 
+// ContainerPort returns 0 — llama.cpp server's listen port is set via the
+// --port CMD arg, not via an environment variable.
+func (b *llamacppBackend) ContainerPort() int { return 0 }
+
+// ContainerPortEnvVars returns nil — llama.cpp is configured via --port CMD arg.
+func (b *llamacppBackend) ContainerPortEnvVars(_ int) map[string]string { return nil }
+
 func (b *llamacppBackend) Health(ctx context.Context, url string) EndpointHealth {
 	// llama.cpp exposes /health (same path as openai_compat's /v1/models check
 	// but returns HTTP 200 when the model is loaded, 503 while loading).

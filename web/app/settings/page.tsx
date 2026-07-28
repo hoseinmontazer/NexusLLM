@@ -39,7 +39,6 @@ export default function SettingsPage() {
     ['GET',    '/admin/v1/projects/:id/usage/summary',   'Project usage totals for a date range'],
     ['POST',   '/admin/v1/projects/:id/priority',        'Change project scheduling priority weight (0–1000)'],
     ['POST',   '/admin/v1/models/deploy',                'Register + auto-place + start container'],
-    ['POST',   '/admin/v1/models/import-ollama',         'Bulk-import all models from a running Ollama'],
     ['POST',   '/admin/v1/models/:id/reset-health',      'Reset failed health state (triggers re-check)'],
     ['POST',   '/admin/v1/services/deploy',              'Deploy any AI service with auto-placement'],
     ['GET',    '/admin/v1/services[?type=]',             'List all AI services by type'],
@@ -173,13 +172,10 @@ cd web && npm run dev    # :3001
 # 5. Create an API Key scoped to your project
 # → API Keys → select org → select team → select project → Create
 
-# 6. Import Ollama models (if Ollama is running)
-# → Models → Import from Ollama
+# 6. Deploy a model (CPU or GPU)
+# → Models → Deploy Model → choose backend (llamacpp for CPU, vLLM for GPU)
 
-# 7. Deploy GPU model (vLLM, requires Docker + GPU)
-# → Models → Deploy vLLM Model → set auto_place: true
-
-# 8. Send requests using your project-scoped key
+# 7. Send requests using your project-scoped key
 # Authorization: Bearer <your-api-key>
 # POST /v1/chat/completions`}</pre>
         </CardContent>

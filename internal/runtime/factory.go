@@ -29,7 +29,6 @@ func NewFactory(client *http.Client) *Factory {
 		proxyClients: make(map[string]*http.Client),
 	}
 	f.Register(BackendVLLM, NewVLLMBackend)
-	f.Register(BackendOllama, NewOllamaBackend)
 	f.Register(BackendTGI, NewTGIBackend)
 	f.Register(BackendOpenAICompat, NewOpenAICompatBackend)
 	// CPU-native services (embeddings, rerankers, STT, TTS, OCR, MCP, agents)

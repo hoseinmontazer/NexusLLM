@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -29,6 +30,30 @@ func NewOpenAICompatBackend(client *http.Client) Backend {
 }
 
 func (b *openAICompatBackend) Type() BackendType { return BackendOpenAICompat }
+
+// ContainerPort returns 0 — generic OpenAI-compatible servers have no single
+// canonical default port.  The container port is driven entirely by
+// ContainerPortEnvVars so the process binds to whatever host port was allocated.
+func (b *openAICompatBackend) ContainerPort() int { return 0 }
+
+// ContainerPortEnvVars injects the standard environment variables read by
+// common OpenAI-compatible server frameworks to set their HTTP listen port.
+//
+// Variables injected (all set to the same value so any framework is covered):
+//   - PORT       — generic convention used by many HTTP servers and PaaS runtimes
+//   - HTTP_PORT  — used by some custom server wrappers
+//
+// Backend-specific variables (e.g. UVICORN_PORT for faster-whisper-server)
+// are handled by their own dedicated backend adapters (cpu_native).
+// Do NOT add UVICORN_PORT here — that would bleed cpu_native specifics into
+// this generic adapter.
+func (b *openAICompatBackend) ContainerPortEnvVars(port int) map[string]string {
+	s := strconv.Itoa(port)
+	return map[string]string{
+		"PORT":      s,
+		"HTTP_PORT": s,
+	}
+}
 
 // PrepareStartupArgs — generic OpenAI-compat servers have no known
 // server-level reasoning flag; args returned unchanged.

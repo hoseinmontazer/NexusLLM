@@ -1,32 +1,26 @@
 package nodeagent
 
 // cache.go — Model cache scanning for the node agent.
-// Scans local HuggingFace and Ollama caches and reports them to the control plane
+// Scans the local HuggingFace cache and reports models to the control plane
 // so operators know which models are already downloaded on each node.
 
 import (
-	"bufio"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
 // CachedModel represents one model found in the local cache.
 type CachedModel struct {
-	ModelRef  string `json:"model_ref"` // HF repo ID (e.g. "google/gemma-2b") or Ollama name
-	Backend   string `json:"backend"`   // vllm | ollama
+	ModelRef  string `json:"model_ref"` // HF repo ID (e.g. "google/gemma-2b")
+	Backend   string `json:"backend"`   // huggingface
 	SizeBytes int64  `json:"size_bytes"`
 	IsCached  bool   `json:"is_cached"`
 }
 
-// ScanModelCache returns all models currently cached on this node from all backends.
+// ScanModelCache returns all models currently cached on this node.
 func ScanModelCache() []CachedModel {
-	var out []CachedModel
-	out = append(out, scanHFCache()...)
-	out = append(out, scanOllamaCache()...)
-	return out
+	return scanHFCache()
 }
 
 // ─── HuggingFace Hub cache ────────────────────────────────────────────────────
@@ -86,53 +80,11 @@ func hfCacheDirs() []string {
 // hfDirToRef converts "models--google--gemma-2b" → "google/gemma-2b"
 func hfDirToRef(dirName string) string {
 	s := strings.TrimPrefix(dirName, "models--")
-	// replace first -- with /
 	before, after, found := strings.Cut(s, "--")
 	if found {
 		return before + "/" + after
 	}
 	return s
-}
-
-// ─── Ollama cache ─────────────────────────────────────────────────────────────
-
-// scanOllamaCache lists models via `ollama list` output.
-func scanOllamaCache() []CachedModel {
-	out, err := exec.Command("ollama", "list").Output()
-	if err != nil {
-		return nil // ollama not installed
-	}
-
-	var models []CachedModel
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	first := true
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if first {
-			first = false
-			continue // skip header line "NAME  ID  SIZE  MODIFIED"
-		}
-		if line == "" {
-			continue
-		}
-		// "gemma2:2b    8ccf136fdd52    1.6 GB    4 hours ago"
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		modelName := fields[0]
-		var sizeBytes int64
-		if len(fields) >= 4 {
-			sizeBytes = parseSize(fields[2], fields[3])
-		}
-		models = append(models, CachedModel{
-			ModelRef:  modelName,
-			Backend:   "ollama",
-			SizeBytes: sizeBytes,
-			IsCached:  true,
-		})
-	}
-	return models
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -147,22 +99,4 @@ func dirSize(path string) int64 {
 		return nil
 	})
 	return total
-}
-
-// parseSize converts "1.6 GB" / "748 MB" to bytes.
-func parseSize(valueStr, unit string) int64 {
-	f, err := strconv.ParseFloat(valueStr, 64)
-	if err != nil {
-		return 0
-	}
-	switch strings.ToUpper(unit) {
-	case "GB":
-		return int64(f * 1024 * 1024 * 1024)
-	case "MB":
-		return int64(f * 1024 * 1024)
-	case "KB":
-		return int64(f * 1024)
-	default:
-		return int64(f)
-	}
 }

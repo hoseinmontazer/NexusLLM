@@ -32,7 +32,6 @@
                     │                     │
                     │  Docker / Podman    │
                     │  vLLM containers    │
-                    │  Ollama             │
                     │  TGI                │
                     │  CPU services       │
                     └─────────────────────┘
@@ -156,8 +155,8 @@ This achieves near-real-time task delivery (~1s latency) without WebSocket or gR
 | `DELETE_RUNTIME` | runtime_id, container_id | `docker rm -f <container>` |
 | `WARM_RUNTIME` | runtime_id, container_id | `docker start <container>` |
 | `UNLOAD_RUNTIME` | runtime_id, container_id | `docker stop` (keeps weights on disk) |
-| `PULL_MODEL` | hf_repo, backend, hf_token | `ollama pull` or notes for vLLM |
-| `DELETE_MODEL` | hf_repo, backend | `ollama rm` |
+| `PULL_MODEL` | hf_repo, backend, hf_token | Download weights for vLLM/llamacpp |
+| `DELETE_MODEL` | hf_repo, backend | Remove cached model weights |
 | `COLLECT_INVENTORY` | — | Returns current inventory via heartbeat |
 | `HEALTH_CHECK` | runtime_ids[] | `docker inspect` each container |
 
@@ -201,7 +200,6 @@ On registration and each heartbeat the agent reports its capabilities:
 {
   "docker":    true,
   "vllm":      false,
-  "ollama":    true,
   "tgi":       false,
   "whisper":   false,
   "tts":       false,

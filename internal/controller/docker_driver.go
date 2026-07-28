@@ -22,8 +22,6 @@ func (d *dockerDriver) Start(ctx context.Context, spec RuntimeSpec) (string, err
 	var args []string
 
 	switch spec.BackendType {
-	case "ollama":
-		args = d.buildOllamaArgs(spec)
 	case "tgi":
 		args = d.buildTGIArgs(spec)
 	case "cpu_native":
@@ -236,43 +234,6 @@ func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) 
 	if spec.MemoryLimit != "" {
 		args = append(args, "--memory", spec.MemoryLimit)
 	}
-	return args
-}
-
-// buildOllamaArgs builds docker run args for Ollama.
-// Uses bridge networking with port mapping instead of host networking
-// to avoid conflicts with a native Ollama installation on the host.
-func (d *dockerDriver) buildOllamaArgs(spec RuntimeSpec) []string {
-	containerPort := 11434
-	hostPort := spec.BindPort
-	if hostPort == 0 {
-		hostPort = 11434
-	}
-	image := spec.Image
-	if image == "" {
-		image = "ollama/ollama:latest"
-	}
-
-	args := []string{"run", "-d",
-		"--name", containerName(spec),
-		"--restart", "unless-stopped",
-		// Port mapping — avoids conflict with native Ollama on host
-		"-p", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort),
-		"-v", "ollama_models:/root/.ollama",
-	}
-
-	// GPU support
-	if len(spec.GPUDevices) > 0 {
-		devList := make([]string, len(spec.GPUDevices))
-		for i, idx := range spec.GPUDevices {
-			devList[i] = strconv.Itoa(idx)
-		}
-		args = append(args, "--gpus", fmt.Sprintf("device=%s", strings.Join(devList, ",")))
-	}
-
-	args = d.applyCommonResourceArgs(args, spec)
-	args = append(args, image)
-	// No extra args — Ollama default entrypoint is `ollama serve`
 	return args
 }
 

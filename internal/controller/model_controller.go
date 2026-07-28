@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"time"
 
 	"github.com/google/uuid"
@@ -100,32 +99,6 @@ func (c *ModelController) StartRaw(ctx context.Context, endpointID, modelID stri
 			zap.String("model", spec.ServedModelName),
 			zap.String("backend", spec.BackendType),
 		)
-
-		// Ollama needs `ollama pull <model>` after the server starts
-		if spec.BackendType == "ollama" && spec.ServedModelName != "" {
-			c.log.Info("waiting for Ollama server to init", zap.String("model", spec.ServedModelName))
-			time.Sleep(8 * time.Second)
-
-			out, pullErr := exec.Command(
-				"docker", "exec", containerID,
-				"ollama", "pull", spec.ServedModelName,
-			).CombinedOutput()
-
-			if pullErr != nil {
-				c.log.Error("ollama pull failed",
-					zap.String("model", spec.ServedModelName),
-					zap.String("output", string(out)),
-					zap.Error(pullErr),
-				)
-				_, _ = c.db.ExecContext(bg,
-					`UPDATE model_endpoints SET lifecycle_state = 'failed', updated_at = NOW() WHERE id = $1`, epID)
-			} else {
-				c.log.Info("ollama model ready", zap.String("model", spec.ServedModelName))
-				_, _ = c.db.ExecContext(bg,
-					`UPDATE model_endpoints SET lifecycle_state = 'active', health_status = 'healthy', updated_at = NOW() WHERE id = $1`, epID)
-				c.publishEvent(bg, epID, "active")
-			}
-		}
 
 		// Suppress unused variable warnings
 		_ = mID
