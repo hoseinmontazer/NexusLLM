@@ -91,7 +91,26 @@ func ResolveMode(req *models.InferenceRequest, caps ModelCaps) bool {
 			}
 		}
 	}
-	// 3. Auto-disable when token budget is too tight for meaningful reasoning
+	// 3. effort / reasoning_effort: newer OpenAI SDK reasoning budget fields.
+	//    "low"    → disable thinking (fast response, no reasoning tokens)
+	//    "medium" → use deployment default
+	//    "high"   → enable thinking (deep reasoning)
+	effort := ""
+	if req.Effort != nil {
+		effort = *req.Effort
+	} else if req.ReasoningEffort != nil {
+		effort = *req.ReasoningEffort
+	}
+	switch effort {
+	case "low":
+		return false
+	case "high":
+		return true
+	case "medium":
+		// fall through to deployment default below
+	}
+
+	// 4. Auto-disable when token budget is too tight for meaningful reasoning
 	if req.MaxTokens != nil && caps.MinThinkingTokens > 0 &&
 		*req.MaxTokens < caps.MinThinkingTokens {
 		return false

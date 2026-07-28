@@ -197,6 +197,10 @@ type InferenceRequest struct {
 	// reasoning_effort: o-series model reasoning budget ("low","medium","high"). Stripped for local backends.
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 
+	// effort: newer OpenAI SDK alias for reasoning_effort (o3, o4-mini, etc.)
+	// "low" | "medium" | "high" — mapped to thinking on/off for local backends.
+	Effort *string `json:"effort,omitempty"`
+
 	// Thinking/reasoning mode control.
 	// When non-nil, overrides the model's deployment default.
 	// Supported by llama.cpp (via chat_template_kwargs) and vLLM (via thinking field).

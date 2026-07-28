@@ -565,6 +565,9 @@ func (h *Handler) Embeddings(c *gin.Context) {
 		EndpointID: ep.ID, PromptTokens: resp.Usage.TotalTokens,
 		LatencyMs: latencyMs, Status: "success",
 	})
+	// Normalize model field — always echo back the NexusLLM model name the
+	// client used, not the upstream provider's internal model ID.
+	resp.Model = res.realModel
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1197,6 +1200,7 @@ func sanitizeForBackend(req models.InferenceRequest, backendType runtime.Backend
 		req.Audio = nil
 		req.WebSearchOptions = nil
 		req.ReasoningEffort = nil
+		req.Effort = nil
 		return req
 	}
 }
