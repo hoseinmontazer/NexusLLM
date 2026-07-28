@@ -660,15 +660,14 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 
 		// Case C — configured port is busy, scan forward.
-		// Exception: if the env map already carries any backend-specific port
-		// variable (injected by the control plane before dispatch), the container
-		// will bind to that port regardless of what the agent checked — so honour
-		// the configured port and let the container fail if it truly can't bind.
-		envPortOverride := p.Env["UVICORN_PORT"] != "" ||
-			p.Env["PORT"] != "" ||
-			p.Env["HTTP_PORT"] != ""
-
-		if !isPortAvailable(p.BindPort) && !envPortOverride {
+		// Port env vars (PORT, HTTP_PORT, UVICORN_PORT) in p.Env are NOT treated
+		// as a hard pin here. They may have been stored in model_runtime_configs.env
+		// as a preferred-port hint by the operator (documented behaviour), which
+		// means they carry a requested value, not an authoritative allocation.
+		// The agent is the authority on which port is actually free — after
+		// scanning, the env vars are unconditionally overwritten below to match
+		// the final p.BindPort. Always scan when the configured port is busy.
+		if !isPortAvailable(p.BindPort) {
 			e.log.Warn("startModel: configured port busy, scanning for free port",
 				zap.String("runtime", p.RuntimeName),
 				zap.Int("configured_port", p.BindPort),
@@ -704,13 +703,16 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 	// It must stay in sync with the backend driver implementations in internal/runtime.
 	// The executor cannot import that package (different binary boundary), so this
 	// function is the single place in the executor that knows backend port env var names.
+	//
+	// Port env vars are ALWAYS overwritten with the final allocated p.BindPort,
+	// regardless of any pre-existing value in p.Env. An operator may store
+	// UVICORN_PORT=8000 in model_runtime_configs.env as a preferred-port hint
+	// (documented behaviour), but once the agent has resolved the actual free port
+	// that value is stale. The container must bind on p.BindPort — period.
+	// Overwriting here is the single authoritative assignment.
 	if p.BindPort > 0 {
 		for k, v := range backendPortEnvVars(p.Backend, p.BindPort) {
-			// Only set if not already overridden by the operator-supplied Env map.
-			// Operator overrides always win — they may be pinning a specific port.
-			if p.Env[k] == "" {
-				p.Env[k] = v
-			}
+			p.Env[k] = v
 		}
 	}
 
