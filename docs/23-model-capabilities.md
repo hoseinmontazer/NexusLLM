@@ -1,6 +1,6 @@
 # Model Capabilities & Endpoint Validation
 
-NexusLLM validates every inference request against the model's declared capabilities before routing it to any runtime backend (vLLM, llama.cpp, Ollama, etc.). This prevents misrouted requests — for example, sending a chat completion to a Whisper transcription model.
+NexusLLM validates every inference request against the model's declared capabilities before routing it to any runtime backend (vLLM, llama.cpp, TGI, etc.). This prevents misrouted requests — for example, sending a chat completion to a Whisper transcription model.
 
 ## How It Works
 
@@ -18,7 +18,7 @@ Capability Validation  ◄── checks models.capabilities (DB)
       └── Supported ──► Policy Checks → Backend Routing
 ```
 
-Validation is **engine-independent**: it reads the `capabilities` JSONB column from the `models` table — the single source of truth — and never adds logic to vLLM, llama.cpp, or Ollama adapters.
+Validation is **engine-independent**: it reads the `capabilities` JSONB column from the `models` table — the single source of truth — and never adds logic to vLLM, llama.cpp, or TGI adapters.
 
 ---
 
@@ -584,17 +584,17 @@ For STT you must use a dedicated audio server (`backend_type: openai_compat`). S
 
 ### Backend Support Matrix
 
-| Model Type | `llamacpp` | `vllm` | `ollama` | `tgi` | `openai_compat` (recommended) |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **CHAT** (text LLM) | ✅ best for GGUF | ✅ best for large GPU | ✅ easy | ✅ | ✅ |
-| **VISION** (multimodal) | ✅ llava/qwen-vl GGUF | ✅ | ✅ | ⚠️ limited | ✅ |
-| **EMBEDDING** | ❌ | ⚠️ limited | ✅ | ✅ TEI | ✅ infinity/TEI |
-| **RERANK** | ❌ | ❌ | ❌ | ✅ TEI | ✅ TEI/infinity |
-| **STT** | ❌ no audio | ❌ not stable | ❌ | ❌ | ✅ **only option** |
-| **TTS** | ❌ | ❌ | ❌ | ❌ | ✅ **only option** |
-| **OCR** | ❌ | ❌ | ❌ | ❌ | ✅ **only option** |
-| **IMAGE_GENERATION** | ❌ | ❌ | ❌ | ❌ | ✅ **only option** |
-| **MODERATION** | ❌ | ⚠️ | ❌ | ❌ | ✅ |
+| Model Type | `llamacpp` | `vllm` | `tgi` | `openai_compat` (recommended) |
+|---|:---:|:---:|:---:|:---:|
+| **CHAT** (text LLM) | ✅ best for GGUF | ✅ best for large GPU | ✅ | ✅ |
+| **VISION** (multimodal) | ✅ llava/qwen-vl GGUF | ✅ | ⚠️ limited | ✅ |
+| **EMBEDDING** | ❌ | ⚠️ limited | ✅ TEI | ✅ infinity/TEI |
+| **RERANK** | ❌ | ❌ | ✅ TEI | ✅ TEI/infinity |
+| **STT** | ❌ no audio | ❌ not stable | ❌ | ✅ **only option** |
+| **TTS** | ❌ | ❌ | ❌ | ✅ **only option** |
+| **OCR** | ❌ | ❌ | ❌ | ✅ **only option** |
+| **IMAGE_GENERATION** | ❌ | ❌ | ❌ | ✅ **only option** |
+| **MODERATION** | ❌ | ⚠️ | ❌ | ✅ |
 
 ✅ = supported and production-tested  ⚠️ = works but not recommended  ❌ = not supported
 
@@ -608,7 +608,7 @@ Concrete Docker images and register commands for every model type. All use `back
 
 ### Chat / LLM
 
-These are served by llama.cpp, vLLM, or Ollama — all expose the OpenAI chat API.
+These are served by llama.cpp or vLLM — both expose the OpenAI chat API.
 
 | Model | Size | Backend | Docker Image | Notes |
 |---|---|---|---|---|
@@ -616,7 +616,6 @@ These are served by llama.cpp, vLLM, or Ollama — all expose the OpenAI chat AP
 | `qwen3-32b` | 32B | `llamacpp` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Supports thinking mode |
 | `gemma-2-2b` | 2B | `llamacpp` | `ghcr.io/ggml-org/llama.cpp:server` | CPU-capable |
 | `deepseek-r1-70b` | 70B | `vllm` | `vllm/vllm-openai:latest` | Reasoning model, needs GPU |
-| `mistral-7b` | 7B | `ollama` | _(Ollama daemon)_ | Import via `/models/import-ollama` |
 
 ```bash
 # llama.cpp chat model
@@ -736,13 +735,12 @@ curl -X POST $GATEWAY_URL/v1/audio/speech \
 
 ### Embeddings
 
-`openai_compat` is recommended. Some models also work via `ollama`.
+`openai_compat` is recommended for embeddings.
 
 | Server | Docker Image | Notes |
 |---|---|---|
 | `infinity` | `michaelf34/infinity:latest` | Best for BGE, E5, Jina |
 | `text-embeddings-inference` (TEI) | `ghcr.io/huggingface/text-embeddings-inference:cpu-1.5` | HuggingFace official |
-| Ollama | _(Ollama daemon)_ | `nomic-embed-text`, `mxbai-embed-large` |
 
 ```bash
 # infinity embedding server
@@ -895,7 +893,7 @@ What do you want to run?
 ├── Text LLM (chat, completion)
 │   ├── GGUF file on disk / small-medium model → llamacpp
 │   ├── Large model (70B+), multi-GPU → vllm
-│   └── Quick local test → ollama
+│   └── Quick local test → llamacpp (cpu mode)
 │
 ├── Vision (image + text) → llamacpp (LLaVA/Qwen-VL GGUF) or vllm
 │

@@ -13,7 +13,7 @@ A self-hosted AI platform that orchestrates LLMs, embeddings, rerankers, speech 
 | Category | Features |
 |---|---|
 | **Service Types** | CHAT, EMBEDDING, RERANK, STT, TTS, OCR, AGENT, MCP |
-| **Runtime Types** | GPU_RUNTIME (vLLM, Ollama, TGI, llama.cpp), CPU_RUNTIME |
+| **Runtime Types** | GPU_RUNTIME (vLLM, TGI, llama.cpp), CPU_RUNTIME |
 | **Hierarchy** | Organization → Team → **Project** → Models → Runtimes |
 | **Project Priority** | Weighted `priority_weight` [0–1000] with aging, reservations, preemption — no enum tiers |
 | **Resource Reservations** | Per-project VRAM / CPU / memory guarantees |
@@ -42,7 +42,7 @@ Full documentation is in the [`docs/`](docs/README.md) folder:
 | [Architecture](docs/03-architecture.md) | Request flow, design decisions, schema overview |
 | [Organizations & Teams](docs/04-orgs-and-teams.md) | Multi-tenant setup, policies, model permissions |
 | [API Keys & Auth](docs/05-api-keys-and-auth.md) | Create keys, SDK usage, security |
-| [Model Registry](docs/06-models.md) | Import Ollama, deploy vLLM, lazy-load llama.cpp |
+| [Model Registry](docs/06-models.md) | Deploy vLLM, llama.cpp, cpu_native services |
 | [AI Service Registry](docs/07-ai-services.md) | Embeddings, STT, TTS, OCR, rerankers, MCP |
 | [Placement Engine](docs/08-placement.md) | Auto GPU/CPU placement, simulation, NUMA |
 | [Cluster Nodes](docs/09-nodes.md) | Node agent, auto GPU registration, telemetry |
@@ -61,24 +61,21 @@ Full documentation is in the [`docs/`](docs/README.md) folder:
 
 ## Quick Start
 
-### Option A — Local dev with Ollama (no GPU needed)
+### Option A — CPU dev with llama.cpp (no GPU needed)
 
 ```bash
-# 1. Pull a model into Ollama
-ollama pull gemma2:2b
-
-# 2. Start postgres + redis + run all migrations
+# 1. Start postgres + redis + run all migrations
 make dev-up
 
-# 3. Run services (3 separate terminals)
+# 2. Run services (3 separate terminals)
 make run-gateway     # inference API  → http://localhost:8080
 make run-admin       # management API → http://localhost:8081
 
-# 4. Start the web admin UI
+# 3. Start the web admin UI
 make web-install     # first time only
 make run-web         # → http://localhost:3001
 
-# 5. Create org, team, project, and API key (web UI or curl)
+# 4. Create org, team, and API key (web UI or curl)
 ADMIN=http://localhost:8081/admin/v1
 ORG_ID=$(curl -s -X POST $ADMIN/orgs \
   -H 'Content-Type: application/json' \
@@ -89,24 +86,32 @@ TEAM_ID=$(curl -s -X POST $ADMIN/teams \
   -d "{\"org_id\":\"$ORG_ID\",\"name\":\"My Team\",\"slug\":\"my-team\",\"priority\":80}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
-# 6. Import Ollama models
-curl -X POST $ADMIN/models/import-ollama -H 'Content-Type: application/json' \
-  -d '{"host":"localhost","port":11434}'
+# 5. Deploy a CPU llama.cpp model
+curl -X POST $ADMIN/models/deploy -H 'Content-Type: application/json' \
+  -d '{
+    "name": "gemma2-2b", "display_name": "Gemma 2 2B",
+    "backend_type": "llamacpp",
+    "image": "ghcr.io/ggml-org/llama.cpp:server",
+    "hf_repo": "bartowski/gemma-2-2b-it-GGUF",
+    "hf_file": "gemma-2-2b-it-Q4_K_M.gguf",
+    "host": "localhost", "port": 0,
+    "execution_mode": "cpu", "start_now": true
+  }'
 
-# 7. Grant model access to the team
+# 6. Grant model access to the team
 curl -X POST $ADMIN/teams/$TEAM_ID/models \
-  -H 'Content-Type: application/json' -d '{"model_name":"gemma2:2b"}'
+  -H 'Content-Type: application/json' -d '{"model_name":"gemma2-2b"}'
 
-# 8. Create an API key
+# 7. Create an API key
 API_KEY=$(curl -s -X POST $ADMIN/teams/$TEAM_ID/api-keys \
   -H 'Content-Type: application/json' -d '{"name":"dev-key"}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
 
-# 9. Make your first inference request
+# 8. Make your first inference request
 curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemma2:2b","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gemma2-2b","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 ### Option B — GPU server with vLLM
@@ -302,7 +307,6 @@ GET    /scheduler/priority-presets    Standard priority preset labels
 
 # Models
 POST   /models/deploy                 Full deploy with optional auto_place
-POST   /models/import-ollama          Bulk import from running Ollama
 POST   /models                        Register external model
 GET    /models
 DELETE /models/:id

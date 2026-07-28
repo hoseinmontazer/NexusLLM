@@ -19,12 +19,12 @@ Your App / OpenAI SDK
 │                   (all Redis — zero DB on hot path)     │
 │  5. Prompt policy  system prompt injection, PII filter  │
 │  6. Routing       pick healthy endpoint from pool       │
-│  7. Dispatch      forward to backend (vLLM/Ollama/etc.) │
+│  7. Dispatch      forward to backend (vLLM/TGI/etc.)    │
 │  8. Usage         record tokens via Redis Stream        │
 └─────────────────────────────────────────────────────────┘
         │
         ▼
-  vLLM / Ollama / TGI / Whisper / any OpenAI-compat service
+  vLLM / TGI / llama.cpp / Whisper / any OpenAI-compat service
 
 
 ┌─────────────────────────────────────────────────────────┐
@@ -70,7 +70,7 @@ Every policy check on the inference hot path (rate limit, quota, ACL, concurrenc
 The gateway holds an in-memory `Registry` with one `Pool` per model. Each Pool has one or more `Endpoint`s. The watcher updates endpoint health every 5 seconds. The gateway never queries the DB during inference.
 
 ### Backend abstraction
-All AI backends (vLLM, Ollama, TGI, OpenAI-compat, cpu_native) implement the same `Backend` interface. The gateway and watcher never know which backend they're talking to.
+All AI backends (vLLM, TGI, OpenAI-compat, cpu_native) implement the same `Backend` interface. The gateway and watcher never know which backend they're talking to.
 
 ### Async everything expensive
 Usage events → Redis Stream → background consumer → PostgreSQL batch inserts. Container lifecycle operations → async goroutine → lifecycle state transitions. Neither blocks the request pipeline.

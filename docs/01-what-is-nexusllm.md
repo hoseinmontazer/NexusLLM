@@ -2,7 +2,7 @@
 
 NexusLLM is a self-hosted **AI Resource Orchestrator** — a platform that sits between your teams and your AI infrastructure.
 
-Instead of every team connecting directly to vLLM, Ollama, or Whisper servers, they connect to NexusLLM's unified API. NexusLLM handles routing, authentication, rate limiting, usage tracking, and model lifecycle management.
+Instead of every team connecting directly to vLLM or Whisper servers, they connect to NexusLLM's unified API. NexusLLM handles routing, authentication, rate limiting, usage tracking, and model lifecycle management.
 
 ---
 
@@ -23,7 +23,7 @@ Instead of every team connecting directly to vLLM, Ollama, or Whisper servers, t
 
 | Type | Examples | Gateway endpoint |
 |---|---|---|
-| `CHAT` | vLLM, Ollama, TGI, any OpenAI-compatible LLM | `POST /v1/chat/completions` |
+| `CHAT` | vLLM, TGI, any OpenAI-compatible LLM | `POST /v1/chat/completions` |
 | `EMBEDDING` | Infinity, TEI, FastEmbed | `POST /v1/embeddings` |
 | `RERANK` | TEI rerank, Cohere-compat | `POST /v1/rerank` |
 | `STT` | faster-whisper-server, whisper.cpp | `POST /v1/audio/transcriptions` |
@@ -49,6 +49,6 @@ The **Web Admin UI** (port 3001) is a Next.js frontend that calls the Admin API.
 ## Hardware targets
 
 NexusLLM is designed for:
-- **Dev/local:** CPU machine with Ollama — no GPU needed
+- **Dev/local:** CPU machine with llama.cpp — no GPU needed
 - **Production:** Bare-metal GPU servers (tested on 2× NVIDIA H200 NVL, 288 GB VRAM, 384 vCPUs, 1 TB RAM)
 - **Future:** Multi-server clusters — add nodes by inserting rows into the `nodes` table, no code changes

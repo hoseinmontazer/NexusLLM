@@ -547,9 +547,6 @@ export const api = {
       req<{ model_id: string; endpoint_id: string; started: boolean; note?: string; task_id?: string }>('POST', '/models/deploy', b),
     register: (b: RegisterModelInput) =>
       req<{ model_id: string; endpoint_id: string }>('POST', '/models', b),
-    importOllama: (host = 'localhost', port = 11434) =>
-      req<{ results: { name: string; status: string; model_id?: string }[]; total: number }>(
-        'POST', '/models/import-ollama', { host, port }),
     health: (id: string) =>
       req<{ model_id: string; endpoints: Endpoint[] }>('GET', `/models/${id}/health`),
     resetHealth: (id: string, epId?: string) =>

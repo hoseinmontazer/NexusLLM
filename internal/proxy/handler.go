@@ -1154,7 +1154,7 @@ func (h *Handler) coldStartTimeout() time.Duration {
 }
 
 // sanitizeForBackend removes fields that are valid in the OpenAI API spec but
-// cause local backends (llama.cpp, Ollama, TGI, vLLM) to return 400 errors
+// cause local backends (llama.cpp, TGI, vLLM) to return 400 errors
 // because they don't recognise them. Called on a copy of the request so the
 // original is untouched for logging and retry purposes.
 //
@@ -1172,7 +1172,7 @@ func sanitizeForBackend(req models.InferenceRequest, backendType runtime.Backend
 		// True OpenAI-compatible remote provider — forward everything as-is.
 		return req
 	default:
-		// Local backends: llama.cpp, vllm, ollama, tgi, cpu_native.
+		// Local backends: llama.cpp, vllm, tgi, cpu_native.
 
 		// Translate max_completion_tokens → max_tokens.
 		// The newer OpenAI SDK (>=1.26) sends max_completion_tokens; local backends
