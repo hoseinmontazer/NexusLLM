@@ -10,9 +10,11 @@ package runtime
 // back to GET /v1/models for services that don't have /health.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -113,5 +115,38 @@ func (b *cpuNativeBackend) Chat(ctx context.Context, r ChatRequest) (*BackendRes
 }
 
 func (b *cpuNativeBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return b.inner.Embeddings(ctx, r)
+	// Infinity (michaelf34/infinity) uses /embeddings (no /v1/ prefix).
+	// Other servers (vLLM, TEI, openai_compat) use /v1/embeddings.
+	// Try /embeddings first; if it returns 404 fall back to /v1/embeddings.
+	body, err := json.Marshal(r.Req)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, path := range []string{"/v1/embeddings", "/embeddings"} {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost,
+			r.EndpointURL+path, bytes.NewReader(body))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if r.UpstreamAPIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
+		}
+		resp, doErr := b.client.Do(req)
+		if doErr != nil {
+			return nil, doErr
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			continue // try next path
+		}
+		defer resp.Body.Close()
+		var out models.EmbeddingResponse
+		if decErr := json.NewDecoder(resp.Body).Decode(&out); decErr != nil {
+			return nil, decErr
+		}
+		return &out, nil
+	}
+	return nil, fmt.Errorf("embeddings endpoint not found at %s — tried /v1/embeddings and /embeddings", r.EndpointURL)
 }
