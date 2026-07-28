@@ -323,7 +323,7 @@ func (a *Agent) telemetryLoop(ctx context.Context) {
 	}
 }
 
-// pushModelCache scans local HF and Ollama caches and reports them to the control plane.
+// pushModelCache scans the local HF cache and reports models to the control plane.
 func (a *Agent) pushModelCache(ctx context.Context) {
 	models := nodeagent.ScanModelCache()
 	if len(models) == 0 {

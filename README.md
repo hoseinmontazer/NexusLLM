@@ -342,7 +342,7 @@ GET    /usage/orgs/:id/monthly-spend
 | **Projects** | `/projects` | Create/manage projects, set priority, reserve VRAM |
 | **Project Detail** | `/projects/:id` | Usage, preemption history, runtime list |
 | API Keys | `/api-keys` | Create (shown once), revoke |
-| Models | `/models` | Import Ollama, deploy vLLM, lazy-load config |
+| Models | `/models` | Deploy vLLM/llamacpp, register external, lazy-load config |
 | Cluster Nodes | `/nodes` | Live CPU/RAM bars, **live GPU data** (auto-populated) |
 | Placement | `/placement` | Resource placement simulator |
 | GPU Inventory | `/gpu` | Manual GPU registration (supplement to auto-discovery) |
