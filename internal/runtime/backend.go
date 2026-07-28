@@ -1,5 +1,5 @@
 // Package runtime defines the Backend interface and all backend implementations.
-// Every backend (vLLM, Ollama, TGI, OpenAI-compatible) implements the same
+// Every backend (vLLM, TGI, llama.cpp, OpenAI-compatible) implements the same
 // interface so the router layer never needs to know which technology is serving
 // a model.
 package runtime

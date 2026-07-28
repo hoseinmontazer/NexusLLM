@@ -1,4 +1,4 @@
-# Node Agent Architecture
+ls # Node Agent Architecture
 
 > **Design principle:** The Control Plane is the brain. The Node Agent is the executor.
 > The agent NEVER makes placement or scheduling decisions.
@@ -237,7 +237,7 @@ States reported by agent via `PUT /agent/v1/runtimes/:id`:
 node_tokens (id, node_id, token_hash, issued_at, expires_at, revoked)
 
 -- Capabilities
-node_capabilities (node_id, has_docker, has_vllm, has_ollama, has_tgi,
+node_capabilities (node_id, has_docker, has_vllm, has_tgi,
                    has_whisper, has_tts, has_embedding, has_gpu, gpu_count)
 
 -- Task queue

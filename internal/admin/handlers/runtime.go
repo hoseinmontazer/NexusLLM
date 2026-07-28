@@ -622,8 +622,8 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 // ─── Simple model registration (no container) ─────────────────────────────────
 
 // RegisterModel handles POST /admin/v1/models
-// Registers an already-running external model (e.g. Ollama, TGI, remote API).
-// Use DeployModel for vLLM containers managed by NexusLLM.
+// Registers an already-running external model (e.g. TGI, remote API).
+// Use DeployModel for containers managed by NexusLLM.
 func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	var input struct {
 		Name        string   `json:"name"         binding:"required"`

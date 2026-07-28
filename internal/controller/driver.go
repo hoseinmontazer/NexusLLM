@@ -28,7 +28,7 @@ type RuntimeSpec struct {
 	ServedModelName string // Short name clients use (e.g. "gemma-3-27b")
 	Version         string
 	EndpointID      string
-	BackendType     string // vllm | ollama | tgi | openai_compat | cpu_native
+	BackendType     string // vllm | tgi | openai_compat | cpu_native | llamacpp
 
 	// Container image
 	Image string
