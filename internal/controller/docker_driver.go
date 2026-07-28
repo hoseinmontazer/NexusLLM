@@ -7,14 +7,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nexusllm/nexusllm/internal/runtime"
 )
 
 // dockerDriver runs model runtimes as plain Docker containers.
 // It shells out to the docker CLI — no SDK dependency needed.
-type dockerDriver struct{}
+type dockerDriver struct {
+	registry *runtime.Registry
+}
 
 // NewDockerDriver constructs a Docker driver.
-func NewDockerDriver() Driver { return &dockerDriver{} }
+// registry is required to obtain backend-specific port environment variables.
+func NewDockerDriver(registry *runtime.Registry) Driver {
+	return &dockerDriver{registry: registry}
+}
 
 func (d *dockerDriver) Type() DriverType { return DriverDocker }
 
@@ -111,6 +118,10 @@ func (d *dockerDriver) buildVLLMArgs(spec RuntimeSpec) []string {
 // (embeddings, rerankers, STT, TTS, OCR, MCP servers, agent runtimes).
 // These containers get CPU affinity via --cpuset-cpus and NUMA via --cpuset-mems,
 // but NO --gpus flag.
+//
+// Port configuration is handled exclusively via environment variables injected
+// by applyCommonResourceArgs → Backend.ContainerPortEnvVars(). Do NOT pass
+// --port here — cpu_native images read PORT/HTTP_PORT/UVICORN_PORT env vars.
 func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 	args := []string{"run", "-d",
 		"--name", containerName(spec),
@@ -132,11 +143,9 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 
 	args = append(args, spec.Image)
 
-	// Pass port if the image uses a configurable port via --port flag
-	// Most CPU-native images respect PORT env (set by executor) or --port flag
-	if spec.BindPort > 0 {
-		args = append(args, "--port", strconv.Itoa(spec.BindPort))
-	}
+	// Do NOT pass --port as a CMD arg for cpu_native backends.
+	// Port configuration comes exclusively from env vars (PORT, HTTP_PORT,
+	// UVICORN_PORT) injected by applyCommonResourceArgs via Backend interface.
 
 	args = append(args, spec.ExtraArgs...)
 	return args
@@ -221,13 +230,37 @@ func (d *dockerDriver) buildLlamaCppArgs(spec RuntimeSpec) []string {
 	return args
 }
 
+// applyCommonResourceArgs injects environment variables and resource limits
 // to an args slice. Used by all backend builders.
+//
+// IMPORTANT: This is where backend-specific port environment variables are
+// injected via the Backend interface, ensuring the legacy Docker controller
+// path behaves identically to the node agent path.
 func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) []string {
-	// Environment variables
+	// ── Inject backend-specific port environment variables ──────────────────
+	// Obtain PORT, HTTP_PORT, UVICORN_PORT (or nil) from the Backend interface.
+	// This ensures cpu_native and openai_compat backends receive the correct
+	// port env vars, identical to the node agent executor path.
+	//
+	// The Backend interface is the single source of truth for which env vars
+	// each backend type requires. Never hardcode port env var names here.
+	if d.registry != nil && spec.BindPort > 0 {
+		backend := d.registry.BackendForType(spec.BackendType)
+		for k, v := range backend.ContainerPortEnvVars(spec.BindPort) {
+			// Only inject if not already set by the caller (user overrides win).
+			if _, alreadySet := spec.Env[k]; !alreadySet {
+				spec.Env[k] = v
+			}
+		}
+	}
+
+	// ── Environment variables ────────────────────────────────────────────────
+	// Now inject all env vars (backend port vars + user-supplied vars).
 	for k, v := range spec.Env {
 		args = append(args, "-e", k+"="+v)
 	}
-	// Resource limits
+
+	// ── Resource limits ──────────────────────────────────────────────────────
 	if spec.CPULimit != "" {
 		args = append(args, "--cpus", spec.CPULimit)
 	}

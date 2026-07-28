@@ -86,7 +86,10 @@ func main() {
 	usageTracker := usage.NewTracker(db, rdb, log)
 	aliasResolver := alias.NewResolver(db, rdb)
 	ppEngine := promptpolicy.NewEngine(db, rdb, log)
-	dockerDriver := controller.NewDockerDriver()
+	// Pass registry to docker driver so it can obtain backend-specific port env vars.
+	// This ensures the legacy local Docker path injects PORT/HTTP_PORT/UVICORN_PORT
+	// identically to the node agent path (single source of truth: Backend interface).
+	dockerDriver := controller.NewDockerDriver(registry)
 	modelCtrl := controller.NewModelController(db, rdb, dockerDriver, log)
 	agentAuthSvc := agentauth.NewService(db, cfg.Auth.JWTSecret)
 	taskMgr := taskmanager.NewManager(db, log)
