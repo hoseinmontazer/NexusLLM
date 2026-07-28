@@ -136,7 +136,7 @@ type ModelConfig struct {
 	ModelID   string // models.id UUID
 
 	// ── Backend ───────────────────────────────────────────────────────────
-	// Matches models.backend_type: llamacpp | vllm | ollama | tgi | cpu_native.
+	// Matches models.backend_type: llamacpp | vllm | tgi | cpu_native | openai_compat.
 	Backend string
 
 	// ── Execution mode ────────────────────────────────────────────────────

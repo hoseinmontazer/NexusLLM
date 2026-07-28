@@ -123,7 +123,7 @@ func (w *Watcher) checkAll(ctx context.Context) {
 // checkOne health-checks a single endpoint, applies circuit-breaker logic,
 // persists the result, and updates Prometheus metrics.
 func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) {
-	// Pick the backend that matches THIS endpoint's type (ollama, vllm, tgi, etc.)
+	// Pick the backend that matches THIS endpoint's type (vllm, tgi, llamacpp, etc.)
 	backend, err := w.registry.BackendForEndpoint(ep)
 	if err != nil {
 		return

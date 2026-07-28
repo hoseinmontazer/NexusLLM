@@ -141,7 +141,7 @@ func InjectThinkingControl(req models.InferenceRequest, thinkingOn bool, caps Mo
 		}
 
 	default:
-		// openai_compat, ollama, tgi, etc. — no native thinking control.
+		// openai_compat, tgi, etc. — no native thinking control.
 		// Caller should inject a system prompt directive if desired.
 		if !thinkingOn {
 			injectNoThinkDirective(&req)

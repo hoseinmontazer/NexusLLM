@@ -238,9 +238,9 @@ curl http://localhost:8081/healthz
 
 Check if the Next.js dev server is proxying correctly — open browser DevTools → Network → look at the failing `/api/admin/*` requests.
 
-### Import from Ollama returns empty results
+### Import from Ollama
 
-This endpoint has been removed. Use **Deploy Model** in the web UI or `POST /admin/v1/models/deploy` to register models.
+This feature has been removed. Use **Deploy Model** in the web UI or `POST /admin/v1/models/deploy` to register models.
 
 ---
 

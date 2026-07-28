@@ -101,7 +101,7 @@ type StartModelPayload struct {
 	RuntimeName string `json:"runtime_name"` // Docker container name, e.g. "nexus-gemma-2"
 
 	// ── Container ─────────────────────────────────────────────────────────
-	Backend   string `json:"backend"`             // llamacpp | vllm | ollama | tgi | cpu_native
+	Backend   string `json:"backend"`             // llamacpp | vllm | tgi | cpu_native | openai_compat
 	Image     string `json:"image"`               // full Docker image reference
 	ModelName string `json:"model_name"`          // routing / served-as name
 	ServedAs  string `json:"served_as,omitempty"` // alternate served model name (vLLM)
