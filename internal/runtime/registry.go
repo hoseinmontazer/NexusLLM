@@ -163,6 +163,16 @@ func (r *Registry) Reload(ctx context.Context) error {
 
 		transportCfg := row.transportConfig()
 
+		// Provider backends never load as StatusDown from the DB — a stale
+		// "down" status from previous health probe failures would make the
+		// endpoint unavailable and trigger the activator, which cannot start
+		// a remote API. Remote APIs are always considered routable; the request
+		// itself will fail if the API is truly unreachable.
+		loadedStatus := row.HealthStatus
+		if IsProviderBackend(row.BackendType) && loadedStatus == StatusDown {
+			loadedStatus = StatusDegraded
+		}
+
 		ep := &Endpoint{
 			ID:                row.ID,
 			ModelID:           row.ModelID,
@@ -170,7 +180,7 @@ func (r *Registry) Reload(ctx context.Context) error {
 			URL:               row.URL(),
 			Weight:            row.Weight,
 			Priority:          row.Priority,
-			Status:            row.HealthStatus,
+			Status:            loadedStatus,
 			UpstreamAPIKey:    row.UpstreamAPIKey,
 			UpstreamBaseURL:   row.UpstreamBaseURL,
 			UpstreamProxy:     row.UpstreamProxy,
@@ -532,6 +542,44 @@ func (r *Registry) GetModelCapabilities(ctx context.Context, modelName string) (
 	}
 
 	return []Capability{}, true
+}
+
+// IsRemoteModel reports whether a model name maps to an external/cloud provider
+// backend by querying the models table. This is the authoritative gate that
+// the proxy handler uses to decide whether to skip the runtime activator.
+//
+// Decision rules (all based on BackendType metadata — never on the model name):
+//   - BackendType is one of the provider backends → true  (skip activator)
+//   - BackendType is a local runtime (vllm, tgi, llamacpp, …) → false
+//   - Model not found in DB → false (let the activator / 503 path handle it)
+//
+// The method uses the in-memory pool as a fast path: if the model is already
+// loaded in the registry we can inspect the endpoint's BackendType without a DB
+// round-trip. Only on a registry miss do we fall back to a direct DB query so
+// that newly created models (not yet reloaded) are handled correctly.
+func (r *Registry) IsRemoteModel(ctx context.Context, modelName string) bool {
+	// Fast path: check the in-memory pool first.
+	r.mu.RLock()
+	pool, ok := r.pools[modelName]
+	r.mu.RUnlock()
+	if ok {
+		// Pool exists — peek at the first endpoint's BackendType.
+		if ep, err := pool.Pick(); err == nil {
+			return IsProviderBackend(ep.BackendType)
+		}
+	}
+
+	// Slow path: model not in pool (might be in DB but not yet reloaded, or
+	// simply does not exist). Query the models table directly.
+	var backendType BackendType
+	err := r.db.GetContext(ctx, &backendType,
+		`SELECT backend_type FROM models WHERE name=$1 AND enabled=TRUE LIMIT 1`,
+		modelName)
+	if err != nil {
+		// Not found or DB error — treat as local so the activator path runs.
+		return false
+	}
+	return IsProviderBackend(backendType)
 }
 
 // jsonDecodeStrings decodes a JSON byte slice into a string slice.

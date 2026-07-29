@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -366,7 +365,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 
-		// Registry miss — try lazy-loading via the runtime activator.
+		// Registry miss — decide whether to cold-start or return 404.
+		//
+		// The decision MUST be based on BackendType metadata from the Model
+		// Registry, never on the model name string. A model named "openai/gpt-x"
+		// is not necessarily remote, and a model named "production-ai" is not
+		// necessarily local. Only the stored BackendType is authoritative.
+		//
+		// IsRemoteModel queries the registry pool first (fast path) then falls
+		// back to a DB lookup (slow path). Remote/provider models have no
+		// container to cold-start — they are always reachable via their
+		// external API. If the registry has no pool entry and the DB says it
+		// is remote (or the model doesn't exist at all as a remote), we return
+		// 404 rather than attempting EnsureRunning.
+		if h.registry.IsRemoteModel(c.Request.Context(), req.Model) {
+			abortErr(c, http.StatusNotFound, "model_not_found",
+				fmt.Sprintf("model %q is not available — check that it is enabled in the provider catalog", req.Model))
+			return
+		}
 		if h.activator != nil {
 			// Check if the model is already healthy right now by giving EnsureRunning
 			// enough time for at least one full health-poll cycle (HealthPollInterval=3s).

@@ -164,6 +164,27 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 
 	out := make([]RemoteModel, 0, len(list.Data))
 	for _, m := range list.Data {
+		// Capability flags are NOT inferred from the model ID string.
+		//
+		// Architecture rule: routing and capability decisions must be based on
+		// explicit metadata, never on pattern-matching names. The basic
+		// /v1/models response carries no structured capability data — only id,
+		// object, created, and owned_by. Storing guesses as facts would cause
+		// incorrect routing (e.g. "openai/gpt-oss-20b" falsely claiming vision
+		// because the ID contains "4o", or being treated as a local runtime
+		// because the name looks like a local model).
+		//
+		// All capability flags default to false. Operators update them via:
+		//   PUT /admin/v1/providers/:id/models/:model_id
+		// or through a richer provider-specific sync that returns capability
+		// metadata (e.g. OpenRouter's /api/v1/models includes context_length,
+		// pricing, and supported parameters — that data can be used when the
+		// provider exposes it explicitly).
+		//
+		// SupportsStreaming is the only safe default to set true — every chat
+		// model endpoint advertised by the providers we integrate with supports
+		// SSE streaming. The ON CONFLICT … DO UPDATE in upsertCatalog preserves
+		// values for existing rows, so hand-edited flags are never clobbered.
 		rm := RemoteModel{
 			ProviderModelID:  m.ID,
 			DisplayName:      m.ID,
@@ -171,12 +192,6 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 			Tags:             extractTags(m.ID),
 			Metadata:         map[string]interface{}{"object": m.Object, "owned_by": m.OwnedBy},
 		}
-		rm.SupportsTools     = containsAny(m.ID, "gpt-4", "gpt-3.5", "claude", "gemini", "llama", "mistral", "qwen", "deepseek")
-		rm.SupportsVision    = containsAny(m.ID, "vision", "vl", "visual", "image", "4o", "gemini", "claude-3")
-		rm.SupportsEmbedding = containsAny(m.ID, "embed", "embedding", "e5", "bge", "minilm")
-		rm.SupportsAudio     = containsAny(m.ID, "whisper", "audio", "speech", "tts", "stt")
-		rm.SupportsReasoning = containsAny(m.ID, "o1", "o3", "o4", "r1", "thinking", "reason", "cot")
-		rm.SupportsImages    = containsAny(m.ID, "dall-e", "stable-diffusion", "flux", "imagen", "sdxl")
 		out = append(out, rm)
 	}
 	return out, nil
@@ -205,6 +220,13 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			tagsArray = pq.Array([]string{})
 		}
 
+		// On conflict we intentionally do NOT overwrite supports_* capability
+		// flags. Those are set once on first insert (all false for a basic
+		// /v1/models response) and then managed exclusively by the operator via
+		// PUT /admin/v1/providers/:id/models/:model_id. Re-syncing must never
+		// reset hand-edited capability data back to the conservative defaults.
+		// Only display metadata (display_name, tags, last_seen_at, enabled) is
+		// refreshed from the provider on every sync.
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO provider_remote_models
 			  (provider_id, provider_model_id, display_name, description,
@@ -213,18 +235,11 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			   tags, enabled, last_seen_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW())
 			ON CONFLICT (provider_id, provider_model_id) DO UPDATE
-			SET display_name       = EXCLUDED.display_name,
-			    supports_streaming = EXCLUDED.supports_streaming,
-			    supports_tools     = EXCLUDED.supports_tools,
-			    supports_vision    = EXCLUDED.supports_vision,
-			    supports_audio     = EXCLUDED.supports_audio,
-			    supports_embeddings= EXCLUDED.supports_embeddings,
-			    supports_reasoning = EXCLUDED.supports_reasoning,
-			    supports_images    = EXCLUDED.supports_images,
-			    tags               = EXCLUDED.tags,
-			    enabled            = TRUE,
-			    removed_at         = NULL,
-			    last_seen_at       = NOW()`,
+			SET display_name = EXCLUDED.display_name,
+			    tags         = EXCLUDED.tags,
+			    enabled      = TRUE,
+			    removed_at   = NULL,
+			    last_seen_at = NOW()`,
 			providerID,
 			m.ProviderModelID,
 			m.DisplayName,
@@ -296,16 +311,6 @@ func extractTags(modelID string) []string {
 		out = append(out, t)
 	}
 	return out
-}
-
-func containsAny(s string, keywords ...string) bool {
-	lower := strings.ToLower(s)
-	for _, kw := range keywords {
-		if strings.Contains(lower, strings.ToLower(kw)) {
-			return true
-		}
-	}
-	return false
 }
 
 // SyncInterval returns the provider's sync interval as a Duration.

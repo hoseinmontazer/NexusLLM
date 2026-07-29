@@ -2,7 +2,6 @@ package catalog
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -263,6 +262,14 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				UpstreamAPIKey:    prov.APIKey,
 				UpstreamModelName: e.ProviderModelID,
 				Transport:         transport,
+				// Capability flags come directly from provider_remote_models.
+				// Never inferred from the model name string.
+				SupportsStreaming:  e.SupportsStreaming,
+				SupportsTools:     e.SupportsTools,
+				SupportsVision:    e.SupportsVision,
+				SupportsAudio:     e.SupportsAudio,
+				SupportsEmbedding: e.SupportsEmbedding,
+				SupportsReasoning: e.SupportsReasoning,
 			}
 			cache.byName[virtualName] = vep
 			cache.list = append(cache.list, virtualName)
@@ -274,19 +281,36 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 	return cache, nil
 }
 
-// capabilitiesFromVirtualEndpoint derives capabilities from a VirtualEndpoint.
-// Since virtual endpoints don't have a capabilities column we infer from the
-// backend type and model name.
+// capabilitiesFromVirtualEndpoint derives the capability list for a virtual
+// (Mode-B catalog) endpoint from the stored DB flags on the VirtualEndpoint.
+//
+// Architecture rule: capabilities MUST come from metadata stored at sync time,
+// never from pattern-matching the model name string. The flags were set when
+// the catalog entry was created (via upsertCatalog) and can be updated by
+// operators via PUT /admin/v1/providers/:id/models/:model_id.
+//
+// Mapping:
+//   SupportsEmbedding=true  → [embedding]           (not a chat model)
+//   SupportsAudio=true      → [transcription]        (STT; not a chat model)
+//   default (chat model)    → [chat, completion]
+//   SupportsVision=true     → append vision to chat caps
+//   SupportsReasoning=true  → append reasoning to chat caps
 func capabilitiesFromVirtualEndpoint(vep *VirtualEndpoint) []runtime.Capability {
-	name := strings.ToLower(vep.UpstreamModelName)
+	// Non-chat modalities take exclusive priority — these models do not also
+	// serve chat requests through the same endpoint.
+	if vep.SupportsEmbedding {
+		return []runtime.Capability{runtime.CapabilityEmbedding}
+	}
+	if vep.SupportsAudio && !vep.SupportsTools {
+		// Heuristic: pure audio models have SupportsAudio but not SupportsTools.
+		// This distinguishes Whisper-style STT (audio-only) from GPT-4o Audio
+		// (chat model that also handles audio, which has SupportsTools=true).
+		return []runtime.Capability{runtime.CapabilityTranscription}
+	}
+
+	// Chat / completion model — the common case.
 	caps := []runtime.Capability{runtime.CapabilityChat, runtime.CapabilityCompletion}
-	if strings.Contains(name, "embed") {
-		caps = []runtime.Capability{runtime.CapabilityEmbedding}
-	} else if strings.Contains(name, "whisper") || strings.Contains(name, "transcri") {
-		caps = []runtime.Capability{runtime.CapabilityTranscription}
-	} else if strings.Contains(name, "tts") || strings.Contains(name, "speech") {
-		caps = []runtime.Capability{runtime.CapabilitySpeech}
-	} else if strings.Contains(name, "vision") || strings.Contains(name, "vl") {
+	if vep.SupportsVision {
 		caps = append(caps, runtime.CapabilityVision)
 	}
 	return caps

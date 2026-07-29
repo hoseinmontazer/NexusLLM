@@ -11,13 +11,24 @@ import (
 // catalog entry. It is never stored in a registry Pool or model_endpoints row.
 // The gateway pipeline uses it identically to a real *runtime.Endpoint.
 type VirtualEndpoint struct {
-	// ID is "virt:<provider_model_id>" — unique per catalog entry.
+	// ID is "virt:<provider_id>:<provider_model_id>" — unique per catalog entry.
 	ID                string
 	BackendType       runtime.BackendType
 	UpstreamBaseURL   string
 	UpstreamAPIKey    string
 	UpstreamModelName string
 	Transport         runtime.ProviderTransportConfig
+
+	// Capability flags — loaded directly from provider_remote_models.supports_*
+	// columns at cache-build time. These are the sole source of truth for
+	// capability validation of virtual (Mode-B) models. They are NEVER inferred
+	// from the model name string.
+	SupportsStreaming  bool
+	SupportsTools     bool
+	SupportsVision    bool
+	SupportsAudio     bool
+	SupportsEmbedding bool
+	SupportsReasoning bool
 }
 
 // AsEndpoint converts a VirtualEndpoint into a *runtime.Endpoint so that
