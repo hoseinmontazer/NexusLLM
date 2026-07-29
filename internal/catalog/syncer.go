@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"go.uber.org/zap"
 )
@@ -141,13 +142,18 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 	defer func() { _ = tx.Rollback() }()
 
 	// Track model IDs returned this sync.
-	seen := make(map[string]bool, len(models))
+	seen := make([]string, 0, len(models))
 	for _, m := range models {
-		seen[m.ProviderModelID] = true
+		seen = append(seen, m.ProviderModelID)
 
-		tagsStr := "{}"
+		// Use pq.Array for the tags column — correctly handles all characters
+		// including slashes, hyphens, colons in model IDs. Never breaks on
+		// special characters the way manual literal construction does.
+		var tagsArray interface{}
 		if len(m.Tags) > 0 {
-			tagsStr = `{"` + strings.Join(m.Tags, `","`) + `"}`
+			tagsArray = pq.Array(m.Tags)
+		} else {
+			tagsArray = pq.Array([]string{})
 		}
 
 		_, err := tx.ExecContext(ctx, `
@@ -156,7 +162,7 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			   supports_streaming, supports_tools, supports_vision,
 			   supports_audio, supports_embeddings, supports_reasoning, supports_images,
 			   tags, enabled, last_seen_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::text[],TRUE,NOW())
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW())
 			ON CONFLICT (provider_id, provider_model_id) DO UPDATE
 			SET display_name       = EXCLUDED.display_name,
 			    supports_streaming = EXCLUDED.supports_streaming,
@@ -181,7 +187,7 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			m.SupportsEmbedding,
 			m.SupportsReasoning,
 			m.SupportsImages,
-			tagsStr,
+			tagsArray,
 		)
 		if err != nil {
 			return err
@@ -189,20 +195,15 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 	}
 
 	// Mark models not returned this sync as removed.
+	// Use pq.Array for the exclusion list — safe for model IDs with any characters.
 	if len(seen) > 0 {
-		// Build exclusion list.
-		ids := make([]string, 0, len(seen))
-		for id := range seen {
-			ids = append(ids, id)
-		}
-		// Use ANY(ARRAY[...]) to avoid N parameters.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE provider_remote_models
 			SET enabled=FALSE, removed_at=NOW()
 			WHERE provider_id=$1
 			  AND enabled=TRUE
-			  AND provider_model_id != ALL($2::text[])`,
-			providerID, "{"+strings.Join(quoteAll(ids), ",")+"}",
+			  AND provider_model_id != ALL($2)`,
+			providerID, pq.Array(seen),
 		)
 		if err != nil {
 			return err
@@ -256,15 +257,6 @@ func containsAny(s string, keywords ...string) bool {
 		}
 	}
 	return false
-}
-
-func quoteAll(ss []string) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		// Escape single quotes for the PostgreSQL array literal.
-		out[i] = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
-	}
-	return out
 }
 
 // SyncInterval returns the provider's sync interval as a Duration.

@@ -273,7 +273,7 @@ func main() {
 	a.POST("/models/external", runtimeH.RegisterExternalModel) // cloud/provider models
 	a.POST("/models", runtimeH.RegisterModel)
 	a.GET("/models", runtimeH.ListModels)
-	a.GET("/providers", runtimeH.ListProviderDefaults) // provider catalog + defaults
+	a.GET("/provider-defaults", runtimeH.ListProviderDefaults) // legacy provider defaults (used by UI form pre-fill)
 	a.POST("/models/:id/endpoints", runtimeH.AddEndpoint)
 	a.DELETE("/models/:id/endpoints/:ep", runtimeH.RemoveEndpoint)
 	a.POST("/models/:id/drain", runtimeH.DrainModel)

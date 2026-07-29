@@ -345,6 +345,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if backend == nil {
 					backend = h.registry.BackendForType(string(runtime.BackendOpenAICompat))
 				}
+				if backend == nil {
+					// BackendForType should never return nil for openai_compat, but
+					// be defensive — fall back to 503 rather than panic.
+					abortErr(c, http.StatusServiceUnavailable, "no_backend",
+						"no backend implementation found for provider type: "+string(ep.BackendType))
+					return
+				}
 				// Build the per-provider HTTP client from the virtual endpoint's
 				// transport config (already carries provider proxy, TLS, etc.).
 				virtualClient, clientErr := runtime.BuildProviderClient(vep.Transport)

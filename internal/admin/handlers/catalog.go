@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 )
@@ -243,9 +245,11 @@ func (h *CatalogHandler) DeleteProvider(c *gin.Context) {
 // SyncProvider handles POST /admin/v1/providers/:id/sync
 func (h *CatalogHandler) SyncProvider(c *gin.Context) {
 	id := c.Param("id")
+	// Use context.Background() — the request context is cancelled as soon as
+	// the 202 response is sent, which would abort the sync goroutine immediately.
 	go func() {
 		if h.scheduler != nil {
-			_ = h.scheduler.TriggerSync(c.Request.Context(), id)
+			_ = h.scheduler.TriggerSync(context.Background(), id)
 			if h.resolver != nil {
 				h.resolver.Invalidate()
 			}
@@ -321,6 +325,21 @@ func (h *CatalogHandler) UpdateTransport(c *gin.Context) {
 	}
 	if in.ConnectTimeoutSeconds != nil {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET connect_timeout_seconds=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.ConnectTimeoutSeconds)
+	}
+	if in.ReadTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET read_timeout_seconds=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.ReadTimeoutSeconds)
+	}
+	if in.IdleConnTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET idle_conn_timeout_seconds=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.IdleConnTimeoutSeconds)
+	}
+	if in.ResponseHeaderTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET response_header_timeout_seconds=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.ResponseHeaderTimeoutSeconds)
+	}
+	if in.MaxIdleConnsPerHost != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET max_idle_conns_per_host=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.MaxIdleConnsPerHost)
+	}
+	if in.MaxConnsPerHost != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET max_conns_per_host=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.MaxConnsPerHost)
 	}
 	if in.DisableHTTP2 != nil {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET disable_http2=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.DisableHTTP2)
@@ -430,10 +449,6 @@ func splitComma(s string) []string {
 		return nil
 	}
 	return strings.Split(s, ",")
-}
-
-func joinStr(ss []string, sep string) string {
-	return strings.Join(ss, sep)
 }
 
 // ── Catalog Alias (Mode A public model) ──────────────────────────────────────
@@ -582,11 +597,13 @@ func (h *CatalogHandler) CreateRule(c *gin.Context) {
 	if in.Priority == 0 {
 		in.Priority = 100
 	}
-	denyTagsLit := "{}"
-	if len(in.DenyTags) > 0 {
-		denyTagsLit = `{"` + joinStr(in.DenyTags, `","`) + `"}`
-	}
 	rid := uuid.New().String()
+	// Use pq.Array for deny_tags — safe for all characters including
+	// slashes and hyphens that appear in provider tag values.
+	denyTagsArray := pq.Array(in.DenyTags)
+	if len(in.DenyTags) == 0 {
+		denyTagsArray = pq.Array([]string{})
+	}
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO provider_exposure_rules
 		  (id,provider_id,rule_type,pattern,model_id,
@@ -594,12 +611,12 @@ func (h *CatalogHandler) CreateRule(c *gin.Context) {
 		   require_audio,require_embeddings,require_reasoning,
 		   deny_tags,priority)
 		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),
-		        $6,$7,$8,$9,$10,$11,$12::text[],$13)`,
+		        $6,$7,$8,$9,$10,$11,$12,$13)`,
 		rid, providerID, in.RuleType,
 		in.Pattern, in.ModelID,
 		in.RequireStreaming, in.RequireTools, in.RequireVision,
 		in.RequireAudio, in.RequireEmbeddings, in.RequireReasoning,
-		denyTagsLit, in.Priority,
+		denyTagsArray, in.Priority,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

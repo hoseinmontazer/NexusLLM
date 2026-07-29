@@ -191,6 +191,8 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 	for _, prov := range providers {
 		prefix := prov.CatalogExposePrefix
 		if prefix == "" {
+			// Fall back to provider name — ensures virtual model names are always
+			// namespaced (e.g. "openrouter/openai/gpt-5", not "/openai/gpt-5").
 			prefix = prov.Name
 		}
 
@@ -253,7 +255,9 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 
 			virtualName := prefix + "/" + e.ProviderModelID
 			vep := &VirtualEndpoint{
-				ID:                "virt:" + e.ProviderModelID,
+				// Include provider ID in the virtual endpoint ID to prevent
+				// collisions when two providers expose a model with the same ID.
+				ID:                "virt:" + prov.ID + ":" + e.ProviderModelID,
 				BackendType:       runtime.BackendType(prov.BackendType),
 				UpstreamBaseURL:   prov.BaseURL,
 				UpstreamAPIKey:    prov.APIKey,
