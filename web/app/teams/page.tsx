@@ -2,39 +2,48 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type Team } from '@/lib/api'
+import { api, type Team, type Model } from '@/lib/api'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, FolderKanban, X, ShieldCheck } from 'lucide-react'
+import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, FolderKanban, X, ShieldCheck, Globe, Cpu } from 'lucide-react'
 import Link from 'next/link'
 
 // ── Model access grant panel ──────────────────────────────────────────────────
 function ModelAccessPanel({ team }: { team: Team }) {
   const qc = useQueryClient()
   const [modelInput, setModelInput] = useState('')
+  const [tab, setTab] = useState<'local' | 'cloud'>('local')
 
   const { data: modelsData, isLoading } = useQuery({
     queryKey: ['team-models', team.id],
     queryFn: () => api.teams.listModels(team.id),
   })
 
-  // All registered models for the autocomplete list
+  // All registered models (both local and cloud — unified registry after migration 044).
+  // provider_is_external=true → cloud model. false/undefined → local model.
   const { data: allModels } = useQuery({
     queryKey: ['models'],
     queryFn: () => api.models.list(),
   })
-  const modelNames = (allModels?.data ?? []).map(m => m.name)
+
+  const allModelList: Model[] = allModels?.data ?? []
+  const localModels   = allModelList.filter(m => !m.provider_is_external)
+  const cloudModels   = allModelList.filter(m =>  m.provider_is_external)
+
   const grantedModels = modelsData?.models ?? []
-  const ungrantedModels = modelNames.filter(n => !grantedModels.includes(n))
+
+  const localUngranted = localModels .filter(m => !grantedModels.includes(m.name))
+  const cloudUngranted = cloudModels .filter(m => !grantedModels.includes(m.name))
+  const allUngranted   = allModelList.filter(m => !grantedModels.includes(m.name))
 
   const grant = useMutation({
     mutationFn: (name: string) => api.teams.addModel(team.id, name),
-    onSuccess: (_,name) => {
-      toast({ title: `Access granted`, description: `${team.name} → ${name}` })
+    onSuccess: (_, name) => {
+      toast({ title: 'Access granted', description: `${team.name} → ${name}` })
       qc.invalidateQueries({ queryKey: ['team-models', team.id] })
       setModelInput('')
     },
@@ -43,19 +52,22 @@ function ModelAccessPanel({ team }: { team: Team }) {
 
   const revoke = useMutation({
     mutationFn: (name: string) => api.teams.removeModel(team.id, name),
-    onSuccess: (_,name) => {
-      toast({ title: `Access revoked`, description: `${team.name} ✕ ${name}` })
+    onSuccess: (_, name) => {
+      toast({ title: 'Access revoked', description: `${team.name} ✕ ${name}` })
       qc.invalidateQueries({ queryKey: ['team-models', team.id] })
     },
     onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
   })
+
+  // Label a granted model as cloud or local
+  const modelMeta = (name: string): Model | undefined => allModelList.find(m => m.name === name)
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
         <ShieldCheck className="w-3.5 h-3.5" />Model Access
         <span className="font-normal normal-case text-muted-foreground ml-1">
-          — gateway ACL, required before any inference request
+          — gateway ACL · local and cloud models use the same permission system
         </span>
       </div>
 
@@ -68,24 +80,35 @@ function ModelAccessPanel({ team }: { team: Team }) {
         </p>
       ) : (
         <div className="flex flex-wrap gap-1.5">
-          {grantedModels.map(name => (
-            <span key={name}
-              className="inline-flex items-center gap-1 text-xs bg-green-50 text-green-700 border border-green-200 rounded-full pl-2.5 pr-1 py-0.5">
-              {name}
-              <button
-                onClick={() => revoke.mutate(name)}
-                disabled={revoke.isPending}
-                className="ml-0.5 hover:text-red-600 transition-colors rounded-full p-0.5 hover:bg-red-50"
-                title={`Revoke ${name}`}
-              >
-                <X className="w-3 h-3" />
-              </button>
-            </span>
-          ))}
+          {grantedModels.map(name => {
+            const meta = modelMeta(name)
+            const isCloud = meta?.provider_is_external === true
+            return (
+              <span key={name}
+                className={`inline-flex items-center gap-1 text-xs border rounded-full pl-2 pr-1 py-0.5 ${
+                  isCloud
+                    ? 'bg-blue-50 text-blue-700 border-blue-200'
+                    : 'bg-green-50 text-green-700 border-green-200'
+                }`}>
+                {isCloud
+                  ? <Globe className="w-2.5 h-2.5 shrink-0" />
+                  : <Cpu  className="w-2.5 h-2.5 shrink-0" />}
+                {name}
+                <button
+                  onClick={() => revoke.mutate(name)}
+                  disabled={revoke.isPending}
+                  className="ml-0.5 hover:text-red-600 transition-colors rounded-full p-0.5 hover:bg-red-50"
+                  title={`Revoke ${name}`}
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </span>
+            )
+          })}
         </div>
       )}
 
-      {/* Grant new model */}
+      {/* Grant new model — text input with datalist autocomplete */}
       <div className="flex gap-2">
         <div className="flex-1 relative">
           <Input
@@ -96,7 +119,7 @@ function ModelAccessPanel({ team }: { team: Team }) {
             list={`model-list-${team.id}`}
           />
           <datalist id={`model-list-${team.id}`}>
-            {ungrantedModels.map(n => <option key={n} value={n} />)}
+            {allUngranted.map(m => <option key={m.name} value={m.name} />)}
           </datalist>
         </div>
         <Button
@@ -109,20 +132,56 @@ function ModelAccessPanel({ team }: { team: Team }) {
         </Button>
       </div>
 
-      {/* Quick-grant all */}
-      {ungrantedModels.length > 0 && (
-        <div className="flex flex-wrap gap-1 pt-1">
-          <span className="text-xs text-muted-foreground self-center mr-1">Quick grant:</span>
-          {ungrantedModels.slice(0, 6).map(name => (
+      {/* Quick-grant tabs: Local | Cloud */}
+      {(localUngranted.length > 0 || cloudUngranted.length > 0) && (
+        <div className="space-y-2">
+          <div className="flex gap-0 border-b">
             <button
-              key={name}
-              onClick={() => grant.mutate(name)}
-              disabled={grant.isPending}
-              className="text-[10px] px-2 py-0.5 rounded border border-dashed border-gray-300 text-muted-foreground hover:border-green-400 hover:text-green-700 hover:bg-green-50 transition-colors"
+              className={`flex items-center gap-1 px-3 py-1 text-xs font-medium border-b-2 transition-colors ${
+                tab === 'local' ? 'border-blue-600 text-blue-700' : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => setTab('local')}
             >
-              + {name}
+              <Cpu className="w-3 h-3" />Local ({localUngranted.length})
             </button>
-          ))}
+            <button
+              className={`flex items-center gap-1 px-3 py-1 text-xs font-medium border-b-2 transition-colors ${
+                tab === 'cloud' ? 'border-blue-600 text-blue-700' : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => setTab('cloud')}
+            >
+              <Globe className="w-3 h-3" />Cloud ({cloudUngranted.length})
+            </button>
+          </div>
+
+          {tab === 'local' && localUngranted.length === 0 && (
+            <p className="text-xs text-muted-foreground italic">All local models already granted.</p>
+          )}
+          {tab === 'cloud' && cloudUngranted.length === 0 && (
+            <p className="text-xs text-muted-foreground italic">
+              No cloud models available.{' '}
+              <Link href="/models" className="text-blue-600 hover:underline">Register a cloud model first →</Link>
+            </p>
+          )}
+
+          <div className="flex flex-wrap gap-1">
+            {(tab === 'local' ? localUngranted : cloudUngranted).slice(0, 12).map(m => (
+              <button
+                key={m.name}
+                onClick={() => grant.mutate(m.name)}
+                disabled={grant.isPending}
+                className="text-[10px] px-2 py-0.5 rounded border border-dashed border-gray-300 text-muted-foreground hover:border-blue-400 hover:text-blue-700 hover:bg-blue-50 transition-colors"
+                title={m.display_name !== m.name ? m.display_name : undefined}
+              >
+                + {m.name}
+              </button>
+            ))}
+            {(tab === 'local' ? localUngranted : cloudUngranted).length > 12 && (
+              <span className="text-[10px] text-muted-foreground self-center">
+                +{(tab === 'local' ? localUngranted : cloudUngranted).length - 12} more — type in the field above
+              </span>
+            )}
+          </div>
         </div>
       )}
     </div>

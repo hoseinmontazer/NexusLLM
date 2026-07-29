@@ -44,14 +44,6 @@ BEGIN;
 -- ─────────────────────────────────────────────────────────────────────────────
 
 COMMENT ON TABLE team_model_permissions IS
-    'Universal model permission grant. Links a team to a Public Model regardless '
-    'of whether the model runs on a local runtime (vLLM, TGI, llama.cpp) or a '
-    'remote provider (OpenAI, OpenRouter, Anthropic, etc.). '
-    'Backend type never affects authorization. '
-    'To grant access: INSERT INTO team_model_permissions (team_id, model_id). '
-    'The model_id FK references models.id — every callable model must have a row there.';
-
-COMMENT ON TABLE team_model_permissions IS
     'Universal model ACL. One row = one team has permission to call one model. '
     'Applies to ALL backend types: local runtimes and cloud providers alike.';
 

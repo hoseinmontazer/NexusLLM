@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, RefreshCw, Zap, Search, CheckCircle2,
-  XCircle, Loader2, Settings, Shield, Eye,
+  XCircle, Loader2, Settings, Shield, Eye, PackageCheck,
 } from 'lucide-react'
 
 // ── Capability badges ──────────────────────────────────────────────────────────
@@ -28,6 +28,142 @@ function CapBadges({ entry }: { entry: CatalogEntry }) {
   )
 }
 
+// ── Register as Public Models panel ───────────────────────────────────────────
+//
+// Shown inside the Catalog tab when the admin has selected models and clicks
+// "Register as Public Models". Each selected provider_model_id gets a row
+// where the admin types a public name (pre-filled from the model ID).
+// Submits to POST /providers/:id/register-models, which creates models rows
+// + model_endpoints rows so the models appear in api.models.list and can be
+// granted to teams via team_model_permissions — identical to local models.
+
+interface RegisterEntry {
+  providerModelId: string
+  publicName: string
+  serviceType: string
+}
+
+function RegisterPublicModelsPanel({
+  providerId,
+  selectedIds,
+  onDone,
+  onCancel,
+}: {
+  providerId: string
+  selectedIds: string[]
+  onDone: () => void
+  onCancel: () => void
+}) {
+  const qc = useQueryClient()
+  const [entries, setEntries] = useState<RegisterEntry[]>(() =>
+    selectedIds.map(id => ({
+      providerModelId: id,
+      // Derive a clean public name: use last path segment, strip version suffixes
+      publicName: id.split('/').pop()?.replace(/:.*$/, '') ?? id,
+      serviceType: id.toLowerCase().includes('embed') ? 'EMBEDDING'
+        : id.toLowerCase().includes('whisper') || id.toLowerCase().includes('transcri') ? 'STT'
+        : id.toLowerCase().includes('tts') || id.toLowerCase().includes('speech') ? 'TTS'
+        : 'CHAT',
+    }))
+  )
+
+  const setEntry = (i: number, field: keyof RegisterEntry, val: string) =>
+    setEntries(prev => prev.map((e, idx) => idx === i ? { ...e, [field]: val } : e))
+
+  const registerMut = useMutation({
+    mutationFn: () => api.providers.registerModels(
+      providerId,
+      entries.map(e => ({
+        public_name:       e.publicName.trim(),
+        provider_model_id: e.providerModelId,
+        service_type:      e.serviceType,
+      })).filter(e => e.public_name !== '')
+    ),
+    onSuccess: (r) => {
+      const ok = r.results.filter(x => !x.error).length
+      const fail = r.results.filter(x => !!x.error)
+      if (ok > 0) {
+        toast({ title: `${ok} model${ok !== 1 ? 's' : ''} registered as Public Models` })
+        qc.invalidateQueries({ queryKey: ['models'] })
+      }
+      if (fail.length > 0) {
+        toast({
+          title: `${fail.length} model${fail.length !== 1 ? 's' : ''} failed`,
+          description: fail.map(f => `${f.public_name}: ${f.error}`).join(' · '),
+          variant: 'destructive',
+        })
+      }
+      onDone()
+    },
+    onError: (e: any) => toast({ title: 'Registration failed', description: e.message, variant: 'destructive' }),
+  })
+
+  return (
+    <div className="rounded-md border border-blue-200 bg-blue-50 p-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-semibold text-blue-900 flex items-center gap-1.5">
+          <PackageCheck className="w-3.5 h-3.5" />
+          Register {selectedIds.length} model{selectedIds.length !== 1 ? 's' : ''} as Public Models
+        </p>
+        <button onClick={onCancel} className="text-xs text-blue-600 hover:text-blue-900">✕ Cancel</button>
+      </div>
+
+      <p className="text-[11px] text-blue-800">
+        Each model gets a <strong>Public Name</strong> — what clients send in the <code>model:</code> field.
+        After registration the model appears in the unified model registry and can be granted to teams.
+      </p>
+
+      <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+        <div className="grid grid-cols-[1fr_1fr_auto] gap-2 text-[10px] font-semibold text-blue-700 px-1">
+          <span>Provider Model ID</span><span>Public Name</span><span>Type</span>
+        </div>
+        {entries.map((e, i) => (
+          <div key={e.providerModelId} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-center">
+            <span className="font-mono text-[10px] text-muted-foreground truncate bg-white/70 border border-blue-100 rounded px-2 py-1"
+              title={e.providerModelId}>
+              {e.providerModelId}
+            </span>
+            <input
+              value={e.publicName}
+              onChange={ev => setEntry(i, 'publicName', ev.target.value)}
+              className="text-xs border border-blue-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+              placeholder="public-name"
+            />
+            <select
+              value={e.serviceType}
+              onChange={ev => setEntry(i, 'serviceType', ev.target.value)}
+              className="text-[10px] border border-blue-200 rounded px-1 py-1 bg-white focus:outline-none"
+            >
+              <option value="CHAT">CHAT</option>
+              <option value="EMBEDDING">EMBED</option>
+              <option value="STT">STT</option>
+              <option value="TTS">TTS</option>
+              <option value="RERANK">RERANK</option>
+              <option value="VISION">VISION</option>
+            </select>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-3 pt-1">
+        <Button
+          size="sm"
+          className="h-7 bg-blue-600 hover:bg-blue-700 text-white"
+          disabled={registerMut.isPending || entries.every(e => !e.publicName.trim())}
+          onClick={() => registerMut.mutate()}
+        >
+          {registerMut.isPending
+            ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Registering…</>
+            : <><PackageCheck className="w-3 h-3 mr-1" />Register Models</>}
+        </Button>
+        <p className="text-[10px] text-blue-700">
+          After this, go to <strong>Teams → Model Access</strong> to grant teams permission to use them.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 // ── Catalog tab ────────────────────────────────────────────────────────────────
 
 function CatalogTab({ providerId }: { providerId: string }) {
@@ -37,6 +173,7 @@ function CatalogTab({ providerId }: { providerId: string }) {
   const [tag, setTag] = useState('')
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [showRegisterPanel, setShowRegisterPanel] = useState(false)
 
   // Catalog entries (paginated)
   const { data, isLoading } = useQuery({
@@ -153,12 +290,30 @@ function CatalogTab({ providerId }: { providerId: string }) {
                 Hide {selectedExposedRuleIds.length}
               </Button>
             )}
+            {/* Register as Public Models — promotes selected catalog entries into
+                the unified model registry so teams can be granted access to them */}
+            <Button size="sm" variant="outline"
+              className="h-7 border-blue-400 text-blue-700 hover:bg-blue-50"
+              onClick={() => setShowRegisterPanel(v => !v)}>
+              <PackageCheck className="w-3 h-3 mr-1" />
+              Register as Public Models
+            </Button>
             <Button size="sm" variant="ghost" className="h-7 text-xs"
-              onClick={() => setSelected(new Set())}>
+              onClick={() => { setSelected(new Set()); setShowRegisterPanel(false) }}>
               Clear
             </Button>
           </div>
         </div>
+      )}
+
+      {/* Register panel — inline form to set public names before submission */}
+      {showRegisterPanel && selected.size > 0 && (
+        <RegisterPublicModelsPanel
+          providerId={providerId}
+          selectedIds={Array.from(selected)}
+          onDone={() => { setSelected(new Set()); setShowRegisterPanel(false) }}
+          onCancel={() => setShowRegisterPanel(false)}
+        />
       )}
 
       {/* Catalog table */}

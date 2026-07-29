@@ -932,6 +932,17 @@ export const api = {
     }) => req<{ id: string; provider_id: string }>('POST', `/providers/${id}/rules`, b),
     deleteRule: (id: string, rid: string) => req<{ message: string }>('DELETE', `/providers/${id}/rules/${rid}`),
     previewRules: (id: string) => req<{ exposed_count: number; blocked_count: number; exposed: string[]; blocked: string[] }>('POST', `/providers/${id}/rules/preview`, {}),
+
+    /** Promote catalog entries to Public Models (creates models + endpoints rows).
+     *  After registration the models appear in api.models.list and can be granted
+     *  to teams via the standard team_model_permissions flow. */
+    registerModels: (id: string, models: { public_name: string; provider_model_id: string; display_name?: string; service_type?: string }[]) =>
+      req<{
+        created: number
+        total: number
+        results: { public_name: string; provider_model_id: string; model_id?: string; endpoint_id?: string; error?: string }[]
+        note: string
+      }>('POST', `/providers/${id}/register-models`, { models }),
   },
 
   // ── Project policy & quota (migration 023) ────────────────────────────────
