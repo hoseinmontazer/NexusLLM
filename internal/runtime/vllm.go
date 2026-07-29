@@ -51,7 +51,11 @@ func (b *vllmBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []stri
 
 // Health polls /health (liveness) and /metrics (capacity) to produce a
 // complete EndpointHealth snapshot.
-func (b *vllmBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *vllmBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	c := b.client
+	if client != nil {
+		c = client
+	}
 	h := EndpointHealth{
 		URL:       url,
 		Status:    StatusDown,
@@ -65,7 +69,7 @@ func (b *vllmBackend) Health(ctx context.Context, url string) EndpointHealth {
 		return h
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	h.LatencyMs = int(time.Since(start).Milliseconds())
 	if err != nil {
 		h.Error = err.Error()
@@ -81,14 +85,17 @@ func (b *vllmBackend) Health(ctx context.Context, url string) EndpointHealth {
 	}
 
 	// Best-effort metrics scrape for capacity info.
-	b.enrichFromMetrics(ctx, url, &h)
+	// Pass the same resolved client so the metrics probe honours the same
+	// per-endpoint proxy, TLS, and timeout configuration as the health probe.
+	b.enrichFromMetrics(ctx, url, c, &h)
 	return h
 }
 
 // enrichFromMetrics scrapes vLLM's Prometheus /metrics endpoint for queue depth
 // and GPU cache utilisation. Failures are silently ignored — health data is
 // already populated from /health.
-func (b *vllmBackend) enrichFromMetrics(ctx context.Context, baseURL string, h *EndpointHealth) {
+// client must be the per-endpoint *http.Client resolved by the caller (never nil).
+func (b *vllmBackend) enrichFromMetrics(ctx context.Context, baseURL string, client *http.Client, h *EndpointHealth) {
 	mCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
@@ -96,7 +103,7 @@ func (b *vllmBackend) enrichFromMetrics(ctx context.Context, baseURL string, h *
 	if err != nil {
 		return
 	}
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return
 	}
@@ -125,12 +132,16 @@ func (b *vllmBackend) enrichFromMetrics(ctx context.Context, baseURL string, h *
 	}
 }
 
-func (b *vllmBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
+func (b *vllmBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	c := b.client
+	if client != nil {
+		c = client
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s/v1/models: %w", url, err)
 	}
@@ -148,6 +159,10 @@ func (b *vllmBackend) Models(ctx context.Context, url string) ([]BackendModel, e
 }
 
 func (b *vllmBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
+	c := b.client
+	if r.Client != nil {
+		c = r.Client
+	}
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal chat request: %w", err)
@@ -163,7 +178,7 @@ func (b *vllmBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("chat completion to %s: %w", chatURL, err)
 	}
@@ -186,6 +201,10 @@ func (b *vllmBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse
 }
 
 func (b *vllmBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
+	c := b.client
+	if r.Client != nil {
+		c = r.Client
+	}
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -197,7 +216,7 @@ func (b *vllmBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.E
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embeddings: %w", err)
 	}

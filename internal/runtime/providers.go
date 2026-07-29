@@ -57,33 +57,29 @@ func (providerNoopLifecycle) PrepareStartupArgs(_ ModelStartupCaps, args []strin
 
 type openAIProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
 // NewOpenAIProviderBackend constructs the OpenAI provider backend.
-func NewOpenAIProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &openAIProviderBackend{client: client}
+func NewOpenAIProviderBackend(_ *http.Client) Backend {
+	return &openAIProviderBackend{}
 }
 
 func (b *openAIProviderBackend) Type() BackendType { return BackendOpenAI }
 
-func (b *openAIProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1/models", "", BackendOpenAI)
+func (b *openAIProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1/models", "", BackendOpenAI)
 }
 
-func (b *openAIProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *openAIProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 
 func (b *openAIProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 
 func (b *openAIProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,20 +92,16 @@ func (b *openAIProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) 
 
 type anthropicProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
 // NewAnthropicProviderBackend constructs the Anthropic provider backend.
-func NewAnthropicProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &anthropicProviderBackend{client: client}
+func NewAnthropicProviderBackend(_ *http.Client) Backend {
+	return &anthropicProviderBackend{}
 }
 
 func (b *anthropicProviderBackend) Type() BackendType { return BackendAnthropic }
 
-func (b *anthropicProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *anthropicProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
@@ -119,7 +111,7 @@ func (b *anthropicProviderBackend) Health(ctx context.Context, url string) Endpo
 	}
 	req.Header.Set("anthropic-version", anthropicVersion)
 	// A health probe without a key returns 401, which still means the API is up.
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	h.LatencyMs = int(time.Since(start).Milliseconds())
 	if err != nil {
 		h.Error = err.Error()
@@ -143,7 +135,7 @@ func (b *anthropicProviderBackend) Health(ctx context.Context, url string) Endpo
 	return h
 }
 
-func (b *anthropicProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
+func (b *anthropicProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
 	// Anthropic /v1/models returns its own format — return a stub.
 	return []BackendModel{{ID: "claude", OwnedBy: "anthropic"}}, nil
 }
@@ -220,7 +212,7 @@ func (b *anthropicProviderBackend) Chat(ctx context.Context, r ChatRequest) (*Ba
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := r.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic chat: %w", err)
 	}
@@ -493,26 +485,22 @@ func buildOAIStreamChunk(id, model, content string, finishReason *string) map[st
 
 type geminiProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
 // NewGeminiProviderBackend constructs the Google Gemini provider backend.
-func NewGeminiProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &geminiProviderBackend{client: client}
+func NewGeminiProviderBackend(_ *http.Client) Backend {
+	return &geminiProviderBackend{}
 }
 
 func (b *geminiProviderBackend) Type() BackendType { return BackendGemini }
 
 // Health checks Gemini's OpenAI-compat /v1beta/openai/models endpoint.
-func (b *geminiProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1beta/openai/models", "", BackendGemini)
+func (b *geminiProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1beta/openai/models", "", BackendGemini)
 }
 
-func (b *geminiProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *geminiProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 
 // Chat routes through Gemini's OpenAI-compat endpoint.
@@ -524,13 +512,13 @@ func (b *geminiProviderBackend) Chat(ctx context.Context, r ChatRequest) (*Backe
 	r2 := r
 	r2.EndpointURL = r.EndpointURL + "/v1beta/openai"
 	// Delegate to the shared OpenAI-compat chat helper (appends /chat/completions).
-	return openAICompatChatWithBase(ctx, b.client, r2, "/chat/completions")
+	return openAICompatChatWithBase(ctx, r.Client, r2, "/chat/completions")
 }
 
 func (b *geminiProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
 	r2 := r
 	r2.EndpointURL = r.EndpointURL + "/v1beta/openai"
-	return openAICompatEmbeddings(ctx, b.client, r2)
+	return openAICompatEmbeddings(ctx, r.Client, r2)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,26 +531,22 @@ func (b *geminiProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) 
 
 type azureOpenAIProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
 // NewAzureOpenAIProviderBackend constructs the Azure OpenAI provider backend.
-func NewAzureOpenAIProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &azureOpenAIProviderBackend{client: client}
+func NewAzureOpenAIProviderBackend(_ *http.Client) Backend {
+	return &azureOpenAIProviderBackend{}
 }
 
 func (b *azureOpenAIProviderBackend) Type() BackendType { return BackendAzureOpenAI }
 
-func (b *azureOpenAIProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *azureOpenAIProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
 	// Azure: probe /openai/deployments?api-version=2024-02-01
-	return providerHealthCheck(ctx, b.client, url,
+	return providerHealthCheck(ctx, client, url,
 		"/openai/deployments?api-version=2024-02-01", "", BackendAzureOpenAI)
 }
 
-func (b *azureOpenAIProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
+func (b *azureOpenAIProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
 	return []BackendModel{{ID: "azure-deployment", OwnedBy: "azure"}}, nil
 }
 
@@ -597,7 +581,7 @@ func (b *azureOpenAIProviderBackend) Chat(ctx context.Context, r ChatRequest) (*
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := r.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("azure openai chat: %w", err)
 	}
@@ -630,7 +614,7 @@ func (b *azureOpenAIProviderBackend) Embeddings(ctx context.Context, r EmbedRequ
 	if r.UpstreamAPIKey != "" {
 		req.Header.Set("api-key", r.UpstreamAPIKey)
 	}
-	resp, err := b.client.Do(req)
+	resp, err := r.Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -654,159 +638,135 @@ func (b *azureOpenAIProviderBackend) Embeddings(ctx context.Context, r EmbedRequ
 // openRouterProviderBackend — OpenRouter (openrouter.ai)
 type openRouterProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewOpenRouterProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &openRouterProviderBackend{client: client}
+func NewOpenRouterProviderBackend(_ *http.Client) Backend {
+	return &openRouterProviderBackend{}
 }
 func (b *openRouterProviderBackend) Type() BackendType { return BackendOpenRouter }
-func (b *openRouterProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/api/v1/models", "", BackendOpenRouter)
+func (b *openRouterProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/api/v1/models", "", BackendOpenRouter)
 }
-func (b *openRouterProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url+"/api/v1", "")
+func (b *openRouterProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url+"/api/v1", "")
 }
 func (b *openRouterProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
 	r2 := r
 	r2.EndpointURL = strings.TrimSuffix(r.EndpointURL, "/v1")
-	return openAICompatChatWithBase(ctx, b.client, r2, "/api/v1/chat/completions")
+	return openAICompatChatWithBase(ctx, r.Client, r2, "/api/v1/chat/completions")
 }
 func (b *openRouterProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // groqProviderBackend — Groq (api.groq.com)
 type groqProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewGroqProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &groqProviderBackend{client: client}
+func NewGroqProviderBackend(_ *http.Client) Backend {
+	return &groqProviderBackend{}
 }
 func (b *groqProviderBackend) Type() BackendType { return BackendGroq }
-func (b *groqProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/openai/v1/models", "", BackendGroq)
+func (b *groqProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/openai/v1/models", "", BackendGroq)
 }
-func (b *groqProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *groqProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 func (b *groqProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 func (b *groqProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // togetherProviderBackend — Together AI (api.together.xyz)
 type togetherProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewTogetherProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &togetherProviderBackend{client: client}
+func NewTogetherProviderBackend(_ *http.Client) Backend {
+	return &togetherProviderBackend{}
 }
 func (b *togetherProviderBackend) Type() BackendType { return BackendTogether }
-func (b *togetherProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1/models", "", BackendTogether)
+func (b *togetherProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1/models", "", BackendTogether)
 }
-func (b *togetherProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *togetherProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 func (b *togetherProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 func (b *togetherProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // mistralProviderBackend — Mistral AI (api.mistral.ai)
 type mistralProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewMistralProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &mistralProviderBackend{client: client}
+func NewMistralProviderBackend(_ *http.Client) Backend {
+	return &mistralProviderBackend{}
 }
 func (b *mistralProviderBackend) Type() BackendType { return BackendMistral }
-func (b *mistralProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1/models", "", BackendMistral)
+func (b *mistralProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1/models", "", BackendMistral)
 }
-func (b *mistralProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *mistralProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 func (b *mistralProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 func (b *mistralProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // cohereProviderBackend — Cohere (api.cohere.com)
 type cohereProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewCohereProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &cohereProviderBackend{client: client}
+func NewCohereProviderBackend(_ *http.Client) Backend {
+	return &cohereProviderBackend{}
 }
 func (b *cohereProviderBackend) Type() BackendType { return BackendCohere }
-func (b *cohereProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1/models", "", BackendCohere)
+func (b *cohereProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1/models", "", BackendCohere)
 }
-func (b *cohereProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *cohereProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 func (b *cohereProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 func (b *cohereProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // deepSeekProviderBackend — DeepSeek (api.deepseek.com)
 type deepSeekProviderBackend struct {
 	providerNoopLifecycle
-	client *http.Client
 }
 
-func NewDeepSeekProviderBackend(client *http.Client) Backend {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
-	}
-	return &deepSeekProviderBackend{client: client}
+func NewDeepSeekProviderBackend(_ *http.Client) Backend {
+	return &deepSeekProviderBackend{}
 }
 func (b *deepSeekProviderBackend) Type() BackendType { return BackendDeepSeek }
-func (b *deepSeekProviderBackend) Health(ctx context.Context, url string) EndpointHealth {
-	return providerHealthCheck(ctx, b.client, url, "/v1/models", "", BackendDeepSeek)
+func (b *deepSeekProviderBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return providerHealthCheck(ctx, client, url, "/v1/models", "", BackendDeepSeek)
 }
-func (b *deepSeekProviderBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return openAICompatModels(ctx, b.client, url, "")
+func (b *deepSeekProviderBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return openAICompatModels(ctx, client, url, "")
 }
 func (b *deepSeekProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChat(ctx, b.client, r)
+	return openAICompatChat(ctx, r.Client, r)
 }
 func (b *deepSeekProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, b.client, r)
+	return openAICompatEmbeddings(ctx, r.Client, r)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

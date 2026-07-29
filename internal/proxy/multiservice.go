@@ -249,7 +249,7 @@ func (h *Handler) Rerank(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.clientFor(ep).Do(httpReq)
+	resp, err := h.registry.ClientForEndpoint(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -343,15 +343,20 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 
 	// If we have an upstream model name (from request or config), rewrite the form.
 	if effectiveUpstreamModel != "" {
-		if err := h.forwardMultipartWithModelSubstitution(c, epEffectiveURL(ep)+"/v1/audio/transcriptions",
-			ep.UpstreamAPIKey, ep.UpstreamProxy, effectiveUpstreamModel, bodyBytes, true); err != nil {
+		if err := h.forwardMultipartWithModelSubstitution(c,
+			epEffectiveURL(ep)+"/v1/audio/transcriptions",
+			ep.UpstreamAPIKey,
+			h.registry.ClientForEndpoint(ep),
+			effectiveUpstreamModel, bodyBytes, true); err != nil {
 			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
 	} else {
 		// No model name substitution needed - forward as-is
 		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions", ep.UpstreamAPIKey, ep.UpstreamProxy); err != nil {
+		if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions",
+			ep.UpstreamAPIKey,
+			h.registry.ClientForEndpoint(ep)); err != nil {
 			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
@@ -406,7 +411,7 @@ func (h *Handler) Speech(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.clientFor(ep).Do(httpReq)
+	resp, err := h.registry.ClientForEndpoint(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -470,7 +475,7 @@ func (h *Handler) OCR(c *gin.Context) {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.UpstreamAPIKey)
 	}
 
-	resp, err := h.clientFor(ep).Do(httpReq)
+	resp, err := h.registry.ClientForEndpoint(ep).Do(httpReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -495,16 +500,17 @@ func (h *Handler) OCR(c *gin.Context) {
 // targetURL and writes the response back. Used for binary/multipart requests
 // where we must not buffer or reparse the body (e.g. STT audio upload).
 // upstreamAPIKey, when non-empty, is injected as Authorization: Bearer.
-// proxyURL, when non-empty, routes the outbound request through that proxy.
-func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL string) error {
+// client must be the per-endpoint *http.Client from Registry.ClientForEndpoint —
+// it carries the correct proxy, TLS, timeout, and connection-pool configuration.
+func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey string, client *http.Client) error {
 	httpReq, err := http.NewRequestWithContext(
 		c.Request.Context(), c.Request.Method, targetURL, c.Request.Body)
 	if err != nil {
 		return err
 	}
 	for key, vals := range c.Request.Header {
-		if key == "Authorization" {
-			continue // never forward internal auth tokens to backends
+		if key == "Authorization" || key == "Host" {
+			continue // never forward internal auth tokens or client Host to backends
 		}
 		for _, v := range vals {
 			httpReq.Header.Add(key, v)
@@ -513,10 +519,6 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL
 	// Inject upstream key after stripping the client's Authorization header.
 	if upstreamAPIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+upstreamAPIKey)
-	}
-	client := h.httpClient
-	if h.factory != nil {
-		client = h.factory.ClientFor(proxyURL)
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -539,7 +541,8 @@ func (h *Handler) forwardRaw(c *gin.Context, targetURL, upstreamAPIKey, proxyURL
 // (e.g. "whisper" → "large-v3" for faster-whisper-server).
 // If stripUpstreamModel is true, the "upstream_model" field is removed from the
 // forwarded request (it's a gateway-only field, not sent to the backend).
-func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetURL, upstreamAPIKey, proxyURL, upstreamModelName string, originalBody []byte, stripUpstreamModel bool) error {
+// client must be the per-endpoint *http.Client from Registry.ClientForEndpoint.
+func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetURL, upstreamAPIKey string, client *http.Client, upstreamModelName string, originalBody []byte, stripUpstreamModel bool) error {
 	// Parse the original multipart form
 	boundary := extractBoundary(c.Request.Header.Get("Content-Type"))
 	mr := multipart.NewReader(bytes.NewReader(originalBody), boundary)
@@ -603,11 +606,6 @@ func (h *Handler) forwardMultipartWithModelSubstitution(c *gin.Context, targetUR
 
 	if upstreamAPIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+upstreamAPIKey)
-	}
-
-	client := h.httpClient
-	if h.factory != nil {
-		client = h.factory.ClientFor(proxyURL)
 	}
 
 	resp, err := client.Do(httpReq)

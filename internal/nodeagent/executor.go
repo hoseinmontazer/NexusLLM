@@ -273,7 +273,7 @@ func backendPortEnvVars(backend string, port int) map[string]string {
 			"PORT":      s,
 			"HTTP_PORT": s,
 		}
-	case "vllm", "tgi", "tei", "llamacpp":
+	case "vllm", "tgi", "llamacpp":
 		// Port is controlled via --port <n> CMD arg in buildDockerArgs.
 		// No env var injection needed.
 		return nil
@@ -295,10 +295,9 @@ func backendPortEnvVars(backend string, port int) map[string]string {
 // (i.e. no fixed default).
 //
 // IMPORTANT: Keep in sync with Backend.ContainerPort implementations.
-func backendContainerPort(backend string) int {
+func backendContainerPort(_ string) int {
 	// All supported backends either accept their port via --port CMD arg or
 	// via the env vars injected by backendPortEnvVars — no fixed internal port.
-	_ = backend // reserved for future backends with a fixed internal port
 	return 0
 }
 
@@ -1122,34 +1121,6 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 			"--health-timeout", "10s",
 			"--health-retries", "5",
 			"--health-start-period", startPeriod,
-		)
-
-	case "tei":
-		// Text Embeddings Inference (ghcr.io/huggingface/text-embeddings-inference).
-		// TEI downloads from HF Hub on first start and caches under /data inside
-		// the container.  We mount the shared models volume at /data so the cache
-		// survives container restarts — exactly the same pattern as llamacpp uses
-		// for /models.
-		//
-		// If a local pre-downloaded path is supplied via ModelsVolume (absolute
-		// host path) or GGUFPath, we honour that too — the operator passes
-		// --model-id /data/<subdir> via ExtraArgs in that case, or sets HFRepo=""
-		// and GGUFPath to the container path.
-		vol := firstNonEmpty(p.ModelsVolume, "nexus_models", "llamacpp_models")
-		args = append(args, "-v", vol+":/data")
-		// TEI uses host networking — port is passed via --port CMD arg.
-		args = append(args, "--network", "host")
-		// Health check: TEI returns 200 on /health when ready, 503 while loading.
-		// Use a generous start-period (5 min) because the first run downloads the
-		// model weights before serving.  Subsequent restarts hit the cache and are
-		// fast, but Docker doesn't distinguish first-run from warm-start.
-		healthURL := fmt.Sprintf("http://localhost:%d/health", p.BindPort)
-		args = append(args,
-			"--health-cmd", fmt.Sprintf("curl -sf %s || exit 1", healthURL),
-			"--health-interval", "30s",
-			"--health-timeout", "10s",
-			"--health-retries", "5",
-			"--health-start-period", "5m",
 		)
 
 	default:

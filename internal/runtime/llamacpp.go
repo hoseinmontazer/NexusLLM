@@ -44,17 +44,12 @@ func (b *llamacppBackend) ContainerPort() int { return 0 }
 // ContainerPortEnvVars returns nil — llama.cpp is configured via --port CMD arg.
 func (b *llamacppBackend) ContainerPortEnvVars(_ int) map[string]string { return nil }
 
-func (b *llamacppBackend) Health(ctx context.Context, url string) EndpointHealth {
-	// llama.cpp exposes /health (same path as openai_compat's /v1/models check
-	// but returns HTTP 200 when the model is loaded, 503 while loading).
-	// openAICompatBackend uses GET /v1/models which also works, but /health is
-	// more semantically correct and is what the watcher already uses for all
-	// other backends.
-	return b.inner.Health(ctx, url)
+func (b *llamacppBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	return b.inner.Health(ctx, url, client)
 }
 
-func (b *llamacppBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return b.inner.Models(ctx, url)
+func (b *llamacppBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return b.inner.Models(ctx, url, client)
 }
 
 func (b *llamacppBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {

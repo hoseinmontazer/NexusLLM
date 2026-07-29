@@ -251,6 +251,12 @@ func main() {
 	a.PUT("/models/:id/runtime-config", runtimeH.UpdateRuntimeConfig)
 	a.PUT("/models/:id/pool-strategy", runtimeH.UpdatePoolStrategy)
 	a.PUT("/models/:id/upstream", runtimeH.UpdateUpstream)
+	// Per-provider HTTP transport config (migration 046).
+	// PUT replaces individual transport fields (proxy, TLS, timeouts, pool).
+	// GET returns the current config for all endpoints of the model.
+	// Changing one provider never affects any other — full transport isolation.
+	a.PUT("/models/:id/transport", runtimeH.UpdateProviderTransport)
+	a.GET("/models/:id/transport", runtimeH.GetProviderTransport)
 	a.GET("/models/:id/health", runtimeH.GetModelHealth)
 	a.DELETE("/models/:id", runtimeH.DeleteModel)
 	a.GET("/models/:id/deploy-status", runtimeH.GetDeployStatus)

@@ -76,6 +76,24 @@ var (
 		Help:      "Total requests that timed out waiting for an external provider.",
 	}, []string{"provider", "model"})
 
+	// ProviderProxyErrorsTotal counts failures connecting through the outbound proxy.
+	// These are distinct from provider-side errors — they indicate a proxy
+	// configuration or network connectivity problem rather than a provider API error.
+	ProviderProxyErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Subsystem: "provider",
+		Name:      "proxy_errors_total",
+		Help:      "Total proxy connection errors when reaching external providers.",
+	}, []string{"provider", "model"})
+
+	// ProviderConnectionFailuresTotal counts TCP / TLS / DNS failures (non-proxy).
+	ProviderConnectionFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Subsystem: "provider",
+		Name:      "connection_failures_total",
+		Help:      "Total TCP/TLS/DNS connection failures reaching external providers.",
+	}, []string{"provider", "model"})
+
 	// ProviderHealthStatus is a gauge: 1 = healthy, 0 = down.
 	// Updated by the runtime watcher on every health-check tick.
 	ProviderHealthStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -133,6 +151,66 @@ func RecordProviderTokens(provider, model string, input, output, cached, reasoni
 //	"network_error" | "invalid_response"
 func RecordProviderFailure(provider, model, failureType string) {
 	ProviderFailuresTotal.WithLabelValues(provider, model, failureType).Inc()
+}
+
+// RecordProviderConnectionError classifies err using ClassifyProviderError and
+// increments the appropriate counter:
+//   - "proxy_error"         → ProviderProxyErrorsTotal
+//   - "connection_failure"  → ProviderConnectionFailuresTotal
+//   - "timeout"             → ProviderTimeoutTotal
+//   - anything else         → ProviderFailuresTotal with the classified label
+//
+// Call this from the proxy handler when backend.Chat/Embeddings returns an error.
+func RecordProviderConnectionError(provider, model string, err error) {
+	if err == nil {
+		return
+	}
+	label := classifyProviderErrorLabel(err)
+	switch label {
+	case "proxy_error":
+		ProviderProxyErrorsTotal.WithLabelValues(provider, model).Inc()
+		ProviderFailuresTotal.WithLabelValues(provider, model, "proxy_error").Inc()
+	case "connection_failure":
+		ProviderConnectionFailuresTotal.WithLabelValues(provider, model).Inc()
+		ProviderFailuresTotal.WithLabelValues(provider, model, "connection_failure").Inc()
+	case "timeout":
+		ProviderTimeoutTotal.WithLabelValues(provider, model).Inc()
+		ProviderFailuresTotal.WithLabelValues(provider, model, "timeout").Inc()
+	default:
+		ProviderFailuresTotal.WithLabelValues(provider, model, label).Inc()
+	}
+}
+
+// classifyProviderErrorLabel maps an error to a short Prometheus label.
+// Mirrors runtime.ClassifyProviderError without importing the runtime package
+// from middleware (which would create an import cycle).
+func classifyProviderErrorLabel(err error) string {
+	msg := err.Error()
+	switch {
+	case containsStr(msg, "proxyconnect"), containsStr(msg, "CONNECT"):
+		return "proxy_error"
+	case containsStr(msg, "connection refused"), containsStr(msg, "no such host"),
+		containsStr(msg, "dial "):
+		return "connection_failure"
+	case containsStr(msg, "i/o timeout"), containsStr(msg, "context deadline exceeded"),
+		containsStr(msg, "context canceled"):
+		return "timeout"
+	case containsStr(msg, "tls "), containsStr(msg, "x509"), containsStr(msg, "certificate"):
+		return "tls_error"
+	default:
+		return "request_error"
+	}
+}
+
+func containsStr(s, sub string) bool {
+	return len(s) >= len(sub) && func() bool {
+		for i := 0; i <= len(s)-len(sub); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	}()
 }
 
 // RecordProviderHealth updates the health gauge for a provider model endpoint.

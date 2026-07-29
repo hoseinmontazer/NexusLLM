@@ -39,10 +39,6 @@ func NewFactory(client *http.Client) *Factory {
 	// HTTP wire format is OpenAI-compatible, but PrepareStartupArgs handles
 	// llamacpp-specific flags (e.g. --reasoning off for thinking models).
 	f.Register(BackendLlamaCpp, NewLlamaCppBackend)
-	// Text Embeddings Inference — HuggingFace embedding server.
-	// Exposes /v1/embeddings (OpenAI-compatible) and /health.
-	// Port is passed via --port CMD arg; model cache lives at /data.
-	f.Register(BackendTEI, NewTEIBackend)
 
 	// ── External / cloud provider backends ───────────────────────────────
 	// Each provider implements the same Backend interface.

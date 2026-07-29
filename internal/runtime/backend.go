@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -24,7 +25,6 @@ const (
 	BackendVLLM         BackendType = "vllm"
 	BackendTGI          BackendType = "tgi"
 	BackendOpenAICompat BackendType = "openai_compat"
-	// BackendTEI is declared in tei.go.
 
 	// ── External / cloud provider backends ────────────────────────────────
 	// These implement the same Backend interface.
@@ -124,14 +124,16 @@ type BackendModel struct {
 type ChatRequest struct {
 	Req            *models.InferenceRequest
 	EndpointURL    string
-	UpstreamAPIKey string // non-empty for cloud/external endpoints
+	UpstreamAPIKey string       // non-empty for cloud/external endpoints
+	Client         *http.Client // per-endpoint dedicated client; nil = backend uses its own
 }
 
 // EmbedRequest is the canonical request passed to a backend's Embeddings method.
 type EmbedRequest struct {
 	Req            *models.EmbeddingRequest
 	EndpointURL    string
-	UpstreamAPIKey string // non-empty for cloud/external endpoints
+	UpstreamAPIKey string       // non-empty for cloud/external endpoints
+	Client         *http.Client // per-endpoint dedicated client; nil = backend uses its own
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,64 +153,37 @@ type Backend interface {
 	Type() BackendType
 
 	// Health checks liveness and readiness of the endpoint at url.
+	// client is the per-endpoint HTTP client to use; local backends may
+	// ignore it and use their own shared client.
 	// The returned EndpointHealth is fully populated even on failure.
-	Health(ctx context.Context, url string) EndpointHealth
+	Health(ctx context.Context, url string, client *http.Client) EndpointHealth
 
 	// Models lists models currently loaded on the backend endpoint.
-	Models(ctx context.Context, url string) ([]BackendModel, error)
+	// client is the per-endpoint HTTP client to use.
+	Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error)
 
 	// Chat sends a chat completion request.
+	// r.Client carries the per-endpoint HTTP client when set; backends
+	// fall back to their own shared client when r.Client is nil.
 	// For streaming requests the response body must be an SSE stream;
 	// for non-streaming it must be a JSON ChatCompletionResponse.
 	// The caller is responsible for closing the response body.
 	Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error)
 
 	// Embeddings sends an embeddings request and returns the parsed response.
+	// r.Client carries the per-endpoint HTTP client when set.
 	Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error)
 
 	// PrepareStartupArgs allows a backend adapter to inject or modify the
 	// extra_args that are sent in a START_MODEL task payload.
-	//
-	// The RuntimeManager calls this once per startup event, passing the
-	// current extra_args and the model's capability flags. The adapter may
-	// prepend, append, or leave the args unchanged based purely on its own
-	// knowledge — no backend-specific logic belongs in the caller.
-	//
-	// caps holds model-level flags declared in the models table. Adapters
-	// that have no startup customisation should return extraArgs unchanged.
 	PrepareStartupArgs(caps ModelStartupCaps, extraArgs []string) []string
 
 	// ContainerPort returns the TCP port the backend process listens on
 	// inside the container by default, before any env-var override.
-	//
-	// This is the container-internal port — it is NOT the host port.
-	// The executor maps host_port → container_port via docker -p or by
-	// injecting the env vars returned by ContainerPortEnvVars so the
-	// process binds to the allocated host port instead.
-	//
-	// Backends that bind to a fixed well-known port that use
-	// docker -p host:container mapping return 0 — no fixed default.
 	ContainerPort() int
 
 	// ContainerPortEnvVars returns the environment variables that configure
 	// the backend process to listen on the given port inside the container.
-	//
-	// The RuntimeManager merges these into the START_MODEL task payload's
-	// Env map so the node agent passes them to `docker run -e`. When
-	// BindPort is pre-allocated at control-plane time these are injected
-	// before dispatch. When the agent allocates the port at runtime it
-	// re-applies the same env vars after port selection using the mirror
-	// table in executor.go (backendPortEnvVars).
-	//
-	// Rules for implementors:
-	//   - Return every env var the backend server reads to set its listen
-	//     port. Never rely on callers knowing which vars to set.
-	//   - Do NOT include generic vars like PORT unless the backend actually
-	//     reads PORT at startup.
-	//   - Backends that use CMD-line flags for port (llamacpp, vllm, tgi)
-	//     may return nil here; their port is passed via ExtraArgs instead.
-	//   - Backends with a fixed internal port that use
-	//     docker -p host:container mapping return nil.
 	ContainerPortEnvVars(port int) map[string]string
 }
 

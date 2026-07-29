@@ -83,18 +83,20 @@ func (b *cpuNativeBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs [
 // Health probes /health first (used by faster-whisper-server, Kokoro, Infinity,
 // and most FastAPI-based servers), then falls back to GET /v1/models.
 // Any 2xx or 4xx response from /health counts as healthy — the service is up.
-func (b *cpuNativeBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *cpuNativeBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	c := b.client
+	if client != nil {
+		c = client
+	}
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/health", nil)
 	if err == nil {
-		resp, doErr := b.client.Do(req)
+		resp, doErr := c.Do(req)
 		h.LatencyMs = int(time.Since(start).Milliseconds())
 		if doErr == nil {
 			resp.Body.Close()
-			// Any non-5xx response means the server is alive.
-			// faster-whisper-server returns 200 {"status":"ok"} on /health.
 			if resp.StatusCode < 500 {
 				h.Status = StatusHealthy
 				return h
@@ -102,13 +104,12 @@ func (b *cpuNativeBackend) Health(ctx context.Context, url string) EndpointHealt
 		}
 	}
 
-	// Fall back to GET /v1/models for OpenAI-compat services that expose it
-	// (e.g. Infinity embedding server, some vLLM-compatible CPU backends).
-	return b.inner.Health(ctx, url)
+	// Fall back to GET /v1/models.
+	return b.inner.Health(ctx, url, client)
 }
 
-func (b *cpuNativeBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
-	return b.inner.Models(ctx, url)
+func (b *cpuNativeBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	return b.inner.Models(ctx, url, client)
 }
 
 func (b *cpuNativeBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
@@ -116,9 +117,10 @@ func (b *cpuNativeBackend) Chat(ctx context.Context, r ChatRequest) (*BackendRes
 }
 
 func (b *cpuNativeBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	// Infinity (michaelf34/infinity) uses /embeddings (no /v1/ prefix).
-	// Other servers (vLLM, TEI, openai_compat) use /v1/embeddings.
-	// Try /embeddings first; if it returns 404 fall back to /v1/embeddings.
+	c := b.client
+	if r.Client != nil {
+		c = r.Client
+	}
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -134,13 +136,13 @@ func (b *cpuNativeBackend) Embeddings(ctx context.Context, r EmbedRequest) (*mod
 		if r.UpstreamAPIKey != "" {
 			req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
 		}
-		resp, doErr := b.client.Do(req)
+		resp, doErr := c.Do(req)
 		if doErr != nil {
 			return nil, doErr
 		}
 		if resp.StatusCode == http.StatusNotFound {
 			resp.Body.Close()
-			continue // try next path
+			continue
 		}
 		defer resp.Body.Close()
 		var out models.EmbeddingResponse

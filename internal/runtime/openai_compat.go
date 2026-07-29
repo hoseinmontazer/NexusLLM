@@ -61,17 +61,28 @@ func (b *openAICompatBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArg
 	return extraArgs
 }
 
+// clientFor returns r.Client when set, otherwise falls back to b.client.
+// This lets the registry inject a per-endpoint client (e.g. proxy-aware)
+// while keeping backward compat for callers that don't set r.Client.
+func (b *openAICompatBackend) clientFor(c *http.Client) *http.Client {
+	if c != nil {
+		return c
+	}
+	return b.client
+}
+
 // Health performs a lightweight GET /v1/models to verify the endpoint is alive.
-func (b *openAICompatBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *openAICompatBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()
+	c := b.clientFor(client)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
 		h.Error = err.Error()
 		return h
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	h.LatencyMs = int(time.Since(start).Milliseconds())
 	if err != nil {
 		h.Error = err.Error()
@@ -82,7 +93,6 @@ func (b *openAICompatBackend) Health(ctx context.Context, url string) EndpointHe
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		h.Status = StatusHealthy
 	} else if resp.StatusCode < 500 {
-		// 4xx — server is reachable but not behaving as expected.
 		h.Status = StatusDegraded
 		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	} else {
@@ -92,12 +102,13 @@ func (b *openAICompatBackend) Health(ctx context.Context, url string) EndpointHe
 	return h
 }
 
-func (b *openAICompatBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
+func (b *openAICompatBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	c := b.clientFor(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +126,7 @@ func (b *openAICompatBackend) Models(ctx context.Context, url string) ([]Backend
 }
 
 func (b *openAICompatBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
+	c := b.clientFor(r.Client)
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -132,7 +144,7 @@ func (b *openAICompatBackend) Chat(ctx context.Context, r ChatRequest) (*Backend
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("openai compat chat: %w", err)
 	}
@@ -148,6 +160,7 @@ func (b *openAICompatBackend) Chat(ctx context.Context, r ChatRequest) (*Backend
 }
 
 func (b *openAICompatBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
+	c := b.clientFor(r.Client)
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -161,7 +174,7 @@ func (b *openAICompatBackend) Embeddings(ctx context.Context, r EmbedRequest) (*
 	if r.UpstreamAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -48,7 +48,7 @@ type Handler struct {
 	log           *zap.Logger
 	mu            sync.RWMutex
 	teamPolicies  map[string]*policy.TeamPolicy
-	httpClient    *http.Client // direct client (local endpoints + fallback)
+	httpClient    *http.Client     // direct client (local endpoints + fallback)
 	factory       *runtime.Factory // nil-safe; provides proxy-aware clients
 	db            *sqlx.DB
 	thinkingRes   *thinking.Resolver
@@ -404,7 +404,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if ep.UpstreamBaseURL != "" {
 		endpointURL = ep.UpstreamBaseURL
 	}
-	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey}
+	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey, Client: h.registry.ClientForEndpoint(ep)}
 
 	// ── Backend compatibility sanitization + Thinking mode resolution ─────
 	// Order matters:
@@ -484,7 +484,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					zap.String("model", req.Model),
 				)
 				disabledReq := thinking.InjectThinkingControl(req, false, thinkingCaps)
-				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey}
+				retryReq := runtime.ChatRequest{Req: &disabledReq, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey, Client: h.registry.ClientForEndpoint(ep)}
 				c.Header("X-Nexus-Thinking-Retry", "1")
 				middleware.ThinkingRequestsTotal.WithLabelValues(
 					claims.TeamID, claims.ProjectID, req.Model, "fast_retry").Inc()
@@ -547,8 +547,11 @@ func (h *Handler) Embeddings(c *gin.Context) {
 	if ep.UpstreamBaseURL != "" {
 		embURL = ep.UpstreamBaseURL
 	}
-	resp, err := backend.Embeddings(c.Request.Context(), runtime.EmbedRequest{Req: &req, EndpointURL: embURL, UpstreamAPIKey: ep.UpstreamAPIKey})
+	resp, err := backend.Embeddings(c.Request.Context(), runtime.EmbedRequest{Req: &req, EndpointURL: embURL, UpstreamAPIKey: ep.UpstreamAPIKey, Client: h.registry.ClientForEndpoint(ep)})
 	if err != nil {
+		if runtime.IsProviderBackend(ep.BackendType) {
+			middleware.RecordProviderConnectionError(string(ep.BackendType), req.Model, err)
+		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -730,6 +733,9 @@ func (h *Handler) syncChat(
 	resp, err := backend.Chat(c.Request.Context(), chatReq)
 	if err != nil {
 		if isConnectError(err) {
+			if runtime.IsProviderBackend(ep.BackendType) {
+				middleware.RecordProviderConnectionError(string(ep.BackendType), req.Model, err)
+			}
 			return false, false // caller will mark endpoint down and retry
 		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
@@ -850,6 +856,9 @@ func (h *Handler) streamChat(
 	if err != nil {
 		if isConnectError(err) {
 			return false // caller will mark endpoint down and retry
+		}
+		if runtime.IsProviderBackend(ep.BackendType) {
+			middleware.RecordProviderConnectionError(string(ep.BackendType), req.Model, err)
 		}
 		abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return true

@@ -191,7 +191,10 @@ MIGRATIONS := \
 	040_model_endpoint_upstream_auth.sql \
 	041_upstream_proxy.sql \
 	042_upstream_model_name.sql \
-	043_model_runtime_env.sql
+	043_model_runtime_env.sql \
+	044_external_provider_models.sql \
+	045_provider_cost_and_rate_limits.sql \
+	046_provider_transport_config.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

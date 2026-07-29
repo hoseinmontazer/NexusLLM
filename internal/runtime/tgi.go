@@ -42,7 +42,9 @@ func (b *tgiBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []strin
 	return extraArgs
 }
 
-func (b *tgiBackend) Health(ctx context.Context, url string) EndpointHealth {
+func (b *tgiBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
+	c := b.client
+	if client != nil { c = client }
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()
 
@@ -51,7 +53,7 @@ func (b *tgiBackend) Health(ctx context.Context, url string) EndpointHealth {
 		h.Error = err.Error()
 		return h
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	h.LatencyMs = int(time.Since(start).Milliseconds())
 	if err != nil {
 		h.Error = err.Error()
@@ -73,13 +75,15 @@ func (b *tgiBackend) Health(ctx context.Context, url string) EndpointHealth {
 	return h
 }
 
-func (b *tgiBackend) Models(ctx context.Context, url string) ([]BackendModel, error) {
+func (b *tgiBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
+	c := b.client
+	if client != nil { c = client }
 	// TGI serves a single model; /v1/models returns it.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +101,8 @@ func (b *tgiBackend) Models(ctx context.Context, url string) ([]BackendModel, er
 }
 
 func (b *tgiBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
+	c := b.client
+	if r.Client != nil { c = r.Client }
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -111,7 +117,7 @@ func (b *tgiBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse,
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tgi chat: %w", err)
 	}
@@ -127,6 +133,8 @@ func (b *tgiBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse,
 }
 
 func (b *tgiBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
+	c := b.client
+	if r.Client != nil { c = r.Client }
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -137,7 +145,7 @@ func (b *tgiBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.Em
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := b.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}

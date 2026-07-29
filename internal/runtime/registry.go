@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -37,6 +38,45 @@ type RegistryEndpoint struct {
 	UpstreamBaseURL   string `db:"upstream_base_url"`
 	UpstreamProxy     string `db:"upstream_proxy"`
 	UpstreamModelName string `db:"upstream_model_name"`
+	// Per-endpoint provider transport configuration (migration 046).
+	// NULL / zero = use production defaults (see DefaultProviderTransportConfig).
+	// Only populated for provider backends; zero for local backends.
+	ProviderProxyURL                 string `db:"provider_proxy_url"`
+	ProviderTLSInsecureSkipVerify    bool   `db:"provider_tls_insecure_skip_verify"`
+	ProviderTLSRootCAPEM             string `db:"provider_tls_root_ca_pem"`
+	ProviderConnectTimeoutSeconds    int    `db:"provider_connect_timeout_seconds"`
+	ProviderReadTimeoutSeconds       int    `db:"provider_read_timeout_seconds"`
+	ProviderIdleConnTimeoutSeconds   int    `db:"provider_idle_conn_timeout_seconds"`
+	ProviderResponseHeaderTimeout    int    `db:"provider_response_header_timeout_seconds"`
+	ProviderMaxIdleConnsPerHost      int    `db:"provider_max_idle_conns_per_host"`
+	ProviderMaxConnsPerHost          int    `db:"provider_max_conns_per_host"`
+	ProviderDisableHTTP2             bool   `db:"provider_disable_http2"`
+}
+
+// transportConfig builds a ProviderTransportConfig from the DB-loaded fields.
+// For local models all DB fields are zero, which makes withDefaults() apply
+// production-grade defaults — the resulting client is used only by provider
+// backends. For local backends the registry uses factory.ClientFor() instead.
+func (r *RegistryEndpoint) transportConfig() ProviderTransportConfig {
+	return ProviderTransportConfig{
+		// Prefer the dedicated provider_proxy_url column; fall back to the
+		// legacy upstream_proxy field for backward compatibility.
+		ProxyURL: func() string {
+			if r.ProviderProxyURL != "" {
+				return r.ProviderProxyURL
+			}
+			return r.UpstreamProxy
+		}(),
+		TLSInsecureSkipVerify:        r.ProviderTLSInsecureSkipVerify,
+		TLSRootCAPEM:                 r.ProviderTLSRootCAPEM,
+		ConnectTimeoutSeconds:        r.ProviderConnectTimeoutSeconds,
+		ReadTimeoutSeconds:           r.ProviderReadTimeoutSeconds,
+		IdleConnTimeoutSeconds:       r.ProviderIdleConnTimeoutSeconds,
+		ResponseHeaderTimeoutSeconds: r.ProviderResponseHeaderTimeout,
+		MaxIdleConnsPerHost:          r.ProviderMaxIdleConnsPerHost,
+		MaxConnsPerHost:              r.ProviderMaxConnsPerHost,
+		DisableHTTP2:                 r.ProviderDisableHTTP2,
+	}
 }
 
 // URL builds the base URL from host and port (no base_path).
@@ -54,20 +94,25 @@ type Registry struct {
 	factory *Factory
 	log     *zap.Logger
 
-	mu    sync.RWMutex
-	pools map[string]*Pool   // model name → pool
-	bends map[string]Backend // backend type → backend instance (shared HTTP client)
+	mu        sync.RWMutex
+	pools     map[string]*Pool   // model name → pool
+	bends     map[string]Backend // backend type → backend instance (shared HTTP client)
+	epClients map[string]*http.Client // endpoint ID → dedicated per-endpoint HTTP client
+	// epClients is only populated for provider backends (IsProviderBackend).
+	// Each client is built once from the endpoint's ProviderTransportConfig
+	// and reused for every request. Local backends use factory.ClientFor().
 }
 
 // NewRegistry constructs and populates a Registry from the database.
 func NewRegistry(db *sqlx.DB, rdb *redis.Client, factory *Factory, log *zap.Logger) (*Registry, error) {
 	r := &Registry{
-		db:      db,
-		rdb:     rdb,
-		factory: factory,
-		log:     log,
-		pools:   make(map[string]*Pool),
-		bends:   make(map[string]Backend),
+		db:        db,
+		rdb:       rdb,
+		factory:   factory,
+		log:       log,
+		pools:     make(map[string]*Pool),
+		bends:     make(map[string]Backend),
+		epClients: make(map[string]*http.Client),
 	}
 	if err := r.Reload(context.Background()); err != nil {
 		return nil, fmt.Errorf("initial registry load: %w", err)
@@ -80,12 +125,13 @@ func NewRegistry(db *sqlx.DB, rdb *redis.Client, factory *Factory, log *zap.Logg
 // populate itself once Reload is called successfully.
 func NewEmptyRegistry(db *sqlx.DB, rdb *redis.Client, factory *Factory, log *zap.Logger) (*Registry, error) {
 	return &Registry{
-		db:      db,
-		rdb:     rdb,
-		factory: factory,
-		log:     log,
-		pools:   make(map[string]*Pool),
-		bends:   make(map[string]Backend),
+		db:        db,
+		rdb:       rdb,
+		factory:   factory,
+		log:       log,
+		pools:     make(map[string]*Pool),
+		bends:     make(map[string]Backend),
+		epClients: make(map[string]*http.Client),
 	}, nil
 }
 
@@ -97,10 +143,12 @@ func (r *Registry) Reload(ctx context.Context) error {
 		return err
 	}
 
-	newPools := make(map[string]*Pool, len(rows))
-	newBends := make(map[string]Backend)
+	newPools     := make(map[string]*Pool, len(rows))
+	newBends     := make(map[string]Backend)
+	newEpClients := make(map[string]*http.Client, len(rows))
 
-	// Pre-populate newBends with existing backends so we don't re-build them.
+	// Carry over existing backends — avoids rebuilding shared HTTP clients
+	// for local backends on every reload.
 	r.mu.RLock()
 	for k, v := range r.bends {
 		newBends[k] = v
@@ -112,6 +160,8 @@ func (r *Registry) Reload(ctx context.Context) error {
 			newPools[row.ModelName] = NewPool(row.ModelID, StrategyRoundRobin)
 		}
 		pool := newPools[row.ModelName]
+
+		transportCfg := row.transportConfig()
 
 		ep := &Endpoint{
 			ID:                row.ID,
@@ -125,8 +175,26 @@ func (r *Registry) Reload(ctx context.Context) error {
 			UpstreamBaseURL:   row.UpstreamBaseURL,
 			UpstreamProxy:     row.UpstreamProxy,
 			UpstreamModelName: row.UpstreamModelName,
+			Transport:         transportCfg,
 		}
 		pool.Add(ep)
+
+		// Build a dedicated HTTP client for every provider endpoint.
+		// Local backends share the factory's single HTTP client.
+		if IsProviderBackend(row.BackendType) {
+			client, buildErr := BuildProviderClient(transportCfg)
+			if buildErr != nil {
+				// Log and fall back to the factory's direct client.
+				// The endpoint is still routable; only the transport config is degraded.
+				r.log.Warn("failed to build provider transport — using default client",
+					zap.String("endpoint_id", row.ID),
+					zap.String("model", row.ModelName),
+					zap.Error(buildErr),
+				)
+				client = r.factory.DirectClient()
+			}
+			newEpClients[row.ID] = client
+		}
 
 		// Ensure we have a backend instance for this type.
 		key := string(row.BackendType)
@@ -142,13 +210,15 @@ func (r *Registry) Reload(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
-	r.pools = newPools
-	r.bends = newBends
+	r.pools     = newPools
+	r.bends     = newBends
+	r.epClients = newEpClients
 	r.mu.Unlock()
 
 	r.log.Info("registry reloaded",
 		zap.Int("models", len(newPools)),
 		zap.Int("endpoints", len(rows)),
+		zap.Int("provider_clients", len(newEpClients)),
 	)
 	return nil
 }
@@ -320,7 +390,19 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    COALESCE(me.upstream_api_key, '')    AS upstream_api_key,
 		    COALESCE(me.upstream_base_url, '')   AS upstream_base_url,
 		    COALESCE(me.upstream_proxy, '')      AS upstream_proxy,
-		    COALESCE(me.upstream_model_name, '') AS upstream_model_name
+		    COALESCE(me.upstream_model_name, '') AS upstream_model_name,
+		    -- Provider transport config (migration 046). COALESCE to zero values
+		    -- for pre-046 installs — BuildProviderClient() applies safe defaults.
+		    COALESCE(me.provider_proxy_url, '')                    AS provider_proxy_url,
+		    COALESCE(me.provider_tls_insecure_skip_verify, FALSE)  AS provider_tls_insecure_skip_verify,
+		    COALESCE(me.provider_tls_root_ca_pem, '')              AS provider_tls_root_ca_pem,
+		    COALESCE(me.provider_connect_timeout_seconds, 0)       AS provider_connect_timeout_seconds,
+		    COALESCE(me.provider_read_timeout_seconds, 0)          AS provider_read_timeout_seconds,
+		    COALESCE(me.provider_idle_conn_timeout_seconds, 0)     AS provider_idle_conn_timeout_seconds,
+		    COALESCE(me.provider_response_header_timeout_seconds, 0) AS provider_response_header_timeout_seconds,
+		    COALESCE(me.provider_max_idle_conns_per_host, 0)       AS provider_max_idle_conns_per_host,
+		    COALESCE(me.provider_max_conns_per_host, 0)            AS provider_max_conns_per_host,
+		    COALESCE(me.provider_disable_http2, FALSE)             AS provider_disable_http2
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
 		WHERE me.is_enabled = TRUE
@@ -337,6 +419,7 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		UNION ALL
 
 		-- Runtime-level endpoints: one row per agent_runtime replica.
+		-- Local backends only — provider backends never create agent_runtime rows.
 		SELECT
 		    ar.id                                    AS id,
 		    ar.model_id,
@@ -361,7 +444,18 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    ''                                       AS upstream_api_key,
 		    ''                                       AS upstream_base_url,
 		    ''                                       AS upstream_proxy,
-		    ''                                       AS upstream_model_name
+		    ''                                       AS upstream_model_name,
+		    -- Transport config: local runtimes never use proxy/TLS settings
+		    '' AS provider_proxy_url,
+		    FALSE AS provider_tls_insecure_skip_verify,
+		    '' AS provider_tls_root_ca_pem,
+		    0 AS provider_connect_timeout_seconds,
+		    0 AS provider_read_timeout_seconds,
+		    0 AS provider_idle_conn_timeout_seconds,
+		    0 AS provider_response_header_timeout_seconds,
+		    0 AS provider_max_idle_conns_per_host,
+		    0 AS provider_max_conns_per_host,
+		    FALSE AS provider_disable_http2
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
@@ -443,6 +537,47 @@ func (r *Registry) GetModelCapabilities(ctx context.Context, modelName string) (
 // jsonDecodeStrings decodes a JSON byte slice into a string slice.
 func jsonDecodeStrings(data []byte, out *[]string) error {
 	return json.Unmarshal(data, out)
+}
+
+// ClientForEndpoint returns the dedicated *http.Client for a provider endpoint.
+//
+// For provider backends (IsProviderBackend) this returns the per-endpoint client
+// built from the endpoint's ProviderTransportConfig at Reload() time. The client
+// has a dedicated transport configured with the endpoint's proxy, TLS settings,
+// timeouts, and connection pool — completely isolated from all other endpoints.
+//
+// For local backends this falls back to the factory's shared direct client,
+// which is correct because local endpoints never use proxy or custom TLS.
+//
+// The returned client is safe for concurrent use and must never be closed by
+// the caller. Its lifetime is tied to the Registry.
+func (r *Registry) ClientForEndpoint(ep *Endpoint) *http.Client {
+	if IsProviderBackend(ep.BackendType) {
+		r.mu.RLock()
+		c, ok := r.epClients[ep.ID]
+		r.mu.RUnlock()
+		if ok {
+			return c
+		}
+		// Endpoint was added after the last Reload (rare). Build a client on
+		// demand from the transport config stored in the endpoint struct.
+		client, err := BuildProviderClient(ep.Transport)
+		if err != nil {
+			return r.factory.DirectClient()
+		}
+		r.mu.Lock()
+		// Double-check: another goroutine may have inserted it concurrently.
+		if existing, ok2 := r.epClients[ep.ID]; ok2 {
+			r.mu.Unlock()
+			return existing
+		}
+		r.epClients[ep.ID] = client
+		r.mu.Unlock()
+		return client
+	}
+	// Local backend: use the factory's proxy-aware client (supports
+	// NEXUS_UPSTREAM_PROXY and per-endpoint upstream_proxy for legacy compat).
+	return r.factory.ClientFor(ep.UpstreamProxy)
 }
 
 // BackendForEndpoint returns a Backend instance for the given endpoint.

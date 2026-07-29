@@ -141,7 +141,7 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 		healthURL = ep.UpstreamBaseURL
 	}
 
-	result := backend.Health(hCtx, healthURL)
+	result := backend.Health(hCtx, healthURL, w.registry.ClientForEndpoint(ep))
 	result.EndpointID = ep.ID
 
 	// ── Circuit breaker ────────────────────────────────────────────────────

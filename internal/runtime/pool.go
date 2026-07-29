@@ -42,7 +42,16 @@ type Endpoint struct {
 	UpstreamBaseURL   string
 	UpstreamProxy     string
 	UpstreamModelName string
-	mu              sync.RWMutex
+
+	// Transport holds the per-endpoint HTTP transport configuration for
+	// provider backends. It is populated from the DB columns added by
+	// migration 046 (provider_proxy_url, provider_tls_insecure, etc.).
+	// For local backends this field is zero-valued and ignored.
+	// The registry builds a dedicated *http.Client for each provider endpoint
+	// using this config and caches it in Registry.epClients.
+	Transport ProviderTransportConfig
+
+	mu sync.RWMutex
 }
 
 // IsAvailable returns true when the endpoint can accept requests.

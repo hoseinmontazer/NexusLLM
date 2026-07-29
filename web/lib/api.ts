@@ -564,6 +564,7 @@ export const api = {
       upstream_api_key?: string
       upstream_base_url?: string
       upstream_model_name?: string
+      /** @deprecated use proxy_url instead — stored in provider_proxy_url column (migration 046) */
       upstream_proxy?: string
       provider_api_version?: string
       provider_timeout_seconds?: number
@@ -571,6 +572,31 @@ export const api = {
       provider_extra_headers?: Record<string, string>
       capabilities?: string[]
       tags?: string[]
+      // ── Per-provider transport config (migration 046) ──────────────────
+      // All optional. Zero values apply BuildProviderClient() production defaults.
+      // Transport is fully isolated per provider — changing one never affects others.
+      /** Outbound proxy for this provider only. Schemes: http, https, socks5.
+       *  Credentials may be embedded: socks5://user:pass@host:port
+       *  Send "" or omit for direct connection. HTTP_PROXY env var is never used. */
+      proxy_url?: string
+      /** Disable TLS cert verification. Only for corporate MITM proxy environments. */
+      tls_insecure_skip_verify?: boolean
+      /** PEM root CA bundle appended to system roots (for self-signed proxy certs). */
+      tls_root_ca_pem?: string
+      /** TCP dial + TLS handshake timeout seconds. Default: 10. */
+      connect_timeout_seconds?: number
+      /** Non-streaming response body read timeout seconds. 0 = unlimited. */
+      read_timeout_seconds?: number
+      /** Keep-alive idle connection pool timeout seconds. Default: 90. */
+      idle_conn_timeout_seconds?: number
+      /** Max wait for response headers after request is sent, seconds. Default: 30. */
+      response_header_timeout_seconds?: number
+      /** Max idle keep-alive connections per host. Default: 32. */
+      max_idle_conns_per_host?: number
+      /** Max total connections (idle + active) per host. 0 = unlimited. */
+      max_conns_per_host?: number
+      /** Disable HTTP/2 negotiation. Only for providers with HTTP/2 issues. */
+      disable_http2?: boolean
     }) => req<{
       model_id: string; endpoint_id: string
       provider_backend_type: string
@@ -640,6 +666,50 @@ export const api = {
       upstream_model_name?: string
     }) => req<{ message: string; model_id: string; proxy_set: boolean }>(
       'PUT', `/models/${id}/upstream`, b),
+
+    /** Update the per-provider HTTP transport config (migration 046 columns).
+     *  All fields are optional — only provided fields are written.
+     *  Send proxy_url: "" to remove the proxy and connect directly.
+     *  The registry rebuilds the per-endpoint *http.Client immediately after save.
+     *  Transport isolation is guaranteed: only this provider's client is rebuilt. */
+    updateTransport: (id: string, b: {
+      proxy_url?: string
+      tls_insecure_skip_verify?: boolean
+      tls_root_ca_pem?: string
+      connect_timeout_seconds?: number
+      read_timeout_seconds?: number
+      idle_conn_timeout_seconds?: number
+      response_header_timeout_seconds?: number
+      max_idle_conns_per_host?: number
+      max_conns_per_host?: number
+      disable_http2?: boolean
+    }) => req<{
+      message: string
+      model_id: string
+      changed: Record<string, unknown>
+      note: string
+    }>('PUT', `/models/${id}/transport`, b),
+
+    /** Get the current per-provider transport config for all endpoints of a model. */
+    getTransport: (id: string) => req<{
+      model_id: string
+      count: number
+      note: string
+      endpoints: {
+        endpoint_id: string
+        proxy_url: string | null
+        tls_insecure_skip_verify: boolean
+        tls_root_ca_pem_set: boolean
+        connect_timeout_seconds: number
+        read_timeout_seconds: number
+        idle_conn_timeout_seconds: number
+        response_header_timeout_seconds: number
+        max_idle_conns_per_host: number
+        max_conns_per_host: number
+        disable_http2: boolean
+        upstream_proxy_legacy?: string | null
+      }[]
+    }>('GET', `/models/${id}/transport`),
   },
 
   gpu: {

@@ -779,6 +779,48 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 		// Example: {"HTTP-Referer":"https://nexusllm.example.com","X-Title":"NexusLLM"}
 		ProviderExtraHeaders map[string]string `json:"provider_extra_headers"`
 
+		// ── Per-provider HTTP transport (migration 046) ───────────────────────
+		// All fields are optional. Zero values apply BuildProviderClient() defaults.
+		// These settings are isolated per-endpoint: changing one provider's proxy
+		// never affects any other provider.
+
+		// ProxyURL: outbound proxy for this provider only.
+		// Schemes: http, https, socks5. Credentials may be embedded.
+		// Example: "socks5://user:pass@proxy.corp:1080"
+		// Empty = direct connection. HTTP_PROXY env var is never consulted.
+		ProxyURL string `json:"proxy_url"`
+
+		// TLSInsecureSkipVerify: disable TLS cert verification.
+		// Use only in controlled corporate environments with MITM proxies.
+		TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify"`
+
+		// TLSRootCAPEM: PEM-encoded CA bundle appended to system roots.
+		// Use when a corporate proxy presents a self-signed certificate.
+		TLSRootCAPEM string `json:"tls_root_ca_pem"`
+
+		// ConnectTimeoutSeconds: TCP dial timeout. Default: 10 s.
+		ConnectTimeoutSeconds int `json:"connect_timeout_seconds"`
+
+		// ReadTimeoutSeconds: max time for a non-streaming response body.
+		// 0 = unlimited (streaming-safe; use context deadline instead).
+		ReadTimeoutSeconds int `json:"read_timeout_seconds"`
+
+		// IdleConnTimeoutSeconds: idle keep-alive pool timeout. Default: 90 s.
+		IdleConnTimeoutSeconds int `json:"idle_conn_timeout_seconds"`
+
+		// ResponseHeaderTimeoutSeconds: max time to wait for response headers.
+		// Default: 30 s. -1 = disabled.
+		ResponseHeaderTimeoutSeconds int `json:"response_header_timeout_seconds"`
+
+		// MaxIdleConnsPerHost: idle connections in pool per host. Default: 32.
+		MaxIdleConnsPerHost int `json:"max_idle_conns_per_host"`
+
+		// MaxConnsPerHost: total connections (idle + active) per host. 0 = unlimited.
+		MaxConnsPerHost int `json:"max_conns_per_host"`
+
+		// DisableHTTP2: prevent HTTP/2 negotiation. Default: false.
+		DisableHTTP2 bool `json:"disable_http2"`
+
 		// Allowed projects and teams for model ACL (optional).
 		// When empty the model is accessible to all projects/teams in the org.
 		AllowedProjectIDs []string `json:"allowed_project_ids"`
@@ -896,10 +938,19 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 		  (id, model_id, host, port, base_path, weight, priority,
 		   health_status, is_enabled, lifecycle_state,
 		   upstream_api_key, upstream_base_url, upstream_proxy, upstream_model_name,
-		   provider_timeout_seconds, provider_max_retries, provider_extra_headers)
+		   provider_timeout_seconds, provider_max_retries, provider_extra_headers,
+		   provider_proxy_url, provider_tls_insecure_skip_verify,
+		   provider_tls_root_ca_pem,
+		   provider_connect_timeout_seconds, provider_read_timeout_seconds,
+		   provider_idle_conn_timeout_seconds, provider_response_header_timeout_seconds,
+		   provider_max_idle_conns_per_host, provider_max_conns_per_host,
+		   provider_disable_http2)
 		VALUES ($1,$2,'0.0.0.0',0,'/v1',100,1,'unknown',TRUE,'active',
 		        NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), NULLIF($6,''),
-		        $7,$8,$9::jsonb)`,
+		        $7,$8,$9::jsonb,
+		        NULLIF($10,''), $11,
+		        NULLIF($12,''),
+		        $13,$14,$15,$16,$17,$18,$19)`,
 		epID, mID,
 		input.UpstreamAPIKey,
 		input.UpstreamBaseURL,
@@ -908,6 +959,17 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 		input.ProviderTimeoutSeconds,
 		input.ProviderMaxRetries,
 		extraHeadersJSON,
+		// migration 046 transport fields
+		input.ProxyURL,
+		input.TLSInsecureSkipVerify,
+		input.TLSRootCAPEM,
+		input.ConnectTimeoutSeconds,
+		input.ReadTimeoutSeconds,
+		input.IdleConnTimeoutSeconds,
+		input.ResponseHeaderTimeoutSeconds,
+		input.MaxIdleConnsPerHost,
+		input.MaxConnsPerHost,
+		input.DisableHTTP2,
 	)
 	if epErr != nil {
 		// Roll back model row if endpoint insert failed.
@@ -1067,6 +1129,291 @@ func (h *RuntimeHandler) DisableModel(c *gin.Context) {
 		`UPDATE models SET enabled = FALSE, updated_at = NOW() WHERE id = $1`, modelID)
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"message": "model disabled"})
+}
+
+// UpdateProviderTransport handles PUT /admin/v1/models/:id/transport
+//
+// Updates the per-provider HTTP transport configuration stored in the
+// migration-046 columns on model_endpoints.
+//
+// Design:
+//   - All fields are optional. Only provided (non-null pointer) fields are written.
+//   - proxy_url is validated before writing — unsupported schemes are rejected with 400.
+//   - After a successful DB update the registry is reloaded so the new per-endpoint
+//     *http.Client is built immediately. No restart required.
+//   - Changing one provider's transport never affects any other provider because
+//     each endpoint has its own client (Registry.epClients).
+//
+// To clear proxy_url (revert to direct connection) send an explicit "".
+// To disable TLS verification send tls_insecure_skip_verify: true.
+func (h *RuntimeHandler) UpdateProviderTransport(c *gin.Context) {
+	modelID := c.Param("id")
+
+	var input struct {
+		// ProxyURL is the outbound proxy for this provider only.
+		// Supported schemes: http, https, socks5.
+		// Credentials may be embedded: http://user:pass@host:port
+		// Send "" to remove the proxy and connect directly.
+		// Example: "socks5://192.168.0.207:3315"
+		ProxyURL *string `json:"proxy_url"`
+
+		// TLSInsecureSkipVerify disables server certificate verification.
+		// Use only in controlled corporate environments with MITM proxies.
+		TLSInsecureSkipVerify *bool `json:"tls_insecure_skip_verify"`
+
+		// TLSRootCAPEM is a PEM-encoded root CA bundle appended to system roots.
+		// Used when a corporate proxy presents a self-signed certificate.
+		// Send "" to clear.
+		TLSRootCAPEM *string `json:"tls_root_ca_pem"`
+
+		// ConnectTimeoutSeconds: TCP dial + TLS handshake timeout.
+		// 0 = use BuildProviderClient() default (10 s).
+		ConnectTimeoutSeconds *int `json:"connect_timeout_seconds"`
+
+		// ReadTimeoutSeconds: max time for a complete non-streaming response body.
+		// 0 = unlimited (streaming-safe). Use context deadline for per-request limits.
+		ReadTimeoutSeconds *int `json:"read_timeout_seconds"`
+
+		// IdleConnTimeoutSeconds: keep-alive idle connection pool timeout.
+		// 0 = use BuildProviderClient() default (90 s).
+		IdleConnTimeoutSeconds *int `json:"idle_conn_timeout_seconds"`
+
+		// ResponseHeaderTimeoutSeconds: max time to wait for response headers.
+		// 0 = use BuildProviderClient() default (30 s). -1 = disabled.
+		ResponseHeaderTimeoutSeconds *int `json:"response_header_timeout_seconds"`
+
+		// MaxIdleConnsPerHost: idle connections in pool per host.
+		// 0 = use BuildProviderClient() default (32).
+		MaxIdleConnsPerHost *int `json:"max_idle_conns_per_host"`
+
+		// MaxConnsPerHost: total connections (idle + active) per host.
+		// 0 = unlimited.
+		MaxConnsPerHost *int `json:"max_conns_per_host"`
+
+		// DisableHTTP2: prevent HTTP/2 negotiation via ALPN.
+		// Set true only for providers with known HTTP/2 compatibility issues.
+		DisableHTTP2 *bool `json:"disable_http2"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// At least one field must be provided.
+	if input.ProxyURL == nil && input.TLSInsecureSkipVerify == nil &&
+		input.TLSRootCAPEM == nil && input.ConnectTimeoutSeconds == nil &&
+		input.ReadTimeoutSeconds == nil && input.IdleConnTimeoutSeconds == nil &&
+		input.ResponseHeaderTimeoutSeconds == nil && input.MaxIdleConnsPerHost == nil &&
+		input.MaxConnsPerHost == nil && input.DisableHTTP2 == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "at least one transport field must be provided",
+			"fields": []string{
+				"proxy_url", "tls_insecure_skip_verify", "tls_root_ca_pem",
+				"connect_timeout_seconds", "read_timeout_seconds",
+				"idle_conn_timeout_seconds", "response_header_timeout_seconds",
+				"max_idle_conns_per_host", "max_conns_per_host", "disable_http2",
+			},
+		})
+		return
+	}
+
+	// Validate proxy_url before touching the DB.
+	if input.ProxyURL != nil {
+		if err := runtime.ValidateProxyURL(*input.ProxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   err.Error(),
+				"example": "http://proxy.corp:3128 or socks5://user:pass@proxy:1080 or \"\" to remove",
+			})
+			return
+		}
+	}
+
+	// Apply each provided field individually so partial updates are safe.
+	// All queries use WHERE model_id=$N so multi-endpoint models update all
+	// endpoints — consistent with how UpdateUpstream behaves.
+	ctx := c.Request.Context()
+
+	if input.ProxyURL != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_proxy_url = NULLIF($1,''), updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.ProxyURL, modelID)
+	}
+	if input.TLSInsecureSkipVerify != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_tls_insecure_skip_verify = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.TLSInsecureSkipVerify, modelID)
+	}
+	if input.TLSRootCAPEM != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_tls_root_ca_pem = NULLIF($1,''), updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.TLSRootCAPEM, modelID)
+	}
+	if input.ConnectTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_connect_timeout_seconds = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.ConnectTimeoutSeconds, modelID)
+	}
+	if input.ReadTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_read_timeout_seconds = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.ReadTimeoutSeconds, modelID)
+	}
+	if input.IdleConnTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_idle_conn_timeout_seconds = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.IdleConnTimeoutSeconds, modelID)
+	}
+	if input.ResponseHeaderTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_response_header_timeout_seconds = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.ResponseHeaderTimeoutSeconds, modelID)
+	}
+	if input.MaxIdleConnsPerHost != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_max_idle_conns_per_host = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.MaxIdleConnsPerHost, modelID)
+	}
+	if input.MaxConnsPerHost != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_max_conns_per_host = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.MaxConnsPerHost, modelID)
+	}
+	if input.DisableHTTP2 != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE model_endpoints
+			 SET provider_disable_http2 = $1, updated_at = NOW()
+			 WHERE model_id = $2`,
+			*input.DisableHTTP2, modelID)
+	}
+
+	// Reload the registry so BuildProviderClient() is called immediately with
+	// the new config. The old per-endpoint *http.Client is replaced atomically.
+	_ = h.registry.Reload(ctx)
+
+	// Build a summary of what changed for the response.
+	changed := map[string]interface{}{}
+	if input.ProxyURL != nil {
+		if *input.ProxyURL == "" {
+			changed["proxy_url"] = "cleared (direct connection)"
+		} else {
+			changed["proxy_url"] = *input.ProxyURL
+		}
+	}
+	if input.TLSInsecureSkipVerify != nil {
+		changed["tls_insecure_skip_verify"] = *input.TLSInsecureSkipVerify
+	}
+	if input.TLSRootCAPEM != nil {
+		if *input.TLSRootCAPEM == "" {
+			changed["tls_root_ca_pem"] = "cleared"
+		} else {
+			changed["tls_root_ca_pem"] = fmt.Sprintf("%d bytes", len(*input.TLSRootCAPEM))
+		}
+	}
+	if input.ConnectTimeoutSeconds != nil {
+		changed["connect_timeout_seconds"] = *input.ConnectTimeoutSeconds
+	}
+	if input.ReadTimeoutSeconds != nil {
+		changed["read_timeout_seconds"] = *input.ReadTimeoutSeconds
+	}
+	if input.IdleConnTimeoutSeconds != nil {
+		changed["idle_conn_timeout_seconds"] = *input.IdleConnTimeoutSeconds
+	}
+	if input.ResponseHeaderTimeoutSeconds != nil {
+		changed["response_header_timeout_seconds"] = *input.ResponseHeaderTimeoutSeconds
+	}
+	if input.MaxIdleConnsPerHost != nil {
+		changed["max_idle_conns_per_host"] = *input.MaxIdleConnsPerHost
+	}
+	if input.MaxConnsPerHost != nil {
+		changed["max_conns_per_host"] = *input.MaxConnsPerHost
+	}
+	if input.DisableHTTP2 != nil {
+		changed["disable_http2"] = *input.DisableHTTP2
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "provider transport config updated — new HTTP client built immediately",
+		"model_id": modelID,
+		"changed":  changed,
+		"note":     "transport isolation is guaranteed — only this provider's client was rebuilt",
+	})
+}
+
+// GetProviderTransport handles GET /admin/v1/models/:id/transport
+//
+// Returns the current per-provider transport configuration for all endpoints
+// of the given model. The proxy_url is returned in full so operators can verify
+// the configuration. The upstream_api_key is never returned.
+func (h *RuntimeHandler) GetProviderTransport(c *gin.Context) {
+	modelID := c.Param("id")
+
+	type transportRow struct {
+		EndpointID                   string  `db:"id"                                       json:"endpoint_id"`
+		ProviderProxyURL             *string `db:"provider_proxy_url"                       json:"proxy_url"`
+		TLSInsecureSkipVerify        bool    `db:"provider_tls_insecure_skip_verify"        json:"tls_insecure_skip_verify"`
+		TLSRootCAPEMSet              bool    `db:"tls_root_ca_pem_set"                      json:"tls_root_ca_pem_set"`
+		ConnectTimeoutSeconds        int     `db:"provider_connect_timeout_seconds"         json:"connect_timeout_seconds"`
+		ReadTimeoutSeconds           int     `db:"provider_read_timeout_seconds"            json:"read_timeout_seconds"`
+		IdleConnTimeoutSeconds       int     `db:"provider_idle_conn_timeout_seconds"       json:"idle_conn_timeout_seconds"`
+		ResponseHeaderTimeoutSeconds int     `db:"provider_response_header_timeout_seconds" json:"response_header_timeout_seconds"`
+		MaxIdleConnsPerHost          int     `db:"provider_max_idle_conns_per_host"         json:"max_idle_conns_per_host"`
+		MaxConnsPerHost              int     `db:"provider_max_conns_per_host"              json:"max_conns_per_host"`
+		DisableHTTP2                 bool    `db:"provider_disable_http2"                   json:"disable_http2"`
+		// Legacy field shown for awareness.
+		UpstreamProxy *string `db:"upstream_proxy" json:"upstream_proxy_legacy,omitempty"`
+	}
+
+	var rows []transportRow
+	err := h.db.SelectContext(c.Request.Context(), &rows, `
+		SELECT id,
+		       provider_proxy_url,
+		       provider_tls_insecure_skip_verify,
+		       (provider_tls_root_ca_pem IS NOT NULL AND provider_tls_root_ca_pem != '') AS tls_root_ca_pem_set,
+		       provider_connect_timeout_seconds,
+		       provider_read_timeout_seconds,
+		       provider_idle_conn_timeout_seconds,
+		       provider_response_header_timeout_seconds,
+		       provider_max_idle_conns_per_host,
+		       provider_max_conns_per_host,
+		       provider_disable_http2,
+		       upstream_proxy
+		FROM model_endpoints
+		WHERE model_id = $1
+		ORDER BY priority`, modelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(rows) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no endpoints found for model " + modelID})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"model_id":   modelID,
+		"endpoints":  rows,
+		"count":      len(rows),
+		"note":       "zero values mean BuildProviderClient() defaults apply (connect=10s idle=90s response_header=30s pool=32)",
+	})
 }
 
 // UpdateUpstream handles PUT /admin/v1/models/:id/upstream
