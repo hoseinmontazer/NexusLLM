@@ -268,6 +268,7 @@ func main() {
 	a.GET("/providers/:id/exposed-models", catalogH.ListExposedModelIDs)
 	a.POST("/providers/:id/expose-models", catalogH.BulkExposeModels)
 	a.POST("/providers/:id/hide-models", catalogH.BulkHideModels)
+	a.POST("/providers/:id/register-models", catalogH.BulkRegisterFromCatalog) // promote to Public Models
 	a.GET("/providers/:id/rules", catalogH.ListRules)
 	a.POST("/providers/:id/rules", catalogH.CreateRule)
 	a.DELETE("/providers/:id/rules/:rid", catalogH.DeleteRule)

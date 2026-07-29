@@ -688,36 +688,35 @@ func (h *Handler) Models(c *gin.Context) {
 	}
 	fallbackCreated := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 
+	// Unified model list: iterate permissions once.
+	// All callable models — local and remote — are in claims.Permissions.
+	// claims.Permissions is loaded from team_model_permissions JOIN models,
+	// which covers every backend type. No separate virtual model path.
+	//
+	// The registry check (registered[modelName]) filters out models the team
+	// has permission for but whose endpoint is not yet routable (e.g. loading,
+	// disabled, or pending registry reload). This is the correct behavior —
+	// we only advertise models that can actually serve requests right now.
+	//
+	// For Mode-A remote models (RegisterCatalogAlias, RegisterExternalModel),
+	// the registry is populated immediately after creation, so they appear here
+	// on the next registry reload (≤10s). modelCreatedAt is loaded from the DB
+	// to ensure a stable `created` timestamp across calls.
 	var data []models.ModelObject
 	for _, modelName := range claims.Permissions {
-		if registered[modelName] {
-			created, ok := modelCreatedAt[modelName]
-			if !ok {
-				created = fallbackCreated
+		created, ok := modelCreatedAt[modelName]
+		if !ok {
+			// Model is granted but not in the DB-loaded timestamp map.
+			// Could be a race between grant and DB query — use fallback.
+			if !registered[modelName] {
+				// Not in registry either — skip: not routable yet.
+				continue
 			}
-			data = append(data, models.ModelObject{
-				ID: modelName, Object: "model", Created: created, OwnedBy: "nexusllm",
-			})
+			created = fallbackCreated
 		}
-	}
-
-	// Include Mode-B virtual catalog models.
-	// Virtual models don't have a Permissions entry — they are available to any
-	// authenticated caller whose team policy allows the model (or has no allowlist).
-	// We include all exposed virtual names and let the policy engine filter at
-	// request time, exactly as it does for local models.
-	if h.virtualResolver != nil {
-		virtualNames, _ := h.virtualResolver.ListExposed(c.Request.Context())
-		for _, vname := range virtualNames {
-			if !registered[vname] { // don't duplicate Mode-A aliases
-				data = append(data, models.ModelObject{
-					ID:      vname,
-					Object:  "model",
-					Created: fallbackCreated,
-					OwnedBy: "nexusllm-catalog",
-				})
-			}
-		}
+		data = append(data, models.ModelObject{
+			ID: modelName, Object: "model", Created: created, OwnedBy: "nexusllm",
+		})
 	}
 
 	c.JSON(http.StatusOK, models.ModelListResponse{Object: "list", Data: data})

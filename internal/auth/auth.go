@@ -240,44 +240,27 @@ func (s *Service) InvalidateAPIKeyCache(ctx context.Context, keyHash string) err
 }
 
 // loadPermissions fetches the list of allowed model names for a team (RBAC).
-// Returns both explicit Public Models (from team_model_permissions) and
-// virtual catalog models (from provider_exposure_rules with allow_model rules).
+//
+// Unified authorization: every Public Model — local runtime or remote provider —
+// must have a row in the models table and an explicit grant in team_model_permissions
+// before any API key belonging to this team can use it. Backend type is irrelevant.
+//
+// This is a single query. There is no second permission table for remote or
+// virtual models. Any model that can be called MUST be registered in models
+// (via RegisterExternalModel, RegisterCatalogAlias, or DeployModel) and granted
+// via team_model_permissions. Mode-B virtual catalog models are a discovery
+// feature only — they are not callable until promoted to a models row.
 func (s *Service) loadPermissions(ctx context.Context, teamID string) ([]string, error) {
 	if teamID == "" {
 		return []string{}, nil
 	}
-
-	// Explicit Public Models via team_model_permissions.
 	var names []string
 	err := s.db.SelectContext(ctx, &names, `
 		SELECT m.name
 		FROM team_model_permissions tmp
 		JOIN models m ON m.id = tmp.model_id
-		WHERE tmp.team_id = $1 AND m.active = TRUE`, teamID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Virtual catalog models: any allow_model rule on a direct-expose provider.
-	// All teams in the same org see the same virtual models — provider exposure
-	// is an org-level decision, not a per-team one.
-	// Query is resilient: silently returns nothing if migration 047 hasn't run.
-	var virtualNames []string
-	_ = s.db.SelectContext(ctx, &virtualNames, `
-		SELECT CASE WHEN p.catalog_expose_prefix != ''
-		            THEN p.catalog_expose_prefix || '/' || per.model_id
-		            ELSE p.name                  || '/' || per.model_id
-		       END AS virtual_name
-		FROM provider_exposure_rules per
-		JOIN providers p ON p.id = per.provider_id
-		WHERE per.rule_type            = 'allow_model'
-		  AND per.enabled              = TRUE
-		  AND p.enabled                = TRUE
-		  AND p.catalog_direct_expose  = TRUE
-		  AND per.model_id IS NOT NULL
-		  AND per.model_id            != ''`)
-
-	return append(names, virtualNames...), nil
+		WHERE tmp.team_id = $1 AND m.enabled = TRUE`, teamID)
+	return names, err
 }
 
 // validateAPIKeyLegacy handles the pre-migration-022 schema (no project columns).

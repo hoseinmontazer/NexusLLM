@@ -753,3 +753,173 @@ func (h *CatalogHandler) PreviewRules(c *gin.Context) {
 		"blocked":       blocked,
 	})
 }
+
+// BulkRegisterFromCatalog handles POST /admin/v1/providers/:id/register-models
+//
+// This is the unified path that replaces team_virtual_model_permissions.
+//
+// It promotes one or more Mode-B catalog models into Mode-A Public Models by
+// creating a models + model_endpoints + model_versions row for each entry.
+// Once registered, the models are first-class Public Models and can be granted
+// to teams via the standard team_model_permissions table — identical to local
+// models. There is no separate permission table for remote models.
+//
+// Request body:
+//
+//	{
+//	  "models": [
+//	    {
+//	      "public_name": "company-gpt",       // required — the public model name
+//	      "provider_model_id": "openai/gpt-4o", // required — must exist in catalog
+//	      "display_name": "Company GPT",       // optional
+//	      "service_type": "CHAT"               // optional, default CHAT
+//	    }
+//	  ]
+//	}
+//
+// Each entry is independent — failures are collected, successes proceed.
+// Returns a summary of created model IDs and any errors.
+func (h *CatalogHandler) BulkRegisterFromCatalog(c *gin.Context) {
+	providerID := c.Param("id")
+
+	type modelInput struct {
+		PublicName      string `json:"public_name"`
+		ProviderModelID string `json:"provider_model_id"`
+		DisplayName     string `json:"display_name"`
+		ServiceType     string `json:"service_type"`
+	}
+	var in struct {
+		Models []modelInput `json:"models" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(in.Models) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "models must not be empty"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load provider once — all models in this request share the same provider.
+	p, err := h.store.Get(ctx, providerID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found: " + providerID})
+		return
+	}
+
+	type result struct {
+		PublicName      string `json:"public_name"`
+		ProviderModelID string `json:"provider_model_id"`
+		ModelID         string `json:"model_id,omitempty"`
+		EndpointID      string `json:"endpoint_id,omitempty"`
+		Error           string `json:"error,omitempty"`
+	}
+	results := make([]result, 0, len(in.Models))
+
+	for _, entry := range in.Models {
+		if entry.PublicName == "" || entry.ProviderModelID == "" {
+			results = append(results, result{
+				PublicName:      entry.PublicName,
+				ProviderModelID: entry.ProviderModelID,
+				Error:           "public_name and provider_model_id are required",
+			})
+			continue
+		}
+		if entry.ServiceType == "" {
+			entry.ServiceType = "CHAT"
+		}
+		displayName := entry.DisplayName
+		if displayName == "" {
+			displayName = entry.PublicName
+		}
+
+		// Verify the catalog entry exists.
+		var catalogID, catalogDisplayName string
+		lookupErr := h.db.QueryRowContext(ctx,
+			`SELECT id::text, display_name FROM provider_remote_models
+			 WHERE provider_id::text=$1 AND provider_model_id=$2 LIMIT 1`,
+			p.ID, entry.ProviderModelID,
+		).Scan(&catalogID, &catalogDisplayName)
+		if lookupErr != nil {
+			results = append(results, result{
+				PublicName:      entry.PublicName,
+				ProviderModelID: entry.ProviderModelID,
+				Error:           "catalog entry not found: " + entry.ProviderModelID,
+			})
+			continue
+		}
+		if displayName == entry.PublicName && catalogDisplayName != "" {
+			displayName = catalogDisplayName
+		}
+
+		// Default capabilities by service type.
+		caps, _ := marshalJSON([]string{"chat", "completion"})
+		if entry.ServiceType == "EMBEDDING" {
+			caps, _ = marshalJSON([]string{"embedding"})
+		}
+
+		mID := uuid.New().String()
+		_, insertErr := h.db.ExecContext(ctx, `
+			INSERT INTO models
+			  (id, name, display_name, provider, backend_type, service_type,
+			   max_context, max_output, enabled, tags, capabilities,
+			   provider_name, provider_is_external, provider_id, provider_catalog_id)
+			VALUES ($1,$2,$3,$4,$5,$6,128000,16384,TRUE,'[]'::jsonb,$7::jsonb,
+			        $4,TRUE,$8::uuid,$9::uuid)`,
+			mID, entry.PublicName, displayName,
+			p.BackendType, p.BackendType, entry.ServiceType,
+			caps, p.ID, catalogID,
+		)
+		if insertErr != nil {
+			results = append(results, result{
+				PublicName:      entry.PublicName,
+				ProviderModelID: entry.ProviderModelID,
+				Error:           "model already exists or DB error: " + insertErr.Error(),
+			})
+			continue
+		}
+
+		_, _ = h.db.ExecContext(ctx,
+			`INSERT INTO model_versions (id,model_id,version,is_default) VALUES ($1,$2,'v1',TRUE)`,
+			uuid.New().String(), mID)
+
+		epID := uuid.New().String()
+		_, _ = h.db.ExecContext(ctx, `
+			INSERT INTO model_endpoints
+			  (id, model_id, host, port, base_path, weight, priority,
+			   health_status, is_enabled, lifecycle_state,
+			   upstream_api_key, upstream_base_url, upstream_proxy, upstream_model_name,
+			   provider_proxy_url)
+			VALUES ($1,$2,'0.0.0.0',0,'/v1',100,1,'unknown',TRUE,'active',
+			        NULLIF($3,''), NULLIF($4,''), '', NULLIF($5,''), NULLIF($6,''))`,
+			epID, mID, p.APIKey, p.BaseURL, entry.ProviderModelID, p.ProxyURL,
+		)
+
+		results = append(results, result{
+			PublicName:      entry.PublicName,
+			ProviderModelID: entry.ProviderModelID,
+			ModelID:         mID,
+			EndpointID:      epID,
+		})
+	}
+
+	if h.registry != nil {
+		_ = h.registry.Reload(ctx)
+	}
+
+	created := 0
+	for _, r := range results {
+		if r.Error == "" {
+			created++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"created": created,
+		"total":   len(in.Models),
+		"results": results,
+		"note": "Registered models are now first-class Public Models. " +
+			"Grant team access via POST /admin/v1/teams/:id/models.",
+	})
+}

@@ -33,6 +33,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/usage"
+	"go.uber.org/zap"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,24 +151,41 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 		}
 	}
 
-	// ── 6. EnsureRunning (lazy-load cold start) ───────────────────────────────
+	// ── 6. EnsureRunning (lazy-load cold start — local models only) ──────────
+	// Authorization is complete at this point. Backend selection begins here.
+	//
+	// Remote/virtual models (BackendType is a provider backend, or the model
+	// resolves via the virtual catalog) MUST NOT trigger EnsureRunning. They
+	// have no container lifecycle — calling EnsureRunning on them would
+	// attempt to schedule a container that does not exist.
+	//
+	// Decision is based on BackendType metadata (IsRemoteModel), never the
+	// model name string. This mirrors the same check in ChatCompletions.
 	if h.activator != nil {
 		if _, _, err := h.registry.ResolveWithFailover(realModel, 1); err != nil {
-			// Same 8-second probe as ChatCompletions — covers one full HealthPollInterval cycle.
-			probeCtx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
-			_, probeErr := h.activator.EnsureRunning(probeCtx, realModel)
-			cancel()
-			if probeErr != nil {
-				go func() {
-					bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
-					defer bgCancel()
-					_, _ = h.activator.EnsureRunning(bgCtx, realModel)
-				}()
-				c.Header("Retry-After", "10")
-				abortErr(c, http.StatusServiceUnavailable, "model_starting",
-					fmt.Sprintf("model %q is starting, please retry in ~10 seconds", realModel))
-				return pipelineResult{}, false
+			// Registry miss. Check whether this is a remote model before
+			// attempting a cold start. Remote models skip EnsureRunning entirely
+			// and are handled in stage 8 via the virtual resolver.
+			if !h.registry.IsRemoteModel(c.Request.Context(), realModel) {
+				// Local model not yet running — probe then cold-start.
+				// Same 8-second probe as ChatCompletions.
+				probeCtx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+				_, probeErr := h.activator.EnsureRunning(probeCtx, realModel)
+				cancel()
+				if probeErr != nil {
+					go func() {
+						bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
+						defer bgCancel()
+						_, _ = h.activator.EnsureRunning(bgCtx, realModel)
+					}()
+					c.Header("Retry-After", "10")
+					abortErr(c, http.StatusServiceUnavailable, "model_starting",
+						fmt.Sprintf("model %q is starting, please retry in ~10 seconds", realModel))
+					return pipelineResult{}, false
+				}
 			}
+			// Remote model — fall through to stage 8 where the virtual
+			// resolver will handle it. No cold-start attempted.
 		}
 	}
 
@@ -180,12 +198,44 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 	middleware.ActiveRequests.WithLabelValues(claims.TeamID, claims.ProjectID, realModel).Inc()
 
 	// ── 8. Endpoint resolution ────────────────────────────────────────────────
+	// Try the registry first (covers local runtimes and Mode-A catalog aliases).
+	// On miss, fall through to the virtual catalog resolver (Mode-B), identical
+	// to the path in ChatCompletions. This ensures all endpoint types — local,
+	// remote registered, and virtual catalog — are routed uniformly after the
+	// full auth pipeline has already completed.
 	ep, _, err := h.registry.ResolveWithFailover(realModel, maxFailoverAttempts)
 	if err != nil {
-		// Roll back inflight — endpoint couldn't be resolved after cold start.
-		h.decrementInflight(c.Request.Context(), claims.TeamID, claims.ProjectID, realModel)
-		abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint", err.Error())
-		return pipelineResult{}, false
+		// Registry miss — try Mode-B virtual catalog resolver.
+		if h.virtualResolver != nil {
+			vep, verr := h.virtualResolver.Resolve(c.Request.Context(), realModel)
+			if verr != nil {
+				h.log.Warn("virtual resolver error in pipelineSetup",
+					zap.String("model", realModel), zap.Error(verr))
+			}
+			if vep != nil {
+				ep = vep.AsEndpoint()
+				// Build a dedicated HTTP client for the virtual endpoint and
+				// register it in the registry client cache so ClientForEndpoint
+				// returns it correctly when the handler dispatches the request.
+				virtualClient, clientErr := runtime.BuildProviderClient(vep.Transport)
+				if clientErr != nil {
+					virtualClient = h.httpClient
+				}
+				h.registry.CacheVirtualClient(ep.ID, virtualClient)
+				// ep is set — fall through to return pipelineResult below.
+			} else {
+				// Not in virtual catalog either — model truly not found.
+				h.decrementInflight(c.Request.Context(), claims.TeamID, claims.ProjectID, realModel)
+				abortErr(c, http.StatusNotFound, "model_not_found",
+					fmt.Sprintf("model %q not found", realModel))
+				return pipelineResult{}, false
+			}
+		} else {
+			// No virtual resolver configured — cannot route.
+			h.decrementInflight(c.Request.Context(), claims.TeamID, claims.ProjectID, realModel)
+			abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint", err.Error())
+			return pipelineResult{}, false
+		}
 	}
 
 	return pipelineResult{
