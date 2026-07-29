@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -95,25 +97,73 @@ func (s *CatalogSyncer) SyncProvider(ctx context.Context, providerID string) err
 	return nil
 }
 
-// fetchModels calls the provider's Models endpoint and returns a slice of RemoteModel.
+// fetchModels calls the provider's /models endpoint and returns a slice of RemoteModel.
+// It calls the endpoint directly with the provider's API key rather than going through
+// the Backend.Models() method, which does not accept an api key parameter.
 func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *http.Client) ([]RemoteModel, error) {
-	bt := runtime.BackendType(p.BackendType)
-	backend, err := s.factory.Build(bt)
-	if err != nil {
-		// Unknown backend type — fall back to openai_compat models endpoint.
-		backend, err = s.factory.Build(runtime.BackendOpenAICompat)
-		if err != nil {
-			return nil, err
-		}
+	// Determine the correct models URL based on backend type.
+	// These mirror the path logic in each provider's Models() implementation.
+	modelsURL := p.BaseURL
+	switch runtime.BackendType(p.BackendType) {
+	case runtime.BackendOpenRouter:
+		// OpenRouter: /api/v1/models
+		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/api/v1/models"
+	case runtime.BackendGroq:
+		// Groq: /openai/v1/models
+		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/openai/v1/models"
+	case runtime.BackendGemini:
+		// Gemini: /v1beta/openai/models
+		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/v1beta/openai/models"
+	default:
+		// All others: standard /v1/models
+		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/v1/models"
 	}
 
-	rawModels, err := backend.Models(ctx, p.BaseURL, client)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	out := make([]RemoteModel, 0, len(rawModels))
-	for _, m := range rawModels {
+	// Inject the API key — this is the critical fix. The Backend.Models() interface
+	// does not pass the key through, so calling it via the backend would send an
+	// unauthenticated request that returns a Cloudflare block page (HTML).
+	if p.APIKey != "" {
+		header := p.APIKeyHeader
+		if header == "" {
+			header = "Authorization"
+		}
+		if header == "Authorization" {
+			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		} else {
+			req.Header.Set(header, p.APIKey)
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("provider /models returned HTTP %d", resp.StatusCode)
+	}
+
+	type modelListResponse struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	var list modelListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("provider /models response not valid JSON: %w", err)
+	}
+
+	out := make([]RemoteModel, 0, len(list.Data))
+	for _, m := range list.Data {
 		rm := RemoteModel{
 			ProviderModelID:  m.ID,
 			DisplayName:      m.ID,
@@ -121,13 +171,12 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 			Tags:             extractTags(m.ID),
 			Metadata:         map[string]interface{}{"object": m.Object, "owned_by": m.OwnedBy},
 		}
-		// Infer capabilities from tags and model ID keywords.
-		rm.SupportsTools      = containsAny(m.ID, "gpt-4", "gpt-3.5", "claude", "gemini", "llama", "mistral", "qwen", "deepseek")
-		rm.SupportsVision     = containsAny(m.ID, "vision", "vl", "visual", "image", "4o", "gemini", "claude-3")
-		rm.SupportsEmbedding  = containsAny(m.ID, "embed", "embedding", "e5", "bge", "minilm")
-		rm.SupportsAudio      = containsAny(m.ID, "whisper", "audio", "speech", "tts", "stt")
-		rm.SupportsReasoning  = containsAny(m.ID, "o1", "o3", "o4", "r1", "thinking", "reason", "cot")
-		rm.SupportsImages     = containsAny(m.ID, "dall-e", "stable-diffusion", "flux", "imagen", "sdxl")
+		rm.SupportsTools     = containsAny(m.ID, "gpt-4", "gpt-3.5", "claude", "gemini", "llama", "mistral", "qwen", "deepseek")
+		rm.SupportsVision    = containsAny(m.ID, "vision", "vl", "visual", "image", "4o", "gemini", "claude-3")
+		rm.SupportsEmbedding = containsAny(m.ID, "embed", "embedding", "e5", "bge", "minilm")
+		rm.SupportsAudio     = containsAny(m.ID, "whisper", "audio", "speech", "tts", "stt")
+		rm.SupportsReasoning = containsAny(m.ID, "o1", "o3", "o4", "r1", "thinking", "reason", "cot")
+		rm.SupportsImages    = containsAny(m.ID, "dall-e", "stable-diffusion", "flux", "imagen", "sdxl")
 		out = append(out, rm)
 	}
 	return out, nil
