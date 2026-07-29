@@ -232,6 +232,187 @@ func (e *Executor) runningContainerPort(ctx context.Context, name string) int {
 	return 0
 }
 
+// discoverActualPort discovers the port a just-started container is actually
+// listening on using the generic PortBindings → --port arg strategy.
+// Retained for internal use by discoverPortForBackend; callers should use
+// discoverPortForBackend instead.
+func (e *Executor) discoverActualPort(ctx context.Context, containerName string, fallback int) int {
+	const (
+		maxAttempts = 15              // FIX-2: increased from 5 — covers large-image slow startup
+		retryDelay  = 1 * time.Second // total window: 15s
+	)
+	for i := 0; i < maxAttempts; i++ {
+		if port := e.runningContainerPort(ctx, containerName); port > 0 {
+			return port
+		}
+		select {
+		case <-ctx.Done():
+			return fallback
+		case <-time.After(retryDelay):
+		}
+	}
+	return fallback
+}
+
+// inspectEnvPort reads environment variables from a running container and
+// extracts the port. Handles "HOST:PORT" (Ollama OLLAMA_HOST) and plain "PORT".
+func (e *Executor) inspectEnvPort(ctx context.Context, containerName string, vars []string) int {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{range .Config.Env}}{{println .}}{{end}}`,
+		containerName).Output()
+	if err != nil {
+		return 0
+	}
+	envMap := make(map[string]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.IndexByte(line, '='); idx > 0 {
+			envMap[line[:idx]] = strings.TrimSpace(line[idx+1:])
+		}
+	}
+	for _, v := range vars {
+		val := envMap[v]
+		if val == "" {
+			continue
+		}
+		// Strip host component: "0.0.0.0:7997" → "7997", ":7997" → "7997"
+		if idx := strings.LastIndexByte(val, ':'); idx >= 0 {
+			val = val[idx+1:]
+		}
+		if port, err := strconv.Atoi(val); err == nil && port > 0 {
+			return port
+		}
+	}
+	return 0
+}
+
+// discoverPortForBackend discovers the actual listening port for a just-started
+// container using a backend-aware strategy.  It is the single authoritative
+// post-start port discovery entry point in the executor.
+//
+// Strategy (per backend):
+//
+//   - ollama:                OLLAMA_HOST env var ("HOST:PORT" or ":PORT")
+//   - cpu_native:            PORT / HTTP_PORT / UVICORN_PORT env vars
+//   - vllm, tgi, llamacpp:  PortBindings (bridge) → --port arg (host network)
+//   - openai_compat:         PortBindings → --port arg → PORT/HTTP_PORT env var
+//   - default/unknown:       all methods in order
+//
+// IMPROVEMENT-2: emits a structured "port_discovery" log entry with outcome,
+// method, attempts, and elapsed time for every call.
+func (e *Executor) discoverPortForBackend(ctx context.Context, containerName, backend string, fallback int) int {
+	const (
+		maxAttempts = 15
+		retryDelay  = 1 * time.Second
+	)
+
+	start := time.Now()
+	method := "none"
+	attempts := 0
+
+	for i := 0; i < maxAttempts; i++ {
+		attempts = i + 1
+
+		// Verify container is running before probing.
+		stateOut, err := exec.CommandContext(ctx, "docker", "inspect",
+			"--format", "{{.State.Running}}", containerName).Output()
+		if err != nil || strings.TrimSpace(string(stateOut)) != "true" {
+			select {
+			case <-ctx.Done():
+				e.log.Info("port_discovery",
+					zap.String("container", containerName),
+					zap.String("backend", backend),
+					zap.Int("requested_port", fallback),
+					zap.Int("actual_port", fallback),
+					zap.String("method", "context_cancelled"),
+					zap.Int("attempts", attempts),
+					zap.Duration("elapsed", time.Since(start)),
+				)
+				return fallback
+			case <-time.After(retryDelay):
+			}
+			continue
+		}
+
+		var port int
+
+		switch backend {
+		case "ollama":
+			// Ollama binds to OLLAMA_HOST — never honours --port.
+			port = e.inspectEnvPort(ctx, containerName, []string{"OLLAMA_HOST"})
+			if port > 0 {
+				method = "env_var:OLLAMA_HOST"
+			}
+
+		case "cpu_native":
+			// cpu_native images read PORT/HTTP_PORT/UVICORN_PORT; no --port arg.
+			port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
+			if port > 0 {
+				method = "env_var:PORT/HTTP_PORT/UVICORN_PORT"
+			}
+
+		case "vllm", "tgi", "llamacpp":
+			// Port controlled via --port CMD arg.
+			// Try PortBindings first (bridge mode), then arg scan (host mode).
+			if p := e.runningContainerPort(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings_or_arg"
+			}
+
+		case "openai_compat":
+			// Generic: PortBindings → --port arg → PORT/HTTP_PORT env var.
+			if p := e.runningContainerPort(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings_or_arg"
+			} else {
+				port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT"})
+				if port > 0 {
+					method = "env_var:PORT/HTTP_PORT"
+				}
+			}
+
+		default:
+			// Unknown backend — try all methods.
+			if p := e.runningContainerPort(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings_or_arg"
+			} else if p := e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT", "OLLAMA_HOST", "UVICORN_PORT"}); p > 0 {
+				port = p
+				method = "env_var:fallback"
+			}
+		}
+
+		if port > 0 {
+			elapsed := time.Since(start)
+			e.log.Info("port_discovery",
+				zap.String("container", containerName),
+				zap.String("backend", backend),
+				zap.Int("requested_port", fallback),
+				zap.Int("actual_port", port),
+				zap.String("method", method),
+				zap.Int("attempts", attempts),
+				zap.Duration("elapsed", elapsed),
+			)
+			return port
+		}
+
+		select {
+		case <-ctx.Done():
+			break
+		case <-time.After(retryDelay):
+		}
+	}
+
+	// All attempts exhausted — fall back to requested port.
+	e.log.Warn("port_discovery: inspect exhausted all attempts — using requested port as fallback",
+		zap.String("container", containerName),
+		zap.String("backend", backend),
+		zap.Int("fallback_port", fallback),
+		zap.Int("attempts", attempts),
+		zap.Duration("elapsed", time.Since(start)),
+	)
+	return fallback
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Backend port helpers — executor-local mirror of Backend interface methods
 // ─────────────────────────────────────────────────────────────────────────────
@@ -649,6 +830,7 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 					Data: map[string]interface{}{
 						"container_id": containerID,
 						"bind_port":    existingPort,
+						"actual_port":  existingPort,
 						"reused":       true,
 					},
 				}
@@ -792,10 +974,32 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 	// expected here and must NOT be treated as failure.
 	// We report "loading_model" to the control plane; it polls /health
 	// independently and transitions the row to "ready" when health passes.
-	e.log.Info("startModel: LOADING_MODEL — container started, model loading",
-		zap.String("container_id", containerID),
-		zap.Int("port", p.BindPort),
-	)
+
+	// ── Actual port discovery ───────────────────────────────────────────────
+	// The source of truth is the running container, NOT the requested BindPort.
+	// discoverPortForBackend uses a per-backend strategy (FIX-3) with a 15s
+	// retry window (FIX-2) and emits a structured log entry (IMPROVEMENT-2).
+	// Task context is passed directly (FIX-6) so discovery is cancelled if the
+	// task is timed out or the agent shuts down.
+	actualPort := e.discoverPortForBackend(ctx, p.RuntimeName, p.Backend, p.BindPort)
+	if actualPort > 0 && actualPort != p.BindPort {
+		e.log.Warn("startModel: container bound to a different port than requested — using actual port",
+			zap.String("runtime", p.RuntimeName),
+			zap.Int("requested_port", p.BindPort),
+			zap.Int("actual_port", actualPort),
+		)
+		p.BindPort = actualPort
+	} else if actualPort > 0 {
+		e.log.Info("startModel: confirmed container port matches requested port",
+			zap.String("runtime", p.RuntimeName),
+			zap.Int("port", p.BindPort),
+		)
+	} else {
+		e.log.Info("startModel: LOADING_MODEL — container started, model loading",
+			zap.String("container_id", containerID),
+			zap.Int("port", p.BindPort),
+		)
+	}
 
 	// Return "loading_model" — the control plane's waitForReady() polls /health
 	// and transitions to "ready" when all four readiness conditions are satisfied.
@@ -806,7 +1010,12 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		RuntimeState: "loading_model",
 		Data: map[string]interface{}{
 			"container_id": containerID,
+			// actual_port is the definitive listening port discovered via docker
+			// inspect.  The control plane must persist this value into
+			// agent_runtimes.bind_port and model_endpoints.port immediately.
+			// Never use the stale requested port for routing.
 			"bind_port":    p.BindPort,
+			"actual_port":  p.BindPort, // explicit alias for clarity at the receiver
 			// Report the resolved gguf_path so the control plane can persist it
 			// in model_runtime_configs — avoids re-download on next container start.
 			"gguf_path": p.GGUFPath,

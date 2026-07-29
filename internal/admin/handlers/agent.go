@@ -317,12 +317,24 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 		// If the agent picked a different port (port conflict resolution), persist it
 		// so the control plane polls the correct address during waitForReady.
 		if bindPort, ok := result["bind_port"].(float64); ok && bindPort > 0 {
+			actualPort := bindPort
+			// Prefer actual_port when present — it is the post-inspect value from
+			// discoverPortForBackend, which is always the definitive listening port.
+			if ap, ok := result["actual_port"].(float64); ok && ap > 0 {
+				actualPort = ap
+			}
+			// FIX-5: monotonic guard — prevents a late-arriving retry from
+			// reverting a newer port value.
 			_, _ = h.db.ExecContext(c.Request.Context(), `
-				UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW() WHERE id=$2`,
-				int(bindPort), runtimeID)
-			// Sync port to model_endpoints, re-enable if disabled, and reset
-			// consecutive_failures so the watcher probes the correct address
-			// immediately without triggering the circuit breaker on the old port.
+				UPDATE agent_runtimes
+				SET bind_port   = $1,
+				    actual_port = $1,
+				    updated_at  = NOW()
+				WHERE id = $2
+				  AND (bind_port = 0 OR updated_at < NOW() - INTERVAL '2 seconds')`,
+				int(actualPort), runtimeID)
+
+			// Primary sync via endpoint_id (activator-spawned runtimes).
 			_, _ = h.db.ExecContext(c.Request.Context(), `
 				UPDATE model_endpoints
 				SET port                 = $1,
@@ -337,7 +349,24 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 				    SELECT endpoint_id FROM agent_runtimes
 				    WHERE id = $2 AND endpoint_id IS NOT NULL
 				)`,
-				int(bindPort), runtimeID)
+				int(actualPort), runtimeID)
+
+			// FIX-4: secondary sync for HA replicas (endpoint_id IS NULL).
+			// Only sync in terminal-startup states so we don't overwrite with a
+			// port from a still-starting replica.
+			if state, ok := result["runtime_state"].(string); ok &&
+				(state == "ready" || state == "active" || state == "loading_model") {
+				_, _ = h.db.ExecContext(c.Request.Context(), `
+					UPDATE model_endpoints me
+					SET    port       = $1,
+					       updated_at = NOW()
+					FROM   agent_runtimes ar
+					WHERE  ar.id            = $2
+					  AND  ar.endpoint_id   IS NULL
+					  AND  me.model_id      = ar.model_id
+					  AND  me.is_enabled    = TRUE`,
+					int(actualPort), runtimeID)
+			}
 		}
 	}
 
@@ -618,13 +647,19 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			input.HealthStatus, runtimeID, claims.NodeID)
 	}
 	if input.BindPort > 0 {
+		// FIX-5: monotonic guard — only write if the row hasn't been updated
+		// more recently (prevents a late-arriving retry from reverting a newer port).
 		_, _ = h.db.ExecContext(c.Request.Context(), `
-			UPDATE agent_runtimes SET bind_port=$1, updated_at=NOW()
-			WHERE id=$2 AND node_id=$3`,
+			UPDATE agent_runtimes
+			SET bind_port  = $1,
+			    actual_port = $1,
+			    updated_at  = NOW()
+			WHERE id       = $2
+			  AND node_id  = $3
+			  AND (bind_port = 0 OR updated_at < NOW() - INTERVAL '2 seconds')`,
 			input.BindPort, runtimeID, claims.NodeID)
-		// Sync port to model_endpoints, re-enable if disabled, and reset
-		// consecutive_failures so the watcher probes the correct address
-		// immediately without triggering the circuit breaker on the old port.
+
+		// Primary sync via endpoint_id (works for activator-spawned runtimes).
 		_, _ = h.db.ExecContext(c.Request.Context(), `
 			UPDATE model_endpoints
 			SET port                 = $1,
@@ -640,6 +675,27 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			    WHERE id = $2 AND endpoint_id IS NOT NULL
 			)`,
 			input.BindPort, runtimeID)
+
+		// FIX-4: secondary sync for HA replicas where endpoint_id IS NULL.
+		// The reconciler inserts agent_runtimes rows with endpoint_id = NULL,
+		// so the primary sync above matches zero rows for those replicas.
+		// When the runtime transitions to ready/active, find the model_endpoints
+		// row via model_id and sync the port so the table stays consistent.
+		// Only update for active states to avoid overwriting with a port from
+		// a stale replica that is still starting.
+		if input.State == "ready" || input.State == "active" {
+			_, _ = h.db.ExecContext(c.Request.Context(), `
+				UPDATE model_endpoints me
+				SET    port       = $1,
+				       updated_at = NOW()
+				FROM   agent_runtimes ar
+				WHERE  ar.id        = $2
+				  AND  ar.node_id   = $3
+				  AND  ar.endpoint_id IS NULL
+				  AND  me.model_id  = ar.model_id
+				  AND  me.is_enabled = TRUE`,
+				input.BindPort, runtimeID, claims.NodeID)
+		}
 	}
 
 	// Sync back to model_endpoints if linked

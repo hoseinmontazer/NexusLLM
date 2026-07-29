@@ -555,20 +555,37 @@ func (a *Agent) executeTask(ctx context.Context, task nodeagent.RemoteTask) {
 		for k, v := range result.Data {
 			resultMap[k] = v
 		}
+
+		// Guarantee bind_port is always present in the /complete body.
+		// The executor stores the actual port in both "bind_port" and
+		// "actual_port". Prefer "actual_port" (the post-inspect value) when
+		// it differs — it is always the definitive listening port.
+		// The control plane's CompleteTask handler persists this into
+		// agent_runtimes.bind_port and model_endpoints.port immediately.
+		resolvedPort := resolveBindPort(result.Data)
+		if resolvedPort > 0 {
+			resultMap["bind_port"] = resolvedPort
+			resultMap["actual_port"] = resolvedPort
+		}
+
 		if err := a.post(ctx, "/agent/v1/tasks/"+task.ID+"/complete", resultMap, nil); err != nil {
 			a.log.Warn("failed to report task completion", zap.Error(err))
 		}
+
 		// Also PUT the runtime row directly — belt-and-suspenders for bind_port.
 		// CompleteTask updates by runtime_id from the result map, but if that
 		// fails (e.g. network blip), this PUT path also persists bind_port.
+		//
+		// The PUT carries bind_port unconditionally whenever it is known so the
+		// control plane's UpdateRuntime handler can sync it to model_endpoints
+		// even if the /complete body was never processed (e.g. due to a retry).
 		if result.RuntimeID != "" && result.RuntimeState != "" {
 			putBody := map[string]interface{}{
 				"state":        result.RuntimeState,
 				"container_id": result.ContainerID,
 			}
-			// Include bind_port if the agent resolved one (port=0 → allocated).
-			if bp, ok := result.Data["bind_port"]; ok {
-				putBody["bind_port"] = bp
+			if resolvedPort > 0 {
+				putBody["bind_port"] = resolvedPort
 			}
 			_ = a.put(ctx, "/agent/v1/runtimes/"+result.RuntimeID, putBody, nil)
 		}
@@ -1007,4 +1024,40 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveBindPort returns the definitive actual port from a task result Data
+// map.  It prefers "actual_port" (the post-inspect value written by
+// discoverActualPort) over "bind_port" (the pre-start allocated value).
+// Both are set to the same value when discovery succeeds; they differ only in
+// the rare case where the executor falls back without a successful inspect.
+// Returns 0 when neither key is present or both are zero.
+func resolveBindPort(data map[string]interface{}) int {
+	// actual_port is set by discoverActualPort() — it is the definitive value.
+	if v, ok := data["actual_port"]; ok {
+		switch p := v.(type) {
+		case int:
+			if p > 0 {
+				return p
+			}
+		case float64:
+			if int(p) > 0 {
+				return int(p)
+			}
+		}
+	}
+	// Fall back to bind_port (the OS-allocated or requested port).
+	if v, ok := data["bind_port"]; ok {
+		switch p := v.(type) {
+		case int:
+			if p > 0 {
+				return p
+			}
+		case float64:
+			if int(p) > 0 {
+				return int(p)
+			}
+		}
+	}
+	return 0
 }

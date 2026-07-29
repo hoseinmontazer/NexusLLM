@@ -386,6 +386,28 @@ POST /admin/v1/models/external
 }
 ```
 
+### upstream_base_url per provider
+
+Each provider backend appends its own path to `upstream_base_url`. Use the root domain — **do not include the API path**.
+
+| Provider | `upstream_base_url` | Final chat URL constructed internally |
+|---|---|---|
+| `openai_provider` | `https://api.openai.com` | `…/v1/chat/completions` |
+| `anthropic_provider` | `https://api.anthropic.com` | `…/v1/messages` |
+| `google_provider` | `https://generativelanguage.googleapis.com` | `…/v1beta/openai/chat/completions` |
+| `azure_openai_provider` | `https://YOUR_RESOURCE.openai.azure.com` | `…/openai/deployments/<model>/chat/completions?api-version=…` |
+| `openrouter_provider` | `https://openrouter.ai` | `…/api/v1/chat/completions` |
+| `groq_provider` | `https://api.groq.com` | `…/openai/v1/chat/completions` |
+| `together_provider` | `https://api.together.xyz` | `…/v1/chat/completions` |
+| `mistral_provider` | `https://api.mistral.ai` | `…/v1/chat/completions` |
+| `cohere_provider` | `https://api.cohere.com` | `…/v1/chat/completions` |
+| `deepseek_provider` | `https://api.deepseek.com` | `…/v1/chat/completions` |
+
+> **Common mistake:** setting `upstream_base_url` to `https://openrouter.ai/api/v1` for OpenRouter.
+> The backend strips `/v1` then appends `/api/v1/chat/completions`, producing a double-path
+> (`/api/api/v1/chat/completions`) that returns a 404 HTML page from OpenRouter.
+> Always use the root domain: `https://openrouter.ai`.
+
 ### List providers
 
 ```
@@ -408,6 +430,68 @@ GET /admin/v1/providers
 PUT /admin/v1/models/:id/upstream
 { "upstream_api_key": "sk-new-key" }
 ```
+
+### Update per-provider outbound proxy
+
+```
+PUT /admin/v1/models/:id/transport
+{ "proxy_url": "socks5://192.168.0.207:3315" }
+```
+
+Supported schemes: `http://`, `https://`, `socks5://`. Credentials may be embedded:
+`http://user:pass@proxy.corp:3128`. Send `""` to remove the proxy and connect directly.
+
+The registry rebuilds the per-endpoint `*http.Client` immediately after the update — no restart required.
+Transport is fully isolated per provider: updating OpenRouter's proxy never affects OpenAI, Anthropic, or any other provider.
+
+> **Note:** the `:id` parameter must be the model's UUID, not its name. Retrieve it with:
+> ```
+> GET /admin/v1/models
+> ```
+> and filter by `name`.
+
+### Get current transport config
+
+```
+GET /admin/v1/models/:id/transport
+
+200 OK
+{
+  "model_id": "…",
+  "count": 1,
+  "endpoints": [{
+    "endpoint_id": "…",
+    "proxy_url": "socks5://192.168.0.207:3315",
+    "tls_insecure_skip_verify": false,
+    "tls_root_ca_pem_set": false,
+    "connect_timeout_seconds": 0,
+    "read_timeout_seconds": 0,
+    "idle_conn_timeout_seconds": 0,
+    "response_header_timeout_seconds": 0,
+    "max_idle_conns_per_host": 0,
+    "max_conns_per_host": 0,
+    "disable_http2": false
+  }],
+  "note": "zero values mean BuildProviderClient() defaults apply (connect=10s idle=90s response_header=30s pool=32)"
+}
+```
+
+### Per-provider proxy: full transport field reference
+
+All fields are optional. Zero values apply production defaults.
+
+| Field | Default | Description |
+|---|---|---|
+| `proxy_url` | `""` (direct) | Outbound proxy. Schemes: `http`, `https`, `socks5`. Credentials allowed. |
+| `tls_insecure_skip_verify` | `false` | Disable TLS cert check. Only for corporate MITM proxies. |
+| `tls_root_ca_pem` | `""` | PEM root CA bundle appended to system roots. |
+| `connect_timeout_seconds` | `10` | TCP dial + TLS handshake timeout. |
+| `read_timeout_seconds` | `0` | Non-streaming body read timeout. `0` = unlimited (streaming-safe). |
+| `idle_conn_timeout_seconds` | `90` | Keep-alive idle connection pool timeout. |
+| `response_header_timeout_seconds` | `30` | Max wait for response headers after request sent. `-1` = disabled. |
+| `max_idle_conns_per_host` | `32` | Idle keep-alive connections in pool per host. |
+| `max_conns_per_host` | `0` | Total connections per host. `0` = unlimited. |
+| `disable_http2` | `false` | Prevent HTTP/2 negotiation via ALPN. |
 
 ---
 

@@ -87,17 +87,79 @@ func (c *ModelController) StartRaw(ctx context.Context, endpointID, modelID stri
 			return
 		}
 
-		// Container is running
-		_, _ = c.db.ExecContext(bg,
-			`UPDATE model_endpoints SET container_id = $1, lifecycle_state = 'loading', updated_at = NOW() WHERE id = $2`,
-			containerID, epID)
+		// ── Actual port discovery ─────────────────────────────────────────────
+		// The source of truth for the listening port is the running container,
+		// NOT spec.BindPort (the pre-start allocation). Discover and persist
+		// the real port immediately so health checks and registry routing use
+		// the correct address from the first probe.
+		//
+		// The docker driver implements discoverPortForBackend with per-backend
+		// strategy (PortBindings → --port arg → env var) and retries for up to
+		// 15 seconds to accommodate large-image slow startup.
+		discoveredPort := spec.BindPort // fallback: requested port
+		if dd, ok := c.driver.(*dockerDriver); ok {
+			startDiscover := time.Now()
+			actualPort := dd.discoverPortForBackend(bg, containerName(spec), spec.BackendType, spec.BindPort)
+			elapsed := time.Since(startDiscover)
+			if actualPort > 0 && actualPort != spec.BindPort {
+				c.log.Warn("container bound to different port than requested — using actual port",
+					zap.String("model", spec.ServedModelName),
+					zap.String("backend", spec.BackendType),
+					zap.Int("requested_port", spec.BindPort),
+					zap.Int("actual_port", actualPort),
+					zap.Duration("discovery_elapsed", elapsed),
+				)
+				discoveredPort = actualPort
+			} else if actualPort > 0 {
+				c.log.Info("port discovery: confirmed container port",
+					zap.String("model", spec.ServedModelName),
+					zap.Int("port", actualPort),
+					zap.Duration("discovery_elapsed", elapsed),
+				)
+				discoveredPort = actualPort
+			} else {
+				c.log.Warn("port discovery: inspect returned 0 — using requested port as fallback",
+					zap.String("model", spec.ServedModelName),
+					zap.Int("fallback_port", spec.BindPort),
+					zap.Duration("discovery_elapsed", elapsed),
+				)
+			}
+		}
+
+		// Persist actual port immediately — model_endpoints.port must reflect the
+		// real container port before health checks begin probing it.
+		// Also update agent_runtimes.bind_port via the linked endpoint_id so
+		// the registry's loadEndpoints() query reads the correct value.
+		_, _ = c.db.ExecContext(bg, `
+			UPDATE model_endpoints
+			SET container_id     = $1,
+			    port             = $2,
+			    lifecycle_state  = 'loading',
+			    updated_at       = NOW()
+			WHERE id = $3`,
+			containerID, discoveredPort, epID)
+
+		// Belt-and-suspenders: also update agent_runtimes.bind_port for any
+		// runtime row linked to this endpoint, so waitForReady() polls the
+		// correct port if an activator is concurrently waiting.
+		_, _ = c.db.ExecContext(bg, `
+			UPDATE agent_runtimes
+			SET bind_port    = $1,
+			    actual_port  = $1,
+			    container_id = $2,
+			    updated_at   = NOW()
+			WHERE endpoint_id = $3
+			  AND state NOT IN ('stopped','deleted','failed')`,
+			discoveredPort, containerID, epID)
+
 		c.transition(bg, epID, "downloading", "loading", "container started", actor)
 		c.succeedOpID(bg, opIDCopy, containerID)
 
-		c.log.Info("container running",
+		c.log.Info("container running — port confirmed",
 			zap.String("container_id", containerID),
 			zap.String("model", spec.ServedModelName),
 			zap.String("backend", spec.BackendType),
+			zap.Int("actual_port", discoveredPort),
 		)
 
 		// Suppress unused variable warnings
@@ -153,9 +215,22 @@ func (c *ModelController) Restart(ctx context.Context, endpointID, actor string)
 		c.transition(ctx, endpointID, ep.LifecycleState, "failed", "restart failed: "+err.Error(), actor)
 		return fmt.Errorf("restart endpoint %s: %w", endpointID, err)
 	}
+
+	// Discover actual port after restart — the new container may bind to a
+	// different port than spec.BindPort (port conflict, backend override, etc.)
+	discoveredPort := spec.BindPort
+	if dd, ok := c.driver.(*dockerDriver); ok {
+		if p := dd.discoverPortForBackend(ctx, containerName(spec), spec.BackendType, spec.BindPort); p > 0 {
+			discoveredPort = p
+		}
+	}
+
 	_, _ = c.db.ExecContext(ctx,
-		`UPDATE model_endpoints SET container_id = $1, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $2`,
-		newID, endpointID)
+		`UPDATE model_endpoints SET container_id = $1, port = $2, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $3`,
+		newID, discoveredPort, endpointID)
+	_, _ = c.db.ExecContext(ctx,
+		`UPDATE agent_runtimes SET bind_port = $1, actual_port = $1, container_id = $2, updated_at = NOW() WHERE endpoint_id = $3 AND state NOT IN ('stopped','deleted','failed')`,
+		discoveredPort, newID, endpointID)
 	c.transition(ctx, endpointID, ep.LifecycleState, "loading", "restarted by "+actor, actor)
 	c.succeedOpID(ctx, opID, newID)
 	return nil
@@ -192,9 +267,20 @@ func (c *ModelController) Upgrade(ctx context.Context, endpointID, newImage, act
 		c.failOpID(ctx, opID, err)
 		return fmt.Errorf("upgrade: %w", err)
 	}
+
+	discoveredPort := spec.BindPort
+	if dd, ok := c.driver.(*dockerDriver); ok {
+		if p := dd.discoverPortForBackend(ctx, containerName(spec), spec.BackendType, spec.BindPort); p > 0 {
+			discoveredPort = p
+		}
+	}
+
 	_, _ = c.db.ExecContext(ctx,
-		`UPDATE model_endpoints SET container_id = $1, runtime_image = $2, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $3`,
-		newID, newImage, endpointID)
+		`UPDATE model_endpoints SET container_id = $1, runtime_image = $2, port = $3, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $4`,
+		newID, newImage, discoveredPort, endpointID)
+	_, _ = c.db.ExecContext(ctx,
+		`UPDATE agent_runtimes SET bind_port = $1, actual_port = $1, container_id = $2, updated_at = NOW() WHERE endpoint_id = $3 AND state NOT IN ('stopped','deleted','failed')`,
+		discoveredPort, newID, endpointID)
 	c.transition(ctx, endpointID, ep.LifecycleState, "loading", "upgraded to "+newImage, actor)
 	c.succeedOpID(ctx, opID, newID)
 	return nil
@@ -214,9 +300,20 @@ func (c *ModelController) Rollback(ctx context.Context, endpointID, previousImag
 		c.failOpID(ctx, opID, err)
 		return fmt.Errorf("rollback: %w", err)
 	}
+
+	discoveredPort := spec.BindPort
+	if dd, ok := c.driver.(*dockerDriver); ok {
+		if p := dd.discoverPortForBackend(ctx, containerName(spec), spec.BackendType, spec.BindPort); p > 0 {
+			discoveredPort = p
+		}
+	}
+
 	_, _ = c.db.ExecContext(ctx,
-		`UPDATE model_endpoints SET container_id = $1, runtime_image = $2, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $3`,
-		newID, previousImage, endpointID)
+		`UPDATE model_endpoints SET container_id = $1, runtime_image = $2, port = $3, lifecycle_state = 'loading', health_status = 'unknown', updated_at = NOW() WHERE id = $4`,
+		newID, previousImage, discoveredPort, endpointID)
+	_, _ = c.db.ExecContext(ctx,
+		`UPDATE agent_runtimes SET bind_port = $1, actual_port = $1, container_id = $2, updated_at = NOW() WHERE endpoint_id = $3 AND state NOT IN ('stopped','deleted','failed')`,
+		discoveredPort, newID, endpointID)
 	c.transition(ctx, endpointID, ep.LifecycleState, "loading", "rolled back to "+previousImage, actor)
 	c.succeedOpID(ctx, opID, newID)
 	return nil

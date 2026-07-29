@@ -17,6 +17,188 @@ type dockerDriver struct {
 	registry *runtime.Registry
 }
 
+// ─── Actual port discovery ───────────────────────────────────────────────────
+//
+// After docker run succeeds, the container may have bound to a different port
+// than was requested (port conflict scan, backend ignoring --port, bind_port=0
+// OS allocation, etc.). These helpers discover the real listening port by
+// inspecting the running container, not by trusting the requested spec.BindPort.
+//
+// This mirrors the logic in internal/nodeagent/executor.go — both code paths
+// must stay in sync. The controller runs inside the admin binary, the executor
+// runs inside the node-agent binary, so the logic cannot be shared via import.
+
+// discoverPortForBackend discovers the actual listening port for a just-started
+// container. It uses a backend-aware strategy because different backends expose
+// their port through different mechanisms:
+//
+//   - vllm, tgi, llamacpp: port passed via --port CMD arg → inspect .Args
+//   - cpu_native: port via PORT/HTTP_PORT/UVICORN_PORT env vars → inspect .Env
+//   - openai_compat: try PortBindings first, then --port arg, then PORT env
+//   - ollama: OLLAMA_HOST env var (format "HOST:PORT" or ":PORT")
+//
+// Returns the discovered port, or fallback if all methods fail.
+func (d *dockerDriver) discoverPortForBackend(ctx context.Context, containerName, backend string, fallback int) int {
+	start := time.Now()
+	const (
+		maxAttempts = 15
+		retryDelay  = 1 * time.Second
+	)
+
+	method := "none"
+	attempts := 0
+
+	for i := 0; i < maxAttempts; i++ {
+		attempts = i + 1
+
+		// Check container is running before probing.
+		stateOut, err := exec.CommandContext(ctx, "docker", "inspect",
+			"--format", "{{.State.Running}}", containerName).Output()
+		if err != nil || strings.TrimSpace(string(stateOut)) != "true" {
+			select {
+			case <-ctx.Done():
+				return fallback
+			case <-time.After(retryDelay):
+			}
+			continue
+		}
+
+		var port int
+
+		switch backend {
+		case "ollama":
+			// Ollama binds to OLLAMA_HOST — never honours --port.
+			port, method = d.portFromEnvVar(ctx, containerName, []string{"OLLAMA_HOST"})
+
+		case "cpu_native":
+			// cpu_native images read PORT/HTTP_PORT/UVICORN_PORT; no --port arg.
+			port, method = d.portFromEnvVar(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
+
+		case "vllm", "tgi", "llamacpp":
+			// These pass port via --port CMD arg.
+			// Try PortBindings first (bridge mode), then arg scan (host mode).
+			if p := d.portFromPortBindings(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings"
+			} else {
+				port, method = d.portFromArgFlag(ctx, containerName)
+			}
+
+		case "openai_compat":
+			// Generic: try PortBindings → --port arg → PORT env var.
+			if p := d.portFromPortBindings(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings"
+			} else if p, m := d.portFromArgFlag(ctx, containerName); p > 0 {
+				port = p
+				method = m
+			} else {
+				port, method = d.portFromEnvVar(ctx, containerName, []string{"PORT", "HTTP_PORT"})
+			}
+
+		default:
+			// Unknown backend — try all methods.
+			if p := d.portFromPortBindings(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings"
+			} else if p, m := d.portFromArgFlag(ctx, containerName); p > 0 {
+				port = p
+				method = m
+			} else {
+				port, method = d.portFromEnvVar(ctx, containerName, []string{"PORT", "HTTP_PORT", "OLLAMA_HOST"})
+			}
+		}
+
+		if port > 0 {
+			elapsed := time.Since(start)
+			_ = elapsed // used in structured log in caller
+			return port
+		}
+
+		select {
+		case <-ctx.Done():
+			return fallback
+		case <-time.After(retryDelay):
+		}
+	}
+
+	_ = method
+	_ = attempts
+	return fallback
+}
+
+// portFromPortBindings reads the HostPort from docker inspect HostConfig.PortBindings.
+// Works for bridge-networked containers where docker manages the mapping.
+func (d *dockerDriver) portFromPortBindings(ctx context.Context, containerName string) int {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{range $p, $conf := .HostConfig.PortBindings}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}`,
+		containerName).Output()
+	if err != nil {
+		return 0
+	}
+	if p := strings.TrimSpace(string(out)); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port
+		}
+	}
+	return 0
+}
+
+// portFromArgFlag reads the --port argument from the container's process args.
+// Works for host-networked containers (vLLM, TGI, llamacpp) started with --port N.
+func (d *dockerDriver) portFromArgFlag(ctx context.Context, containerName string) (int, string) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{join .Args " "}}`, containerName).Output()
+	if err != nil {
+		return 0, "none"
+	}
+	args := strings.Fields(strings.TrimSpace(string(out)))
+	for i, arg := range args {
+		if (arg == "--port" || arg == "-p") && i+1 < len(args) {
+			if port, err := strconv.Atoi(args[i+1]); err == nil && port > 0 {
+				return port, "arg_flag"
+			}
+		}
+		if strings.HasPrefix(arg, "--port=") {
+			if port, err := strconv.Atoi(strings.TrimPrefix(arg, "--port=")); err == nil && port > 0 {
+				return port, "arg_flag"
+			}
+		}
+	}
+	return 0, "none"
+}
+
+// portFromEnvVar reads the named environment variables from the container and
+// extracts the port. Handles "HOST:PORT" (Ollama format) and plain "PORT" values.
+func (d *dockerDriver) portFromEnvVar(ctx context.Context, containerName string, vars []string) (int, string) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{range .Config.Env}}{{println .}}{{end}}`,
+		containerName).Output()
+	if err != nil {
+		return 0, "none"
+	}
+	envMap := make(map[string]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.IndexByte(line, '='); idx > 0 {
+			envMap[line[:idx]] = strings.TrimSpace(line[idx+1:])
+		}
+	}
+	for _, v := range vars {
+		val := envMap[v]
+		if val == "" {
+			continue
+		}
+		// Strip host component: "0.0.0.0:7997" → "7997", ":7997" → "7997"
+		if idx := strings.LastIndexByte(val, ':'); idx >= 0 {
+			val = val[idx+1:]
+		}
+		if port, err := strconv.Atoi(val); err == nil && port > 0 {
+			return port, "env_var:" + v
+		}
+	}
+	return 0, "none"
+}
+
 // NewDockerDriver constructs a Docker driver.
 // registry is required to obtain backend-specific port environment variables.
 func NewDockerDriver(registry *runtime.Registry) Driver {

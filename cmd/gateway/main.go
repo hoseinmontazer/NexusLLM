@@ -130,6 +130,11 @@ func main() {
 	idleMgr := runtimemgr.NewIdleManager(db, taskMgr, rmCfg, log).WithActivator(activator)
 	go idleMgr.Start(watchCtx)
 
+	// IMPROVEMENT-5: background sweep that detects and auto-corrects any
+	// divergence between agent_runtimes.bind_port and model_endpoints.port.
+	// Runs every 5 minutes. Emits a warning log for every corrected row.
+	activator.StartPortMismatchSweep(watchCtx)
+
 	// Usage consumer
 	go usageTracker.StartConsumer(watchCtx)
 

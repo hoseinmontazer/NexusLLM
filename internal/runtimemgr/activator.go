@@ -469,14 +469,20 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	// rows (e.g. no matching model_endpoints row) we must detect that and fail
 	// with a clear error rather than silently orphaning runtimeID (which would
 	// cause an FK violation when the task references it).
+	// FIX-8: requested_port is written once at dispatch time and never
+	// overwritten by agent reports.  It records what port was sent to the
+	// agent so operators can audit whether the container honoured the request.
+	// actual_port starts at 0 and is updated by CompleteTask / UpdateRuntime
+	// once discoverPortForBackend() confirms the real listening port.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
-		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
-		   requested_mode, effective_mode, workload_policy)
+		   state, gpu_ids, bind_host, bind_port, requested_port, actual_port,
+		   cpu_affinity, numa_node, requested_mode, effective_mode, workload_policy)
 		SELECT $1, $2, me.id, $3, $4, $8, 'pending',
-		       $7::jsonb, me.host, me.port, $5, $6,
-		       $9, $10, $11
+		       $7::jsonb, me.host, me.port,
+		       me.port, 0,
+		       $5, $6, $9, $10, $11
 		FROM model_endpoints me
 		WHERE me.model_id = $3
 		  AND me.lifecycle_state NOT IN ('deleted')
@@ -717,6 +723,12 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 						SET state = 'ready', last_used_at = COALESCE(last_used_at, NOW()), updated_at = NOW()
 						WHERE id = $1 AND state NOT IN ('idle','stopping','stopped','failed','deleted')`, rt.ID)
 
+					// FIX-7: only call enableEndpoint once the port is confirmed.
+					// Calling it with port == 0 triggers the fallback branch which
+					// enables the endpoint with the stale me.port value, causing a
+					// brief window where the registry routes to the wrong address.
+					// Port is guaranteed > 0 here because we skipped the health
+					// check (continue) when port == 0 above.
 					a.enableEndpoint(ctx, cfg.ModelID)
 					_ = a.registry.Reload(ctx)
 
@@ -1332,4 +1344,102 @@ func (a *RuntimeActivator) httpHealthCheck(baseURL string) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPROVEMENT-5: portMismatchSweep — background reconciliation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// StartPortMismatchSweep launches a background goroutine that periodically
+// queries for rows where agent_runtimes.bind_port differs from the linked
+// model_endpoints.port for active runtimes, and corrects the mismatch.
+//
+// This is the safety net for any edge case that slips past the primary sync
+// paths (CompleteTask, UpdateRuntime, enableEndpoint). It runs every 5 minutes
+// and emits a warning log for every mismatch it detects so operators can
+// identify and fix any persistent source of divergence.
+//
+// Call this from cmd/admin/main.go after the activator is constructed.
+func (a *RuntimeActivator) StartPortMismatchSweep(ctx context.Context) {
+	go a.portMismatchSweep(ctx)
+}
+
+func (a *RuntimeActivator) portMismatchSweep(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Run once immediately at startup to catch any pre-existing mismatches.
+	a.runPortMismatchSweep(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.runPortMismatchSweep(ctx)
+		}
+	}
+}
+
+func (a *RuntimeActivator) runPortMismatchSweep(ctx context.Context) {
+	type mismatchRow struct {
+		RuntimeID   string `db:"runtime_id"`
+		RuntimeName string `db:"runtime_name"`
+		ModelName   string `db:"model_name"`
+		ARBindPort  int    `db:"ar_bind_port"`
+		MEPort      int    `db:"me_port"`
+		EndpointID  string `db:"endpoint_id"`
+	}
+
+	var rows []mismatchRow
+	err := a.db.SelectContext(ctx, &rows, `
+		SELECT ar.id            AS runtime_id,
+		       ar.runtime_name  AS runtime_name,
+		       m.name           AS model_name,
+		       ar.bind_port     AS ar_bind_port,
+		       me.port          AS me_port,
+		       me.id            AS endpoint_id
+		FROM   agent_runtimes ar
+		JOIN   model_endpoints me ON me.id = ar.endpoint_id
+		JOIN   models m ON m.id = ar.model_id
+		WHERE  ar.state IN ('ready','active','warm','idle')
+		  AND  ar.bind_port > 0
+		  AND  me.port != ar.bind_port`)
+	if err != nil {
+		a.log.Warn("portMismatchSweep: query failed", zap.Error(err))
+		return
+	}
+
+	if len(rows) == 0 {
+		return
+	}
+
+	for _, row := range rows {
+		a.log.Warn("portMismatchSweep: detected port mismatch — correcting",
+			zap.String("runtime_id", row.RuntimeID),
+			zap.String("runtime_name", row.RuntimeName),
+			zap.String("model", row.ModelName),
+			zap.Int("ar_bind_port", row.ARBindPort),
+			zap.Int("me_port", row.MEPort),
+			zap.String("endpoint_id", row.EndpointID),
+		)
+
+		// Correct model_endpoints.port to match the confirmed actual port.
+		_, _ = a.db.ExecContext(ctx, `
+			UPDATE model_endpoints
+			SET    port       = $1,
+			       updated_at = NOW()
+			WHERE  id = $2`,
+			row.ARBindPort, row.EndpointID)
+	}
+
+	// Force a registry reload if any mismatches were corrected so routing
+	// picks up the corrected ports immediately.
+	reloadCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_ = a.registry.Reload(reloadCtx)
+
+	a.log.Warn("portMismatchSweep: corrected mismatches and reloaded registry",
+		zap.Int("count", len(rows)),
+	)
 }
