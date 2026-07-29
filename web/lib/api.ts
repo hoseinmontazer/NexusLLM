@@ -918,6 +918,12 @@ export const api = {
       const qs = params ? '?' + Object.entries(params).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => `${k}=${v}`).join('&') : ''
       return req<{ data: CatalogEntry[]; total: number; page: number; per_page: number }>('GET', `/providers/${id}/catalog${qs}`)
     },
+    listExposedModelIDs: (id: string) =>
+      req<{ exposed: Record<string, string>; count: number }>('GET', `/providers/${id}/exposed-models`),
+    exposeModels: (id: string, modelIds: string[]) =>
+      req<{ created: number; provider_id: string; note: string }>('POST', `/providers/${id}/expose-models`, { model_ids: modelIds }),
+    hideModels: (id: string, ruleIds: string[]) =>
+      req<{ hidden: number; provider_id: string }>('POST', `/providers/${id}/hide-models`, { rule_ids: ruleIds }),
     listRules: (id: string) => req<{ data: ExposureRule[]; total: number }>('GET', `/providers/${id}/rules`),
     createRule: (id: string, b: {
       rule_type: string; pattern?: string; model_id?: string

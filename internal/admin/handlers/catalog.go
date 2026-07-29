@@ -563,6 +563,105 @@ func splitStr(s string, sep rune) []string {
 
 // ── Exposure Rules ────────────────────────────────────────────────────────────
 
+// ListExposedModelIDs handles GET /admin/v1/providers/:id/exposed-models
+// Returns the set of provider_model_id values that have an allow_model rule.
+// Used by the catalog UI to show which models are currently toggled on.
+func (h *CatalogHandler) ListExposedModelIDs(c *gin.Context) {
+	id := c.Param("id")
+	type row struct {
+		ModelID string `db:"model_id"`
+		RuleID  string `db:"id"`
+	}
+	var rows []row
+	err := h.db.SelectContext(c.Request.Context(), &rows, `
+		SELECT id::text, COALESCE(model_id,'') AS model_id
+		FROM provider_exposure_rules
+		WHERE provider_id::text=$1 AND rule_type='allow_model' AND enabled=TRUE`, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Return map of model_id → rule_id so UI can delete individual rules.
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		if r.ModelID != "" {
+			m[r.ModelID] = r.RuleID
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"exposed": m, "count": len(m)})
+}
+
+// BulkExposeModels handles POST /admin/v1/providers/:id/expose-models
+// Creates allow_model rules for the given model IDs and enables direct exposure.
+func (h *CatalogHandler) BulkExposeModels(c *gin.Context) {
+	id := c.Param("id")
+	var in struct {
+		ModelIDs []string `json:"model_ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(in.ModelIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model_ids must not be empty"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	created := 0
+	for _, modelID := range in.ModelIDs {
+		if modelID == "" {
+			continue
+		}
+		rid := uuid.New().String()
+		_, err := h.db.ExecContext(ctx, `
+			INSERT INTO provider_exposure_rules
+			  (id, provider_id, rule_type, model_id, priority)
+			VALUES ($1, $2::uuid, 'allow_model', $3, 50)
+			ON CONFLICT DO NOTHING`,
+			rid, id, modelID,
+		)
+		if err == nil {
+			created++
+		}
+	}
+
+	// Auto-enable direct catalog expose so virtual models are immediately routable.
+	_, _ = h.db.ExecContext(ctx,
+		`UPDATE providers SET catalog_direct_expose=TRUE, updated_at=NOW() WHERE id::text=$1`, id)
+
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"created":    created,
+		"provider_id": id,
+		"note":       "catalog_direct_expose enabled — selected models are now routable as virtual endpoints",
+	})
+}
+
+// BulkHideModels handles POST /admin/v1/providers/:id/hide-models
+// Deletes allow_model rules for the given model IDs.
+func (h *CatalogHandler) BulkHideModels(c *gin.Context) {
+	id := c.Param("id")
+	var in struct {
+		RuleIDs []string `json:"rule_ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	for _, rid := range in.RuleIDs {
+		_, _ = h.db.ExecContext(ctx,
+			`DELETE FROM provider_exposure_rules WHERE id::text=$1 AND provider_id::text=$2`, rid, id)
+	}
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"hidden": len(in.RuleIDs), "provider_id": id})
+}
+
 // ListRules handles GET /admin/v1/providers/:id/rules
 func (h *CatalogHandler) ListRules(c *gin.Context) {
 	id := c.Param("id")

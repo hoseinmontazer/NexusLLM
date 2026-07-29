@@ -31,28 +31,92 @@ function CapBadges({ entry }: { entry: CatalogEntry }) {
 // ── Catalog tab ────────────────────────────────────────────────────────────────
 
 function CatalogTab({ providerId }: { providerId: string }) {
+  const qc = useQueryClient()
   const [q, setQ] = useState('')
   const [cap, setCap] = useState('')
   const [tag, setTag] = useState('')
   const [page, setPage] = useState(1)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
 
+  // Catalog entries (paginated)
   const { data, isLoading } = useQuery({
     queryKey: ['catalog', providerId, q, cap, tag, page],
-    queryFn: () => api.providers.listCatalog(providerId, { q: q || undefined, capability: cap || undefined, tag: tag || undefined, page, per_page: 50 }),
+    queryFn: () => api.providers.listCatalog(providerId, {
+      q: q || undefined, capability: cap || undefined,
+      tag: tag || undefined, page, per_page: 50,
+    }),
     refetchInterval: false,
   })
+
+  // Which models already have allow_model rules (map: model_id → rule_id)
+  const { data: exposedData, refetch: refetchExposed } = useQuery({
+    queryKey: ['exposed-models', providerId],
+    queryFn: () => api.providers.listExposedModelIDs(providerId),
+  })
+  const exposed: Record<string, string> = exposedData?.exposed ?? {}
+  const exposedCount = exposedData?.count ?? 0
 
   const entries = data?.data ?? []
   const total = data?.total ?? 0
 
+  // Bulk expose selected models
+  const exposeMut = useMutation({
+    mutationFn: (ids: string[]) => api.providers.exposeModels(providerId, ids),
+    onSuccess: (r) => {
+      toast({ title: `${r.created} model${r.created !== 1 ? 's' : ''} exposed` })
+      setSelected(new Set())
+      refetchExposed()
+      qc.invalidateQueries({ queryKey: ['provider', providerId] })
+    },
+    onError: (e: any) => toast({ title: 'Failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Bulk hide (remove allow_model rules)
+  const hideMut = useMutation({
+    mutationFn: (ruleIds: string[]) => api.providers.hideModels(providerId, ruleIds),
+    onSuccess: (r) => {
+      toast({ title: `${r.hidden} model${r.hidden !== 1 ? 's' : ''} hidden` })
+      setSelected(new Set())
+      refetchExposed()
+      qc.invalidateQueries({ queryKey: ['provider', providerId] })
+    },
+    onError: (e: any) => toast({ title: 'Failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Toggle a single model's exposure inline
+  const toggleModel = (modelId: string) => {
+    const ruleId = exposed[modelId]
+    if (ruleId) {
+      hideMut.mutate([ruleId])
+    } else {
+      exposeMut.mutate([modelId])
+    }
+  }
+
+  const allSelected = entries.length > 0 && entries.every(e => selected.has(e.provider_model_id))
+  const toggleAll = () => {
+    if (allSelected) {
+      setSelected(prev => { const n = new Set(prev); entries.forEach(e => n.delete(e.provider_model_id)); return n })
+    } else {
+      setSelected(prev => { const n = new Set(prev); entries.forEach(e => n.add(e.provider_model_id)); return n })
+    }
+  }
+
+  const selectedArr = Array.from(selected)
+  const selectedExposedRuleIds = selectedArr.map(id => exposed[id]).filter(Boolean)
+  const selectedUnexposed = selectedArr.filter(id => !exposed[id])
+
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap gap-2">
+      {/* Search + filter bar */}
+      <div className="flex flex-wrap gap-2 items-center">
         <div className="flex items-center gap-1.5 border rounded-md px-2.5 h-8 bg-white text-xs flex-1 min-w-48">
           <Search className="w-3 h-3 text-muted-foreground shrink-0" />
-          <input className="outline-none bg-transparent w-full" placeholder="search models…" value={q} onChange={e => { setQ(e.target.value); setPage(1) }} />
+          <input className="outline-none bg-transparent w-full" placeholder="search models…"
+            value={q} onChange={e => { setQ(e.target.value); setPage(1) }} />
         </div>
-        <select className="border rounded-md h-8 px-2 text-xs" value={cap} onChange={e => { setCap(e.target.value); setPage(1) }}>
+        <select className="border rounded-md h-8 px-2 text-xs" value={cap}
+          onChange={e => { setCap(e.target.value); setPage(1) }}>
           <option value="">All capabilities</option>
           <option value="tools">Function calling</option>
           <option value="vision">Vision</option>
@@ -60,55 +124,147 @@ function CatalogTab({ providerId }: { providerId: string }) {
           <option value="embedding">Embeddings</option>
           <option value="reasoning">Reasoning</option>
         </select>
-        <input className="border rounded-md h-8 px-2 text-xs w-28" placeholder="tag filter…" value={tag} onChange={e => { setTag(e.target.value); setPage(1) }} />
-        <span className="text-xs text-muted-foreground self-center">{total} models</span>
+        <input className="border rounded-md h-8 px-2 text-xs w-24" placeholder="tag…"
+          value={tag} onChange={e => { setTag(e.target.value); setPage(1) }} />
+        <span className="text-xs text-muted-foreground">{total} models</span>
+        <span className="text-xs font-medium text-green-700 ml-auto">
+          ✓ {exposedCount} exposed
+        </span>
       </div>
 
-      {isLoading ? <p className="text-sm text-muted-foreground">Loading catalog…</p> : (
+      {/* Bulk action bar — shown only when rows are selected */}
+      {selected.size > 0 && (
+        <div className="flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-md px-3 py-2 text-sm">
+          <span className="font-medium text-blue-800">{selected.size} selected</span>
+          <div className="flex gap-2 ml-auto">
+            {selectedUnexposed.length > 0 && (
+              <Button size="sm" className="h-7 bg-green-600 hover:bg-green-700 text-white"
+                disabled={exposeMut.isPending}
+                onClick={() => exposeMut.mutate(selectedUnexposed)}>
+                {exposeMut.isPending ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <Eye className="w-3 h-3 mr-1" />}
+                Expose {selectedUnexposed.length}
+              </Button>
+            )}
+            {selectedExposedRuleIds.length > 0 && (
+              <Button size="sm" variant="outline" className="h-7 text-red-600 border-red-300 hover:bg-red-50"
+                disabled={hideMut.isPending}
+                onClick={() => hideMut.mutate(selectedExposedRuleIds)}>
+                {hideMut.isPending ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <XCircle className="w-3 h-3 mr-1" />}
+                Hide {selectedExposedRuleIds.length}
+              </Button>
+            )}
+            <Button size="sm" variant="ghost" className="h-7 text-xs"
+              onClick={() => setSelected(new Set())}>
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Catalog table */}
+      {isLoading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground py-8 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin" />Loading catalog…
+        </div>
+      ) : (
         <div className="rounded-md border overflow-hidden">
           <table className="w-full text-xs">
             <thead>
               <tr className="bg-gray-50 border-b text-muted-foreground">
+                <th className="px-3 py-2 w-8">
+                  <input type="checkbox" checked={allSelected} onChange={toggleAll}
+                    className="h-3.5 w-3.5 cursor-pointer" />
+                </th>
                 <th className="text-left px-3 py-2 font-medium">Model ID</th>
                 <th className="text-left px-3 py-2 font-medium">Capabilities</th>
                 <th className="text-left px-3 py-2 font-medium">Context</th>
                 <th className="text-left px-3 py-2 font-medium">$/1M in</th>
                 <th className="text-left px-3 py-2 font-medium">Tags</th>
-                <th className="text-left px-3 py-2 font-medium">Status</th>
+                <th className="text-center px-3 py-2 font-medium w-24">Exposed</th>
               </tr>
             </thead>
             <tbody className="divide-y">
-              {entries.map(e => (
-                <tr key={e.id} className="hover:bg-gray-50">
-                  <td className="px-3 py-2 font-mono">{e.provider_model_id}</td>
-                  <td className="px-3 py-2"><CapBadges entry={e} /></td>
-                  <td className="px-3 py-2 tabular-nums">{e.context_length ? `${Math.round(e.context_length/1000)}K` : '—'}</td>
-                  <td className="px-3 py-2 tabular-nums">{e.input_cost_per_1m != null ? `$${e.input_cost_per_1m}` : '—'}</td>
-                  <td className="px-3 py-2">
-                    <div className="flex flex-wrap gap-0.5">
-                      {(e.tags ?? []).map(t => <span key={t} className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-600">{t}</span>)}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2">
-                    {e.enabled
-                      ? <span className="text-green-700 flex items-center gap-0.5"><CheckCircle2 className="w-3 h-3" />active</span>
-                      : <span className="text-gray-400 flex items-center gap-0.5"><XCircle className="w-3 h-3" />removed</span>}
+              {entries.map(e => {
+                const isExposed = !!exposed[e.provider_model_id]
+                const isSelected = selected.has(e.provider_model_id)
+                return (
+                  <tr key={e.id}
+                    className={`transition-colors ${isSelected ? 'bg-blue-50' : isExposed ? 'bg-green-50/40' : 'hover:bg-gray-50'}`}>
+                    <td className="px-3 py-2">
+                      <input type="checkbox" checked={isSelected}
+                        onChange={() => setSelected(prev => {
+                          const n = new Set(prev)
+                          isSelected ? n.delete(e.provider_model_id) : n.add(e.provider_model_id)
+                          return n
+                        })}
+                        className="h-3.5 w-3.5 cursor-pointer" />
+                    </td>
+                    <td className="px-3 py-2 font-mono max-w-xs truncate" title={e.provider_model_id}>
+                      {e.provider_model_id}
+                    </td>
+                    <td className="px-3 py-2"><CapBadges entry={e} /></td>
+                    <td className="px-3 py-2 tabular-nums whitespace-nowrap">
+                      {e.context_length ? `${Math.round(e.context_length / 1000)}K` : '—'}
+                    </td>
+                    <td className="px-3 py-2 tabular-nums">
+                      {e.input_cost_per_1m != null ? `$${e.input_cost_per_1m}` : '—'}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-wrap gap-0.5">
+                        {(e.tags ?? []).slice(0, 3).map(t => (
+                          <span key={t} className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-600">{t}</span>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-center">
+                      {/* Toggle switch */}
+                      <button
+                        onClick={() => toggleModel(e.provider_model_id)}
+                        disabled={exposeMut.isPending || hideMut.isPending}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${
+                          isExposed ? 'bg-green-500' : 'bg-gray-200'
+                        }`}
+                        title={isExposed ? 'Click to hide' : 'Click to expose'}
+                      >
+                        <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                          isExposed ? 'translate-x-4' : 'translate-x-0.5'
+                        }`} />
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })}
+              {entries.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-3 py-10 text-center text-muted-foreground">
+                    No catalog entries. Trigger a sync first.
                   </td>
                 </tr>
-              ))}
-              {entries.length === 0 && (
-                <tr><td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">No catalog entries. Trigger a sync first.</td></tr>
               )}
             </tbody>
           </table>
         </div>
       )}
 
+      {/* Pagination */}
       {total > 50 && (
-        <div className="flex gap-2 justify-end">
-          <Button size="sm" variant="outline" disabled={page === 1} onClick={() => setPage(p => p-1)}>← Prev</Button>
-          <span className="text-xs text-muted-foreground self-center">page {page} of {Math.ceil(total/50)}</span>
-          <Button size="sm" variant="outline" disabled={page * 50 >= total} onClick={() => setPage(p => p+1)}>Next →</Button>
+        <div className="flex items-center gap-2 justify-between">
+          <span className="text-xs text-muted-foreground">
+            Showing {(page - 1) * 50 + 1}–{Math.min(page * 50, total)} of {total}
+          </span>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" disabled={page === 1} onClick={() => setPage(p => p - 1)}>← Prev</Button>
+            <span className="text-xs text-muted-foreground self-center">page {page} of {Math.ceil(total / 50)}</span>
+            <Button size="sm" variant="outline" disabled={page * 50 >= total} onClick={() => setPage(p => p + 1)}>Next →</Button>
+          </div>
+        </div>
+      )}
+
+      {/* Hint when nothing is exposed yet */}
+      {exposedCount === 0 && total > 0 && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+          <strong>No models exposed yet.</strong> Toggle individual models on, or select multiple and click <em>Expose</em>.
+          Only exposed models are routable by clients.
         </div>
       )}
     </div>
