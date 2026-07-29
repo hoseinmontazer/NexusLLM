@@ -946,7 +946,7 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 		   provider_max_idle_conns_per_host, provider_max_conns_per_host,
 		   provider_disable_http2)
 		VALUES ($1,$2,'0.0.0.0',0,'/v1',100,1,'unknown',TRUE,'active',
-		        NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), NULLIF($6,''),
+		        NULLIF($3,''), NULLIF($4,''), COALESCE(NULLIF($5,''),''), NULLIF($6,''),
 		        $7,$8,$9::jsonb,
 		        NULLIF($10,''), $11,
 		        NULLIF($12,''),
