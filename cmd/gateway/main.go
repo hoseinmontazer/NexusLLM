@@ -305,7 +305,55 @@ func seedModelPermissions(ctx context.Context, db *sqlx.DB, engine *policy.Engin
 			log.Warn("failed to seed team model permission", zap.Error(err))
 		}
 	}
-	log.Info("model permissions seeded", zap.Int("count", len(rows)))
+
+	// ── Virtual catalog models (Mode B) ───────────────────────────────────────
+	// Exposed catalog models are controlled by provider exposure rules, not by
+	// per-team model permissions. Seed every exposed virtual model name into
+	// every org and every team so the policy engine Step 0 allows them through.
+	//
+	// Virtual model name format: <expose_prefix>/<provider_model_id>
+	// Example: "openrouter/openai/gpt-oss-20b"
+	//
+	// This runs only when the providers table exists (migration 047+).
+	type virtualRow struct {
+		OrgID      string `db:"org_id"`
+		TeamID     string `db:"team_id"`
+		VirtualName string `db:"virtual_name"`
+	}
+	var virtualRows []virtualRow
+	_ = db.SelectContext(ctx, &virtualRows, `
+		SELECT DISTINCT
+		    o.id  AS org_id,
+		    t.id  AS team_id,
+		    CASE WHEN p.catalog_expose_prefix != ''
+		         THEN p.catalog_expose_prefix || '/' || per.model_id
+		         ELSE p.name                  || '/' || per.model_id
+		    END AS virtual_name
+		FROM provider_exposure_rules per
+		JOIN providers p ON p.id = per.provider_id
+		CROSS JOIN teams t
+		JOIN organizations o ON o.id = t.org_id
+		WHERE per.rule_type   = 'allow_model'
+		  AND per.enabled     = TRUE
+		  AND p.enabled       = TRUE
+		  AND p.catalog_direct_expose = TRUE
+		  AND per.model_id IS NOT NULL
+		  AND per.model_id   != ''
+		  AND t.active        = TRUE
+		  AND o.active        = TRUE`)
+	for _, r := range virtualRows {
+		if err := engine.SetOrgModelAllowed(ctx, r.OrgID, r.VirtualName); err != nil {
+			log.Warn("failed to seed virtual model org permission", zap.Error(err))
+		}
+		if err := engine.SetModelAllowed(ctx, r.TeamID, r.VirtualName); err != nil {
+			log.Warn("failed to seed virtual model team permission", zap.Error(err))
+		}
+	}
+
+	log.Info("model permissions seeded",
+		zap.Int("explicit", len(rows)),
+		zap.Int("virtual", len(virtualRows)),
+	)
 }
 
 // seedProjectPolicies loads all project_policies rows and pushes them into the

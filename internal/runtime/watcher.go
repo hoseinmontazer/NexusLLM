@@ -152,6 +152,14 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 		if fails < 3 {
 			newStatus = StatusDegraded
 		}
+		// Provider backends are remote APIs — never mark them StatusDown from
+		// health failures alone. A degraded remote API is still routable;
+		// the request will fail with an upstream error if the API is truly down.
+		// Marking StatusDown removes the endpoint from the registry pool and
+		// triggers the activator, which cannot start a remote API container.
+		if IsProviderBackend(ep.BackendType) {
+			newStatus = StatusDegraded
+		}
 	} else {
 		w.resetFailures(ctx, ep.ID)
 	}

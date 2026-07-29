@@ -11,22 +11,22 @@ import (
 
 // ExposureRule is a Layer-3 allow/deny rule for a provider.
 type ExposureRule struct {
-	ID         string `db:"id"`
-	ProviderID string `db:"provider_id"`
-	RuleType   string `db:"rule_type"` // allow_model | allow_pattern | deny_pattern | capability_filter
-	Pattern    string `db:"pattern"`
-	ModelID    string `db:"model_id"`
+	ID         string `db:"id"          json:"id"`
+	ProviderID string `db:"provider_id" json:"provider_id"`
+	RuleType   string `db:"rule_type"   json:"rule_type"`
+	Pattern    string `db:"pattern"     json:"pattern"`
+	ModelID    string `db:"model_id"    json:"model_id"`
 
-	RequireStreaming  *bool `db:"require_streaming"`
-	RequireTools     *bool `db:"require_tools"`
-	RequireVision    *bool `db:"require_vision"`
-	RequireAudio     *bool `db:"require_audio"`
-	RequireEmbedding *bool `db:"require_embeddings"`
-	RequireReasoning *bool `db:"require_reasoning"`
+	RequireStreaming  *bool `db:"require_streaming"  json:"require_streaming"`
+	RequireTools     *bool `db:"require_tools"      json:"require_tools"`
+	RequireVision    *bool `db:"require_vision"     json:"require_vision"`
+	RequireAudio     *bool `db:"require_audio"      json:"require_audio"`
+	RequireEmbedding *bool `db:"require_embeddings" json:"require_embeddings"`
+	RequireReasoning *bool `db:"require_reasoning"  json:"require_reasoning"`
 
-	DenyTagsRaw string `db:"deny_tags_raw"` // comma-separated from array_to_string
-	Priority    int    `db:"priority"`
-	Enabled     bool   `db:"enabled"`
+	DenyTagsRaw string `db:"deny_tags_raw" json:"deny_tags_raw"`
+	Priority    int    `db:"priority"      json:"priority"`
+	Enabled     bool   `db:"enabled"       json:"enabled"`
 }
 
 // DenyTags splits DenyTagsRaw into a slice.
