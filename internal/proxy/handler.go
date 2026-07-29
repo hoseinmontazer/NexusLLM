@@ -461,6 +461,17 @@ virtualDispatch:
 	if ep.UpstreamBaseURL != "" {
 		endpointURL = ep.UpstreamBaseURL
 	}
+
+	// Substitute upstream model name when configured.
+	// For virtual (Mode B) catalog models ep.UpstreamModelName is the provider's
+	// own model ID (e.g. "openai/gpt-oss-20b"), while req.Model is the NexusLLM
+	// virtual name (e.g. "openrouter/openai/gpt-oss-20b"). Without this the
+	// provider receives the full virtual name and rejects it as unknown.
+	// The same substitution applies for Mode A aliases and legacy external models.
+	if ep.UpstreamModelName != "" {
+		req.Model = ep.UpstreamModelName
+	}
+
 	chatReq := runtime.ChatRequest{Req: &req, EndpointURL: endpointURL, UpstreamAPIKey: ep.UpstreamAPIKey, Client: h.registry.ClientForEndpoint(ep)}
 
 	// ── Backend compatibility sanitization + Thinking mode resolution ─────
