@@ -1,0 +1,289 @@
+package catalog
+
+import (
+	"context"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/runtime"
+	"go.uber.org/zap"
+)
+
+// exposedRow is the DB row returned by the exposed-catalog query.
+type exposedRow struct {
+	RemoteModelID     string `db:"remote_model_id"`
+	ProviderID        string `db:"provider_id"`
+	ProviderModelID   string `db:"provider_model_id"`
+	DisplayName       string `db:"display_name"`
+	ContextLength     *int   `db:"context_length"`
+	SupportsStreaming  bool   `db:"supports_streaming"`
+	SupportsTools     bool   `db:"supports_tools"`
+	SupportsVision    bool   `db:"supports_vision"`
+	SupportsEmbedding bool   `db:"supports_embeddings"`
+	SupportsReasoning bool   `db:"supports_reasoning"`
+	ProviderName      string `db:"provider_name"`
+	BackendType       string `db:"backend_type"`
+	BaseURL           string `db:"base_url"`
+	APIKey            string `db:"api_key"`
+	ProxyURL          string `db:"proxy_url"`
+	TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
+	TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
+	ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
+	ReadTimeoutSeconds           int    `db:"read_timeout_seconds"`
+	IdleConnTimeoutSeconds       int    `db:"idle_conn_timeout_seconds"`
+	ResponseHeaderTimeoutSeconds int    `db:"response_header_timeout_seconds"`
+	MaxIdleConnsPerHost          int    `db:"max_idle_conns_per_host"`
+	MaxConnsPerHost              int    `db:"max_conns_per_host"`
+	DisableHTTP2                 bool   `db:"disable_http2"`
+	VirtualModelName  string `db:"virtual_model_name"`
+	TagsRaw           string `db:"tags_raw"`
+}
+
+// virtualCache is the in-memory resolved catalog used by hot-path resolution.
+type virtualCache struct {
+	byName map[string]*VirtualEndpoint // virtual_model_name → endpoint
+	list   []string                    // ordered list of virtual model names
+	builtAt time.Time
+}
+
+// VirtualModelResolver resolves Mode-B virtual model names to VirtualEndpoints.
+// It caches the exposed catalog in memory and refreshes on Invalidate().
+type VirtualModelResolver struct {
+	db      *sqlx.DB
+	store   *ProviderStore
+	rules   *RuleStore
+	engine  *RuleEngine
+	clients *ProviderClientCache
+	log     *zap.Logger
+
+	mu    sync.RWMutex
+	cache *virtualCache
+}
+
+// NewVirtualModelResolver constructs a resolver.
+func NewVirtualModelResolver(db *sqlx.DB, log *zap.Logger) *VirtualModelResolver {
+	return &VirtualModelResolver{
+		db:      db,
+		store:   NewProviderStore(db),
+		rules:   NewRuleStore(db),
+		engine:  NewRuleEngine(),
+		clients: NewProviderClientCache(),
+		log:     log,
+	}
+}
+
+// Resolve returns a VirtualEndpoint for a Mode-B model name.
+// Returns (nil, nil) when the name is not in the exposed catalog.
+func (r *VirtualModelResolver) Resolve(ctx context.Context, modelName string) (*VirtualEndpoint, error) {
+	cache, err := r.getCache(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ep, ok := cache.byName[modelName]
+	if !ok {
+		return nil, nil
+	}
+	return ep, nil
+}
+
+// ListExposed returns all virtual model names currently exposed.
+// Used by GET /v1/models.
+func (r *VirtualModelResolver) ListExposed(ctx context.Context) ([]string, error) {
+	cache, err := r.getCache(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cache.list, nil
+}
+
+// Capabilities returns the capability list for a virtual model.
+// Returns (nil, false) if the model is not in the exposed catalog.
+func (r *VirtualModelResolver) Capabilities(ctx context.Context, modelName string) ([]runtime.Capability, bool) {
+	cache, err := r.getCache(ctx)
+	if err != nil || cache == nil {
+		return nil, false
+	}
+	ep, ok := cache.byName[modelName]
+	if !ok {
+		return nil, false
+	}
+	return capabilitiesFromVirtualEndpoint(ep), true
+}
+
+// Invalidate clears the in-memory cache so the next request rebuilds it.
+// Call after every catalog sync or rule change.
+func (r *VirtualModelResolver) Invalidate() {
+	r.mu.Lock()
+	r.cache = nil
+	r.mu.Unlock()
+}
+
+// getCache returns the in-memory cache, building it if stale or absent.
+func (r *VirtualModelResolver) getCache(ctx context.Context) (*virtualCache, error) {
+	r.mu.RLock()
+	c := r.cache
+	r.mu.RUnlock()
+	if c != nil {
+		return c, nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Double-check after write lock.
+	if r.cache != nil {
+		return r.cache, nil
+	}
+
+	fresh, err := r.buildCache(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.cache = fresh
+	return fresh, nil
+}
+
+// buildCache queries providers + catalog + rules and produces the in-memory map.
+func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, error) {
+	// Load all direct-expose providers.
+	type provRow struct {
+		ID                   string `db:"id"`
+		Name                 string `db:"name"`
+		BackendType          string `db:"backend_type"`
+		BaseURL              string `db:"base_url"`
+		APIKey               string `db:"api_key"`
+		CatalogExposePrefix  string `db:"catalog_expose_prefix"`
+		ProxyURL             string `db:"proxy_url"`
+		TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
+		TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
+		ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
+		ReadTimeoutSeconds           int    `db:"read_timeout_seconds"`
+		IdleConnTimeoutSeconds       int    `db:"idle_conn_timeout_seconds"`
+		ResponseHeaderTimeoutSeconds int    `db:"response_header_timeout_seconds"`
+		MaxIdleConnsPerHost          int    `db:"max_idle_conns_per_host"`
+		MaxConnsPerHost              int    `db:"max_conns_per_host"`
+		DisableHTTP2                 bool   `db:"disable_http2"`
+	}
+	var providers []provRow
+	if err := r.db.SelectContext(ctx, &providers, `
+		SELECT id::text, name, backend_type, base_url, api_key,
+		       catalog_expose_prefix,
+		       COALESCE(proxy_url,'') AS proxy_url,
+		       tls_insecure_skip_verify,
+		       COALESCE(tls_root_ca_pem,'') AS tls_root_ca_pem,
+		       connect_timeout_seconds, read_timeout_seconds,
+		       idle_conn_timeout_seconds, response_header_timeout_seconds,
+		       max_idle_conns_per_host, max_conns_per_host, disable_http2
+		FROM providers
+		WHERE enabled=TRUE AND catalog_direct_expose=TRUE`); err != nil {
+		// Table may not exist yet (pre-migration 047).
+		r.log.Debug("virtual resolver: providers query returned error (pre-migration?)", zap.Error(err))
+		return &virtualCache{byName: map[string]*VirtualEndpoint{}, list: nil, builtAt: time.Now()}, nil
+	}
+
+	cache := &virtualCache{
+		byName:  make(map[string]*VirtualEndpoint),
+		list:    nil,
+		builtAt: time.Now(),
+	}
+
+	for _, prov := range providers {
+		prefix := prov.CatalogExposePrefix
+		if prefix == "" {
+			prefix = prov.Name
+		}
+
+		transport := runtime.ProviderTransportConfig{
+			ProxyURL:                     prov.ProxyURL,
+			TLSInsecureSkipVerify:        prov.TLSInsecureSkipVerify,
+			TLSRootCAPEM:                 prov.TLSRootCAPEM,
+			ConnectTimeoutSeconds:        prov.ConnectTimeoutSeconds,
+			ReadTimeoutSeconds:           prov.ReadTimeoutSeconds,
+			IdleConnTimeoutSeconds:       prov.IdleConnTimeoutSeconds,
+			ResponseHeaderTimeoutSeconds: prov.ResponseHeaderTimeoutSeconds,
+			MaxIdleConnsPerHost:          prov.MaxIdleConnsPerHost,
+			MaxConnsPerHost:              prov.MaxConnsPerHost,
+			DisableHTTP2:                 prov.DisableHTTP2,
+		}
+
+		// Load catalog entries for this provider.
+		type catalogRow struct {
+			ProviderModelID   string `db:"provider_model_id"`
+			TagsRaw           string `db:"tags_raw"`
+			SupportsStreaming  bool   `db:"supports_streaming"`
+			SupportsTools     bool   `db:"supports_tools"`
+			SupportsVision    bool   `db:"supports_vision"`
+			SupportsAudio     bool   `db:"supports_audio"`
+			SupportsEmbedding bool   `db:"supports_embeddings"`
+			SupportsReasoning bool   `db:"supports_reasoning"`
+		}
+		var entries []catalogRow
+		if err := r.db.SelectContext(ctx, &entries, `
+			SELECT provider_model_id,
+			       COALESCE(array_to_string(tags,','),'') AS tags_raw,
+			       supports_streaming, supports_tools, supports_vision,
+			       supports_audio, supports_embeddings, supports_reasoning
+			FROM provider_remote_models
+			WHERE provider_id::text=$1 AND enabled=TRUE`, prov.ID); err != nil {
+			r.log.Warn("virtual resolver: failed to load catalog", zap.String("provider", prov.Name), zap.Error(err))
+			continue
+		}
+
+		rules, err := r.rules.ListForProvider(ctx, prov.ID)
+		if err != nil {
+			r.log.Warn("virtual resolver: failed to load rules", zap.String("provider", prov.Name), zap.Error(err))
+			continue
+		}
+
+		for _, e := range entries {
+			entry := CatalogEntry{
+				ProviderModelID:   e.ProviderModelID,
+				Tags:              splitTags(e.TagsRaw),
+				SupportsStreaming:  e.SupportsStreaming,
+				SupportsTools:     e.SupportsTools,
+				SupportsVision:    e.SupportsVision,
+				SupportsAudio:     e.SupportsAudio,
+				SupportsEmbedding: e.SupportsEmbedding,
+				SupportsReasoning: e.SupportsReasoning,
+			}
+			if !r.engine.IsExposed(entry, rules) {
+				continue
+			}
+
+			virtualName := prefix + "/" + e.ProviderModelID
+			vep := &VirtualEndpoint{
+				ID:                "virt:" + e.ProviderModelID,
+				BackendType:       runtime.BackendType(prov.BackendType),
+				UpstreamBaseURL:   prov.BaseURL,
+				UpstreamAPIKey:    prov.APIKey,
+				UpstreamModelName: e.ProviderModelID,
+				Transport:         transport,
+			}
+			cache.byName[virtualName] = vep
+			cache.list = append(cache.list, virtualName)
+		}
+	}
+
+	r.log.Debug("virtual resolver cache built",
+		zap.Int("virtual_models", len(cache.list)))
+	return cache, nil
+}
+
+// capabilitiesFromVirtualEndpoint derives capabilities from a VirtualEndpoint.
+// Since virtual endpoints don't have a capabilities column we infer from the
+// backend type and model name.
+func capabilitiesFromVirtualEndpoint(vep *VirtualEndpoint) []runtime.Capability {
+	name := strings.ToLower(vep.UpstreamModelName)
+	caps := []runtime.Capability{runtime.CapabilityChat, runtime.CapabilityCompletion}
+	if strings.Contains(name, "embed") {
+		caps = []runtime.Capability{runtime.CapabilityEmbedding}
+	} else if strings.Contains(name, "whisper") || strings.Contains(name, "transcri") {
+		caps = []runtime.Capability{runtime.CapabilityTranscription}
+	} else if strings.Contains(name, "tts") || strings.Contains(name, "speech") {
+		caps = []runtime.Capability{runtime.CapabilitySpeech}
+	} else if strings.Contains(name, "vision") || strings.Contains(name, "vl") {
+		caps = append(caps, runtime.CapabilityVision)
+	}
+	return caps
+}

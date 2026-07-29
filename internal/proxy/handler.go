@@ -26,6 +26,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/models"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/runtimemgr"
 	"github.com/nexusllm/nexusllm/internal/thinking"
@@ -53,6 +54,9 @@ type Handler struct {
 	db            *sqlx.DB
 	thinkingRes   *thinking.Resolver
 	coldStartDur  time.Duration // 0 = use default (20 min)
+	// virtualResolver resolves Mode-B catalog model names when the registry
+	// has no matching pool entry. Nil-safe — skipped when not set.
+	virtualResolver *catalog.VirtualModelResolver
 }
 
 // NewHandler constructs the proxy Handler.
@@ -125,6 +129,15 @@ func (h *Handler) WithCapabilityValidator(cv *CapabilityValidator) *Handler {
 // per-model upstream_proxy may be set.
 func (h *Handler) WithFactory(f *runtime.Factory) *Handler {
 	h.factory = f
+	return h
+}
+
+// WithVirtualResolver attaches a catalog.VirtualModelResolver for Mode-B
+// catalog model resolution. When set, registry misses fall through to the
+// resolver before the activator/503 path. Virtual models never trigger
+// EnsureRunning — they are always considered routable.
+func (h *Handler) WithVirtualResolver(r *catalog.VirtualModelResolver) *Handler {
+	h.virtualResolver = r
 	return h
 }
 
@@ -314,6 +327,38 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// ── 5. Resolve endpoint ────────────────────────────────────────────────
 	ep, backend, err := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
 	if err != nil {
+		// ── 5a. Try the virtual catalog resolver (Mode-B) ─────────────────
+		// Provider catalog models are never cold-started. If the name exists
+		// in the exposed catalog we dispatch immediately, bypassing the
+		// activator entirely. This is the correct behaviour — virtual models
+		// are always "running" because they are backed by a remote API.
+		if h.virtualResolver != nil {
+			vep, verr := h.virtualResolver.Resolve(c.Request.Context(), req.Model)
+			if verr != nil {
+				h.log.Warn("virtual resolver error", zap.String("model", req.Model), zap.Error(verr))
+			}
+			if vep != nil {
+				// Synthesize a real Endpoint from the virtual entry and obtain
+				// the backend implementation from the factory/registry.
+				ep = vep.AsEndpoint()
+				backend = h.registry.BackendForType(string(ep.BackendType))
+				if backend == nil {
+					backend = h.registry.BackendForType(string(runtime.BackendOpenAICompat))
+				}
+				// Build the per-provider HTTP client from the virtual endpoint's
+				// transport config (already carries provider proxy, TLS, etc.).
+				virtualClient, clientErr := runtime.BuildProviderClient(vep.Transport)
+				if clientErr != nil {
+					virtualClient = h.httpClient
+				}
+				// Store client on the endpoint so ClientForEndpoint picks it up.
+				// We store it in the Registry's epClients cache keyed by ep.ID.
+				h.registry.CacheVirtualClient(ep.ID, virtualClient)
+				// Proceed with the virtual endpoint — skip activator entirely.
+				goto virtualDispatch
+			}
+		}
+
 		// Registry miss — try lazy-loading via the runtime activator.
 		if h.activator != nil {
 			// Check if the model is already healthy right now by giving EnsureRunning
@@ -359,6 +404,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			return
 		}
 	}
+
+	// virtualDispatch: jump target when a Mode-B virtual model was resolved.
+	// The ep and backend are already set; skip the activator and proceed directly
+	// to inflight tracking and dispatch.
+virtualDispatch:
 
 	// ── 6. Track inflight ─────────────────────────────────────────────────
 	// Project-scoped requests: only increment project inflight counter (Layer-1).
@@ -615,6 +665,26 @@ func (h *Handler) Models(c *gin.Context) {
 			})
 		}
 	}
+
+	// Include Mode-B virtual catalog models.
+	// Virtual models don't have a Permissions entry — they are available to any
+	// authenticated caller whose team policy allows the model (or has no allowlist).
+	// We include all exposed virtual names and let the policy engine filter at
+	// request time, exactly as it does for local models.
+	if h.virtualResolver != nil {
+		virtualNames, _ := h.virtualResolver.ListExposed(c.Request.Context())
+		for _, vname := range virtualNames {
+			if !registered[vname] { // don't duplicate Mode-A aliases
+				data = append(data, models.ModelObject{
+					ID:      vname,
+					Object:  "model",
+					Created: fallbackCreated,
+					OwnedBy: "nexusllm-catalog",
+				})
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, models.ModelListResponse{Object: "list", Data: data})
 }
 

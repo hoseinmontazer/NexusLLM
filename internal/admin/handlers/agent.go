@@ -323,15 +323,18 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 			if ap, ok := result["actual_port"].(float64); ok && ap > 0 {
 				actualPort = ap
 			}
-			// FIX-5: monotonic guard — prevents a late-arriving retry from
-			// reverting a newer port value.
+			// FIX-5: bind_port written separately from actual_port so a missing
+			// actual_port column (pre-migration-047) cannot block bind_port from updating.
 			_, _ = h.db.ExecContext(c.Request.Context(), `
 				UPDATE agent_runtimes
-				SET bind_port   = $1,
-				    actual_port = $1,
-				    updated_at  = NOW()
+				SET bind_port  = $1,
+				    updated_at = NOW()
 				WHERE id = $2
 				  AND (bind_port = 0 OR updated_at < NOW() - INTERVAL '2 seconds')`,
+				int(actualPort), runtimeID)
+			// Best-effort: write actual_port if migration 047 has been applied.
+			_, _ = h.db.ExecContext(c.Request.Context(),
+				`UPDATE agent_runtimes SET actual_port=$1 WHERE id=$2`,
 				int(actualPort), runtimeID)
 
 			// Primary sync via endpoint_id (activator-spawned runtimes).
@@ -647,11 +650,10 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			input.HealthStatus, runtimeID, claims.NodeID)
 	}
 	if input.BindPort > 0 {
-		// FIX-5: monotonic guard — only write if the row hasn't been updated
-		// more recently (prevents a late-arriving retry from reverting a newer port).
+		// FIX-5: monotonic guard — only write if this is newer than what we have.
 		_, _ = h.db.ExecContext(c.Request.Context(), `
 			UPDATE agent_runtimes
-			SET bind_port  = $1,
+			SET bind_port   = $1,
 			    actual_port = $1,
 			    updated_at  = NOW()
 			WHERE id       = $2

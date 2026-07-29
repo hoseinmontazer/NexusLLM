@@ -29,6 +29,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
@@ -234,10 +235,41 @@ func main() {
 	a.DELETE("/api-keys/:id", apikeyH.RevokeAPIKey)
 	a.PUT("/api-keys/:id/project", apikeyH.SetKeyProject) // scope key to a project
 
-	// ── Models ────────────────────────────────────────────────────────────────
-	// POST /admin/v1/models/deploy    ← must come before /models/:id to avoid conflict
-	// POST /admin/v1/models/external  ← dedicated external/cloud provider registration
-	a.POST("/models/deploy", runtimeH.DeployModel)
+	// ── Providers (Layer-1 catalog architecture) ──────────────────────────────
+	// POST   /admin/v1/providers              — create provider
+	// GET    /admin/v1/providers              — list providers
+	// GET    /admin/v1/providers/:id          — get provider
+	// PUT    /admin/v1/providers/:id          — update provider
+	// DELETE /admin/v1/providers/:id          — disable provider
+	// POST   /admin/v1/providers/:id/sync     — trigger catalog sync
+	// GET    /admin/v1/providers/:id/health   — test connectivity
+	// PUT    /admin/v1/providers/:id/transport — update transport config
+	// GET    /admin/v1/providers/:id/catalog  — list catalog entries (paginated)
+	// GET    /admin/v1/providers/:id/rules    — list exposure rules
+	// POST   /admin/v1/providers/:id/rules    — create rule
+	// DELETE /admin/v1/providers/:id/rules/:rid — delete rule
+	// POST   /admin/v1/providers/:id/rules/preview — dry-run rule evaluation
+	// POST   /admin/v1/models/catalog-alias   — create Mode-A public model alias
+	factory2 := runtime.NewFactory(&http.Client{Timeout: 10 * time.Second})
+	catalogResolver := catalog.NewVirtualModelResolver(db, log)
+	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
+	go catalogScheduler.Start(usageCtx)
+	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
+
+	a.POST("/providers", catalogH.CreateProvider)
+	a.GET("/providers", catalogH.ListProviders)
+	a.GET("/providers/:id", catalogH.GetProvider)
+	a.PUT("/providers/:id", catalogH.UpdateProvider)
+	a.DELETE("/providers/:id", catalogH.DeleteProvider)
+	a.POST("/providers/:id/sync", catalogH.SyncProvider)
+	a.GET("/providers/:id/health", catalogH.HealthCheck)
+	a.PUT("/providers/:id/transport", catalogH.UpdateTransport)
+	a.GET("/providers/:id/catalog", catalogH.ListCatalog)
+	a.GET("/providers/:id/rules", catalogH.ListRules)
+	a.POST("/providers/:id/rules", catalogH.CreateRule)
+	a.DELETE("/providers/:id/rules/:rid", catalogH.DeleteRule)
+	a.POST("/providers/:id/rules/preview", catalogH.PreviewRules)
+	a.POST("/models/catalog-alias", catalogH.RegisterCatalogAlias)
 	a.POST("/models/external", runtimeH.RegisterExternalModel) // cloud/provider models
 	a.POST("/models", runtimeH.RegisterModel)
 	a.GET("/models", runtimeH.ListModels)

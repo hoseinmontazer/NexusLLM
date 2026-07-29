@@ -5,7 +5,7 @@ import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard, Building2, Users, KeyRound,
   Cpu, Gauge, BarChart3, Settings, Zap,
-  Network, Box, FolderKanban, Shield, Activity,
+  Network, Box, FolderKanban, Shield, Activity, Globe,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -19,9 +19,10 @@ const nav: NavItem[] = [
   { href: '/',          label: 'Dashboard',     icon: LayoutDashboard },
 
   { section: 'header',  label: 'INFERENCE' },
-  { href: '/models',    label: 'Models',         icon: Cpu },
-  { href: '/runtimes',  label: 'Runtimes',       icon: Activity },
-  { href: '/ha',        label: 'High Availability', icon: Shield },
+  { href: '/models',     label: 'Models',           icon: Cpu },
+  { href: '/providers',  label: 'Cloud Providers',  icon: Globe },
+  { href: '/runtimes',   label: 'Runtimes',         icon: Activity },
+  { href: '/ha',         label: 'High Availability', icon: Shield },
 
   { section: 'header',  label: 'EXECUTION' },
   { href: '/projects',  label: 'Projects',       icon: FolderKanban },

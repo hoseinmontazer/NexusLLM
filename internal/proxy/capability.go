@@ -145,7 +145,14 @@ func abortCapabilityError(c *gin.Context, modelName string, required runtime.Cap
 // It is the single authority for capability validation — no backend adapter or
 // runtime-specific code performs this check.
 type CapabilityValidator struct {
-	registry CapabilityRegistryReader
+	registry        CapabilityRegistryReader
+	catalogResolver catalogCapabilityReader // nil-safe; set via WithCatalogResolver
+}
+
+// catalogCapabilityReader is the subset of catalog.VirtualModelResolver used
+// for capability lookup. Defined as an interface to avoid an import cycle.
+type catalogCapabilityReader interface {
+	Capabilities(ctx context.Context, modelName string) ([]runtime.Capability, bool)
 }
 
 // CapabilityRegistryReader is the subset of runtime.Registry used by the validator.
@@ -159,6 +166,13 @@ type CapabilityRegistryReader interface {
 // NewCapabilityValidator constructs a CapabilityValidator backed by reg.
 func NewCapabilityValidator(reg CapabilityRegistryReader) *CapabilityValidator {
 	return &CapabilityValidator{registry: reg}
+}
+
+// WithCatalogResolver attaches a catalog resolver so that virtual (Mode-B)
+// models can also be capability-validated without being in the registry pool.
+func (v *CapabilityValidator) WithCatalogResolver(r catalogCapabilityReader) *CapabilityValidator {
+	v.catalogResolver = r
+	return v
 }
 
 // Validate checks whether modelName supports the capability required by
@@ -179,7 +193,16 @@ func (v *CapabilityValidator) Validate(ctx context.Context, modelName, routePath
 
 	caps, found := v.registry.GetModelCapabilities(ctx, modelName)
 	if !found {
-		// Model not in registry at all — capability check cannot be performed.
+		// Fall back to catalog resolver for virtual (Mode-B) models.
+		if v.catalogResolver != nil {
+			if catalogCaps, ok := v.catalogResolver.Capabilities(ctx, modelName); ok {
+				caps = catalogCaps
+				found = true
+			}
+		}
+	}
+	if !found {
+		// Model not in registry or catalog — capability check cannot be performed.
 		// The downstream pipeline will handle the "model not found" error.
 		return nil
 	}

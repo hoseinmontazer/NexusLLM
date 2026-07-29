@@ -580,6 +580,15 @@ func (r *Registry) ClientForEndpoint(ep *Endpoint) *http.Client {
 	return r.factory.ClientFor(ep.UpstreamProxy)
 }
 
+// CacheVirtualClient stores an *http.Client for a virtual endpoint ID so that
+// ClientForEndpoint can return it without rebuilding. Called by the proxy
+// handler after resolving a Mode-B virtual model.
+func (r *Registry) CacheVirtualClient(endpointID string, client *http.Client) {
+	r.mu.Lock()
+	r.epClients[endpointID] = client
+	r.mu.Unlock()
+}
+
 // BackendForEndpoint returns a Backend instance for the given endpoint.
 func (r *Registry) BackendForEndpoint(ep *Endpoint) (Backend, error) {
 	r.mu.RLock()

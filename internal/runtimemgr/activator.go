@@ -469,19 +469,13 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	// rows (e.g. no matching model_endpoints row) we must detect that and fail
 	// with a clear error rather than silently orphaning runtimeID (which would
 	// cause an FK violation when the task references it).
-	// FIX-8: requested_port is written once at dispatch time and never
-	// overwritten by agent reports.  It records what port was sent to the
-	// agent so operators can audit whether the container honoured the request.
-	// actual_port starts at 0 and is updated by CompleteTask / UpdateRuntime
-	// once discoverPortForBackend() confirms the real listening port.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
-		   state, gpu_ids, bind_host, bind_port, requested_port, actual_port,
+		   state, gpu_ids, bind_host, bind_port,
 		   cpu_affinity, numa_node, requested_mode, effective_mode, workload_policy)
 		SELECT $1, $2, me.id, $3, $4, $8, 'pending',
 		       $7::jsonb, me.host, me.port,
-		       me.port, 0,
 		       $5, $6, $9, $10, $11
 		FROM model_endpoints me
 		WHERE me.model_id = $3
@@ -496,6 +490,14 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		effectiveMode,
 		workloadPolicy,
 	)
+	if err != nil {
+		return fmt.Errorf("insert agent_runtime: %w", err)
+	}
+
+	// Best-effort: also write requested_port/actual_port if migration 047 applied.
+	_, _ = tx.ExecContext(ctx,
+		`UPDATE agent_runtimes SET requested_port=bind_port, actual_port=0 WHERE id=$1`,
+		runtimeID)
 	if err != nil {
 		return fmt.Errorf("insert agent_runtime: %w", err)
 	}

@@ -1,0 +1,639 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/catalog"
+	"github.com/nexusllm/nexusllm/internal/runtime"
+)
+
+// CatalogHandler exposes the Provider Catalog admin REST API.
+type CatalogHandler struct {
+	db        *sqlx.DB
+	store     *catalog.ProviderStore
+	rules     *catalog.RuleStore
+	scheduler *catalog.SyncScheduler
+	resolver  *catalog.VirtualModelResolver
+	registry  *runtime.Registry
+}
+
+// NewCatalogHandler constructs a CatalogHandler.
+func NewCatalogHandler(
+	db *sqlx.DB,
+	scheduler *catalog.SyncScheduler,
+	resolver *catalog.VirtualModelResolver,
+	registry *runtime.Registry,
+) *CatalogHandler {
+	return &CatalogHandler{
+		db:        db,
+		store:     catalog.NewProviderStore(db),
+		rules:     catalog.NewRuleStore(db),
+		scheduler: scheduler,
+		resolver:  resolver,
+		registry:  registry,
+	}
+}
+
+// ── Provider CRUD ─────────────────────────────────────────────────────────────
+
+// ListProviders handles GET /admin/v1/providers
+func (h *CatalogHandler) ListProviders(c *gin.Context) {
+	providers, err := h.store.List(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Strip api_key from list response — only indicate presence.
+	type safeProvider struct {
+		ID                  string     `json:"id"`
+		Name                string     `json:"name"`
+		DisplayName         string     `json:"display_name"`
+		BackendType         string     `json:"backend_type"`
+		BaseURL             string     `json:"base_url"`
+		APIKeySet           bool       `json:"api_key_set"`
+		CatalogSyncEnabled  bool       `json:"catalog_sync_enabled"`
+		CatalogSyncInterval int        `json:"catalog_sync_interval"`
+		CatalogDirectExpose bool       `json:"catalog_direct_expose"`
+		CatalogExposePrefix string     `json:"catalog_expose_prefix"`
+		CatalogLastSyncedAt *time.Time `json:"catalog_last_synced_at"`
+		CatalogModelCount   int        `json:"catalog_model_count"`
+		CatalogSyncStatus   string     `json:"catalog_sync_status"`
+		CatalogSyncError    string     `json:"catalog_sync_error,omitempty"`
+		ProxyURL            string     `json:"proxy_url,omitempty"`
+		Enabled             bool       `json:"enabled"`
+		Health              string     `json:"health"`
+		LastHealthCheck     *time.Time `json:"last_health_check"`
+		CreatedAt           time.Time  `json:"created_at"`
+		UpdatedAt           time.Time  `json:"updated_at"`
+	}
+	out := make([]safeProvider, len(providers))
+	for i, p := range providers {
+		out[i] = safeProvider{
+			ID: p.ID, Name: p.Name, DisplayName: p.DisplayName,
+			BackendType: p.BackendType, BaseURL: p.BaseURL,
+			APIKeySet:           p.APIKey != "",
+			CatalogSyncEnabled:  p.CatalogSyncEnabled,
+			CatalogSyncInterval: p.CatalogSyncInterval,
+			CatalogDirectExpose: p.CatalogDirectExpose,
+			CatalogExposePrefix: p.CatalogExposePrefix,
+			CatalogLastSyncedAt: p.CatalogLastSyncedAt,
+			CatalogModelCount:   p.CatalogModelCount,
+			CatalogSyncStatus:   p.CatalogSyncStatus,
+			CatalogSyncError:    p.CatalogSyncError,
+			ProxyURL:            p.ProxyURL,
+			Enabled:             p.Enabled,
+			Health:              p.Health,
+			LastHealthCheck:     p.LastHealthCheck,
+			CreatedAt:           p.CreatedAt,
+			UpdatedAt:           p.UpdatedAt,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out, "total": len(out)})
+}
+
+// GetProvider handles GET /admin/v1/providers/:id
+func (h *CatalogHandler) GetProvider(c *gin.Context) {
+	id := c.Param("id")
+	p, err := h.store.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + id})
+		return
+	}
+	p.APIKey = "" // never return key
+	c.JSON(http.StatusOK, p)
+}
+
+// CreateProvider handles POST /admin/v1/providers
+func (h *CatalogHandler) CreateProvider(c *gin.Context) {
+	var in struct {
+		Name                string `json:"name"         binding:"required"`
+		DisplayName         string `json:"display_name" binding:"required"`
+		BackendType         string `json:"backend_type" binding:"required"`
+		BaseURL             string `json:"base_url"     binding:"required"`
+		APIKey              string `json:"api_key"`
+		APIKeyHeader        string `json:"api_key_header"`
+		CatalogSyncEnabled  bool   `json:"catalog_sync_enabled"`
+		CatalogSyncInterval int    `json:"catalog_sync_interval"`
+		CatalogDirectExpose bool   `json:"catalog_direct_expose"`
+		CatalogExposePrefix string `json:"catalog_expose_prefix"`
+		ProxyURL            string `json:"proxy_url"`
+		RequestTimeoutSec   int    `json:"request_timeout_seconds"`
+		MaxRetries          int    `json:"max_retries"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.ProxyURL != "" {
+		if err := runtime.ValidateProxyURL(in.ProxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if in.APIKeyHeader == "" {
+		in.APIKeyHeader = "Authorization"
+	}
+	if in.CatalogSyncInterval <= 0 {
+		in.CatalogSyncInterval = 3600
+	}
+	if in.RequestTimeoutSec <= 0 {
+		in.RequestTimeoutSec = 120
+	}
+	if in.MaxRetries <= 0 {
+		in.MaxRetries = 2
+	}
+	id := uuid.New().String()
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO providers
+		  (id, name, display_name, backend_type, base_url, api_key, api_key_header,
+		   catalog_sync_enabled, catalog_sync_interval, catalog_direct_expose,
+		   catalog_expose_prefix, proxy_url, request_timeout_seconds, max_retries)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULLIF($12,''),$13,$14)`,
+		id, in.Name, in.DisplayName, in.BackendType, in.BaseURL,
+		in.APIKey, in.APIKeyHeader,
+		in.CatalogSyncEnabled, in.CatalogSyncInterval, in.CatalogDirectExpose,
+		in.CatalogExposePrefix, in.ProxyURL, in.RequestTimeoutSec, in.MaxRetries,
+	)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "provider name already exists or DB error: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"id": id, "name": in.Name, "status": "created"})
+}
+
+// UpdateProvider handles PUT /admin/v1/providers/:id
+func (h *CatalogHandler) UpdateProvider(c *gin.Context) {
+	id := c.Param("id")
+	var in struct {
+		DisplayName         *string `json:"display_name"`
+		BaseURL             *string `json:"base_url"`
+		APIKey              *string `json:"api_key"`
+		CatalogSyncEnabled  *bool   `json:"catalog_sync_enabled"`
+		CatalogSyncInterval *int    `json:"catalog_sync_interval"`
+		CatalogDirectExpose *bool   `json:"catalog_direct_expose"`
+		CatalogExposePrefix *string `json:"catalog_expose_prefix"`
+		ProxyURL            *string `json:"proxy_url"`
+		Enabled             *bool   `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.ProxyURL != nil {
+		if err := runtime.ValidateProxyURL(*in.ProxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	ctx := c.Request.Context()
+	if in.DisplayName != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET display_name=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.DisplayName)
+	}
+	if in.BaseURL != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET base_url=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.BaseURL)
+	}
+	if in.APIKey != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET api_key=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.APIKey)
+	}
+	if in.CatalogSyncEnabled != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET catalog_sync_enabled=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.CatalogSyncEnabled)
+	}
+	if in.CatalogSyncInterval != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET catalog_sync_interval=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.CatalogSyncInterval)
+	}
+	if in.CatalogDirectExpose != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET catalog_direct_expose=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.CatalogDirectExpose)
+		if h.resolver != nil {
+			h.resolver.Invalidate()
+		}
+	}
+	if in.CatalogExposePrefix != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET catalog_expose_prefix=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.CatalogExposePrefix)
+		if h.resolver != nil {
+			h.resolver.Invalidate()
+		}
+	}
+	if in.ProxyURL != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET proxy_url=NULLIF($2,''),updated_at=NOW() WHERE id::text=$1`, id, *in.ProxyURL)
+	}
+	if in.Enabled != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET enabled=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.Enabled)
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "provider updated", "id": id})
+}
+
+// DeleteProvider handles DELETE /admin/v1/providers/:id
+func (h *CatalogHandler) DeleteProvider(c *gin.Context) {
+	id := c.Param("id")
+	_, _ = h.db.ExecContext(c.Request.Context(),
+		`UPDATE providers SET enabled=FALSE,updated_at=NOW() WHERE id::text=$1`, id)
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "provider disabled", "id": id})
+}
+
+// SyncProvider handles POST /admin/v1/providers/:id/sync
+func (h *CatalogHandler) SyncProvider(c *gin.Context) {
+	id := c.Param("id")
+	go func() {
+		if h.scheduler != nil {
+			_ = h.scheduler.TriggerSync(c.Request.Context(), id)
+			if h.resolver != nil {
+				h.resolver.Invalidate()
+			}
+		}
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"message": "sync triggered", "provider_id": id})
+}
+
+// HealthCheck handles GET /admin/v1/providers/:id/health
+func (h *CatalogHandler) HealthCheck(c *gin.Context) {
+	id := c.Param("id")
+	p, err := h.store.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+		return
+	}
+	client, err := runtime.BuildProviderClient(p.Transport())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	bt := runtime.BackendType(p.BackendType)
+	factory := runtime.NewFactory(client)
+	backend, _ := factory.Build(bt)
+	if backend == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown backend_type: " + p.BackendType})
+		return
+	}
+	health := backend.Health(c.Request.Context(), p.BaseURL, client)
+	status := "healthy"
+	if health.Status != runtime.StatusHealthy {
+		status = string(health.Status)
+	}
+	_ = h.store.UpdateHealth(c.Request.Context(), id, status)
+	c.JSON(http.StatusOK, gin.H{
+		"provider_id": id,
+		"health":      status,
+		"latency_ms":  health.LatencyMs,
+		"error":       health.Error,
+	})
+}
+
+// UpdateTransport handles PUT /admin/v1/providers/:id/transport
+func (h *CatalogHandler) UpdateTransport(c *gin.Context) {
+	id := c.Param("id")
+	var in struct {
+		ProxyURL                     *string `json:"proxy_url"`
+		TLSInsecureSkipVerify        *bool   `json:"tls_insecure_skip_verify"`
+		ConnectTimeoutSeconds        *int    `json:"connect_timeout_seconds"`
+		ReadTimeoutSeconds           *int    `json:"read_timeout_seconds"`
+		IdleConnTimeoutSeconds       *int    `json:"idle_conn_timeout_seconds"`
+		ResponseHeaderTimeoutSeconds *int    `json:"response_header_timeout_seconds"`
+		MaxIdleConnsPerHost          *int    `json:"max_idle_conns_per_host"`
+		MaxConnsPerHost              *int    `json:"max_conns_per_host"`
+		DisableHTTP2                 *bool   `json:"disable_http2"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.ProxyURL != nil {
+		if err := runtime.ValidateProxyURL(*in.ProxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	ctx := c.Request.Context()
+	if in.ProxyURL != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET proxy_url=NULLIF($2,''),updated_at=NOW() WHERE id::text=$1`, id, *in.ProxyURL)
+	}
+	if in.TLSInsecureSkipVerify != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET tls_insecure_skip_verify=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.TLSInsecureSkipVerify)
+	}
+	if in.ConnectTimeoutSeconds != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET connect_timeout_seconds=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.ConnectTimeoutSeconds)
+	}
+	if in.DisableHTTP2 != nil {
+		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET disable_http2=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.DisableHTTP2)
+	}
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "transport updated", "provider_id": id})
+}
+
+// ── Catalog ───────────────────────────────────────────────────────────────────
+
+// ListCatalog handles GET /admin/v1/providers/:id/catalog
+func (h *CatalogHandler) ListCatalog(c *gin.Context) {
+	id := c.Param("id")
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "50"))
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 || perPage > 200 {
+		perPage = 50
+	}
+	offset := (page - 1) * perPage
+
+	q := "%" + c.Query("q") + "%"
+	capability := c.Query("capability")
+	tag := c.Query("tag")
+	exposed := c.Query("exposed")
+
+	type row struct {
+		ID               string   `db:"id"               json:"id"`
+		ProviderModelID  string   `db:"provider_model_id" json:"provider_model_id"`
+		DisplayName      string   `db:"display_name"     json:"display_name"`
+		ContextLength    *int     `db:"context_length"   json:"context_length"`
+		InputCost        *float64 `db:"input_cost_per_1m" json:"input_cost_per_1m"`
+		OutputCost       *float64 `db:"output_cost_per_1m" json:"output_cost_per_1m"`
+		SupportsStreaming bool     `db:"supports_streaming" json:"supports_streaming"`
+		SupportsTools    bool     `db:"supports_tools"   json:"supports_tools"`
+		SupportsVision   bool     `db:"supports_vision"  json:"supports_vision"`
+		SupportsAudio    bool     `db:"supports_audio"   json:"supports_audio"`
+		SupportsEmbed    bool     `db:"supports_embeddings" json:"supports_embeddings"`
+		SupportsReason   bool     `db:"supports_reasoning" json:"supports_reasoning"`
+		TagsRaw          string   `db:"tags_raw"         json:"-"`
+		Tags             []string `db:"-"                json:"tags"`
+		Enabled          bool     `db:"enabled"          json:"enabled"`
+		LastSeenAt       time.Time `db:"last_seen_at"    json:"last_seen_at"`
+	}
+
+	base := `FROM provider_remote_models
+		WHERE provider_id::text=$1
+		  AND (provider_model_id ILIKE $2 OR display_name ILIKE $2)`
+	args := []interface{}{id, q}
+	argN := 3
+
+	if capability != "" {
+		switch capability {
+		case "tools":
+			base += ` AND supports_tools=TRUE`
+		case "vision":
+			base += ` AND supports_vision=TRUE`
+		case "audio":
+			base += ` AND supports_audio=TRUE`
+		case "embedding":
+			base += ` AND supports_embeddings=TRUE`
+		case "reasoning":
+			base += ` AND supports_reasoning=TRUE`
+		}
+	}
+	if tag != "" {
+		base += ` AND $` + strconv.Itoa(argN) + `=ANY(tags)`
+		args = append(args, tag)
+		argN++
+	}
+	if exposed == "true" {
+		base += ` AND enabled=TRUE`
+	} else if exposed == "false" {
+		base += ` AND enabled=FALSE`
+	}
+
+	var total int
+	_ = h.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) `+base, args...).Scan(&total)
+
+	args = append(args, perPage, offset)
+	var rows []row
+	_ = h.db.SelectContext(c.Request.Context(), &rows,
+		`SELECT id::text, provider_model_id, display_name, context_length,
+		        input_cost_per_1m, output_cost_per_1m,
+		        supports_streaming, supports_tools, supports_vision,
+		        supports_audio, supports_embeddings, supports_reasoning,
+		        COALESCE(array_to_string(tags,','),'') AS tags_raw,
+		        enabled, last_seen_at `+base+
+			` ORDER BY provider_model_id LIMIT $`+strconv.Itoa(argN)+` OFFSET $`+strconv.Itoa(argN+1),
+		args...)
+	for i := range rows {
+		if rows[i].TagsRaw != "" {
+			for _, t := range splitComma(rows[i].TagsRaw) {
+				rows[i].Tags = append(rows[i].Tags, t)
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "total": total, "page": page, "per_page": perPage})
+}
+
+func splitComma(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+func joinStr(ss []string, sep string) string {
+	return strings.Join(ss, sep)
+}
+
+// ── Catalog Alias (Mode A public model) ──────────────────────────────────────
+
+// RegisterCatalogAlias handles POST /admin/v1/models/catalog-alias
+// Creates a NexusLLM Public Model backed by a catalog entry.
+func (h *CatalogHandler) RegisterCatalogAlias(c *gin.Context) {
+	var in struct {
+		Name            string   `json:"name"         binding:"required"`
+		DisplayName     string   `json:"display_name"`
+		ProviderID      string   `json:"provider_id"  binding:"required"`
+		ProviderModelID string   `json:"provider_model_id" binding:"required"`
+		ServiceType     string   `json:"service_type"`
+		Capabilities    []string `json:"capabilities"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.ServiceType == "" {
+		in.ServiceType = "CHAT"
+	}
+	if in.DisplayName == "" {
+		in.DisplayName = in.Name
+	}
+
+	// Load provider.
+	p, err := h.store.Get(c.Request.Context(), in.ProviderID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found: " + in.ProviderID})
+		return
+	}
+
+	// Look up catalog entry.
+	var catalogID, displayName string
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT id::text, display_name FROM provider_remote_models
+		 WHERE provider_id::text=$1 AND provider_model_id=$2 LIMIT 1`,
+		p.ID, in.ProviderModelID,
+	).Scan(&catalogID, &displayName)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "catalog entry not found: " + in.ProviderModelID})
+		return
+	}
+	if in.DisplayName == in.Name && displayName != "" {
+		in.DisplayName = displayName
+	}
+
+	caps := in.Capabilities
+	if len(caps) == 0 {
+		caps = []string{"chat", "completion"}
+	}
+	capsJSON, _ := marshalJSON(caps)
+
+	mID := uuid.New().String()
+	_, err = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO models
+		  (id, name, display_name, provider, backend_type, service_type,
+		   max_context, max_output, enabled, tags, capabilities,
+		   provider_name, provider_is_external, provider_id, provider_catalog_id)
+		VALUES ($1,$2,$3,$4,$5,$6,128000,16384,TRUE,'[]'::jsonb,$7::jsonb,
+		        $4,TRUE,$8::uuid,$9::uuid)`,
+		mID, in.Name, in.DisplayName,
+		p.BackendType, p.BackendType, in.ServiceType,
+		capsJSON, p.ID, catalogID,
+	)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists or DB error: " + err.Error()})
+		return
+	}
+	_, _ = h.db.ExecContext(c.Request.Context(),
+		`INSERT INTO model_versions (id,model_id,version,is_default) VALUES ($1,$2,'v1',TRUE)`,
+		uuid.New().String(), mID)
+
+	epID := uuid.New().String()
+	_, _ = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO model_endpoints
+		  (id, model_id, host, port, base_path, weight, priority,
+		   health_status, is_enabled, lifecycle_state,
+		   upstream_api_key, upstream_base_url, upstream_proxy, upstream_model_name,
+		   provider_proxy_url)
+		VALUES ($1,$2,'0.0.0.0',0,'/v1',100,1,'unknown',TRUE,'active',
+		        NULLIF($3,''), NULLIF($4,''), '', NULLIF($5,''),
+		        NULLIF($6,''))`,
+		epID, mID, p.APIKey, p.BaseURL, in.ProviderModelID, p.ProxyURL,
+	)
+
+	if h.registry != nil {
+		_ = h.registry.Reload(c.Request.Context())
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"model_id":          mID,
+		"model_name":        in.Name,
+		"endpoint_id":       epID,
+		"provider_id":       p.ID,
+		"provider_model_id": in.ProviderModelID,
+		"status":            "active",
+	})
+}
+
+func marshalJSON(v interface{}) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "[]", err
+	}
+	return string(b), nil
+}
+
+func splitStr(s string, sep rune) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == sep })
+}
+
+// ── Exposure Rules ────────────────────────────────────────────────────────────
+
+// ListRules handles GET /admin/v1/providers/:id/rules
+func (h *CatalogHandler) ListRules(c *gin.Context) {
+	id := c.Param("id")
+	rules, err := h.rules.ListAll(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rules, "total": len(rules)})
+}
+
+// CreateRule handles POST /admin/v1/providers/:id/rules
+func (h *CatalogHandler) CreateRule(c *gin.Context) {
+	providerID := c.Param("id")
+	var in struct {
+		RuleType          string   `json:"rule_type" binding:"required"`
+		Pattern           string   `json:"pattern"`
+		ModelID           string   `json:"model_id"`
+		RequireStreaming   *bool    `json:"require_streaming"`
+		RequireTools      *bool    `json:"require_tools"`
+		RequireVision     *bool    `json:"require_vision"`
+		RequireAudio      *bool    `json:"require_audio"`
+		RequireEmbeddings *bool    `json:"require_embeddings"`
+		RequireReasoning  *bool    `json:"require_reasoning"`
+		DenyTags          []string `json:"deny_tags"`
+		Priority          int      `json:"priority"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.Priority == 0 {
+		in.Priority = 100
+	}
+	denyTagsLit := "{}"
+	if len(in.DenyTags) > 0 {
+		denyTagsLit = `{"` + joinStr(in.DenyTags, `","`) + `"}`
+	}
+	rid := uuid.New().String()
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO provider_exposure_rules
+		  (id,provider_id,rule_type,pattern,model_id,
+		   require_streaming,require_tools,require_vision,
+		   require_audio,require_embeddings,require_reasoning,
+		   deny_tags,priority)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),
+		        $6,$7,$8,$9,$10,$11,$12::text[],$13)`,
+		rid, providerID, in.RuleType,
+		in.Pattern, in.ModelID,
+		in.RequireStreaming, in.RequireTools, in.RequireVision,
+		in.RequireAudio, in.RequireEmbeddings, in.RequireReasoning,
+		denyTagsLit, in.Priority,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusCreated, gin.H{"id": rid, "provider_id": providerID})
+}
+
+// DeleteRule handles DELETE /admin/v1/providers/:id/rules/:rid
+func (h *CatalogHandler) DeleteRule(c *gin.Context) {
+	rid := c.Param("rid")
+	_, _ = h.db.ExecContext(c.Request.Context(),
+		`DELETE FROM provider_exposure_rules WHERE id::text=$1`, rid)
+	if h.resolver != nil {
+		h.resolver.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "rule deleted", "id": rid})
+}
+
+// PreviewRules handles POST /admin/v1/providers/:id/rules/preview
+func (h *CatalogHandler) PreviewRules(c *gin.Context) {
+	id := c.Param("id")
+	exposed, blocked, err := h.rules.PreviewExposure(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"exposed_count": len(exposed),
+		"blocked_count": len(blocked),
+		"exposed":       exposed,
+		"blocked":       blocked,
+	})
+}

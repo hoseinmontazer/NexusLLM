@@ -507,6 +507,38 @@ export interface ClusterHAStatus {
   recoveries_triggered: number
 }
 
+// ── Provider Catalog types (migration 047) ────────────────────────────────
+export interface CatalogProvider {
+  id: string; name: string; display_name: string
+  backend_type: string; base_url: string
+  api_key_set: boolean
+  catalog_sync_enabled: boolean; catalog_sync_interval: number
+  catalog_direct_expose: boolean; catalog_expose_prefix: string
+  catalog_last_synced_at?: string; catalog_model_count: number
+  catalog_sync_status: string; catalog_sync_error?: string
+  proxy_url?: string; enabled: boolean; health: string
+  last_health_check?: string; created_at: string; updated_at: string
+}
+
+export interface CatalogEntry {
+  id: string; provider_model_id: string; display_name: string
+  context_length?: number
+  input_cost_per_1m?: number; output_cost_per_1m?: number
+  supports_streaming: boolean; supports_tools: boolean
+  supports_vision: boolean; supports_audio: boolean
+  supports_embeddings: boolean; supports_reasoning: boolean
+  tags: string[]; enabled: boolean; last_seen_at: string
+}
+
+export interface ExposureRule {
+  id: string; provider_id: string; rule_type: string
+  pattern?: string; model_id?: string
+  require_streaming?: boolean; require_tools?: boolean
+  require_vision?: boolean; require_audio?: boolean
+  require_embeddings?: boolean; require_reasoning?: boolean
+  deny_tags_raw?: string; priority: number; enabled: boolean
+}
+
 // ── Organisations ─────────────────────────────────────────────────────────────
 export const api = {
   orgs: {
@@ -854,6 +886,46 @@ export const api = {
       const qs = params?.limit ? `?limit=${params.limit}` : ''
       return req<{ data: RecoveryLogEntry[]; total: number; model_id: string }>('GET', `/ha/recovery-log/${modelId}${qs}`)
     },
+  },
+
+  // ── Provider Catalog (migration 047) ─────────────────────────────────────
+  providers: {
+    list: () => req<{ data: CatalogProvider[]; total: number }>('GET', '/providers'),
+    get: (id: string) => req<CatalogProvider>('GET', `/providers/${id}`),
+    create: (b: {
+      name: string; display_name: string; backend_type: string; base_url: string
+      api_key?: string; catalog_sync_enabled?: boolean; catalog_sync_interval?: number
+      catalog_direct_expose?: boolean; catalog_expose_prefix?: string; proxy_url?: string
+      request_timeout_seconds?: number; max_retries?: number
+    }) => req<{ id: string; name: string; status: string }>('POST', '/providers', b),
+    update: (id: string, b: Partial<{
+      display_name: string; base_url: string; api_key: string
+      catalog_sync_enabled: boolean; catalog_sync_interval: number
+      catalog_direct_expose: boolean; catalog_expose_prefix: string
+      proxy_url: string; enabled: boolean
+    }>) => req<{ message: string; id: string }>('PUT', `/providers/${id}`, b),
+    delete: (id: string) => req<{ message: string; id: string }>('DELETE', `/providers/${id}`),
+    sync: (id: string) => req<{ message: string; provider_id: string }>('POST', `/providers/${id}/sync`, {}),
+    health: (id: string) => req<{ provider_id: string; health: string; latency_ms: number; error: string }>('GET', `/providers/${id}/health`),
+    updateTransport: (id: string, b: {
+      proxy_url?: string; tls_insecure_skip_verify?: boolean
+      connect_timeout_seconds?: number; disable_http2?: boolean
+    }) => req<{ message: string; provider_id: string }>('PUT', `/providers/${id}/transport`, b),
+    listCatalog: (id: string, params?: {
+      q?: string; capability?: string; tag?: string; exposed?: string
+      page?: number; per_page?: number
+    }) => {
+      const qs = params ? '?' + Object.entries(params).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => `${k}=${v}`).join('&') : ''
+      return req<{ data: CatalogEntry[]; total: number; page: number; per_page: number }>('GET', `/providers/${id}/catalog${qs}`)
+    },
+    listRules: (id: string) => req<{ data: ExposureRule[]; total: number }>('GET', `/providers/${id}/rules`),
+    createRule: (id: string, b: {
+      rule_type: string; pattern?: string; model_id?: string
+      require_tools?: boolean; require_vision?: boolean; require_reasoning?: boolean
+      deny_tags?: string[]; priority?: number
+    }) => req<{ id: string; provider_id: string }>('POST', `/providers/${id}/rules`, b),
+    deleteRule: (id: string, rid: string) => req<{ message: string }>('DELETE', `/providers/${id}/rules/${rid}`),
+    previewRules: (id: string) => req<{ exposed_count: number; blocked_count: number; exposed: string[]; blocked: string[] }>('POST', `/providers/${id}/rules/preview`, {}),
   },
 
   // ── Project policy & quota (migration 023) ────────────────────────────────

@@ -14,6 +14,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
 	"github.com/nexusllm/nexusllm/internal/middleware"
@@ -156,12 +157,14 @@ func main() {
 	seedProjectPolicies(ctx, db, policyEngine, log)
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
-	capValidator := proxy.NewCapabilityValidator(registry)
+	catalogResolver := catalog.NewVirtualModelResolver(db, log)
+	capValidator := proxy.NewCapabilityValidator(registry).WithCatalogResolver(catalogResolver)
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		registry, usageTracker, teamPolicies, log,
 	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout).
-		WithCapabilityValidator(capValidator).WithFactory(factory)
+		WithCapabilityValidator(capValidator).WithFactory(factory).
+		WithVirtualResolver(catalogResolver)
 
 	// ── Policy live reload every 60s ──────────────────────────────────────────
 	// Uses a sync.RWMutex-protected wrapper to avoid data races between the

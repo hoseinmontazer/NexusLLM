@@ -194,7 +194,9 @@ MIGRATIONS := \
 	043_model_runtime_env.sql \
 	044_external_provider_models.sql \
 	045_provider_cost_and_rate_limits.sql \
-	046_provider_transport_config.sql
+	046_provider_transport_config.sql \
+	047_provider_catalog.sql \
+	048_actual_port_columns.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."
