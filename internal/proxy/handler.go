@@ -1628,6 +1628,11 @@ func extractSupportedParameters(metadataRaw string) []string {
 //
 // Auth still applies. The caller must have a valid NexusLLM API key.
 //
+// The HTTP client is built from the provider's full transport config
+// (proxy, TLS, timeouts, connection pool) — the same client used for
+// chat completions and catalog sync. This ensures outbound proxy settings
+// are honoured identically across all provider traffic.
+//
 // Examples:
 //
 //	GET /v1/providers/openrouter/models   → proxied from https://openrouter.ai/api/v1/models
@@ -1635,8 +1640,6 @@ func extractSupportedParameters(metadataRaw string) []string {
 //	GET /v1/providers/anthropic/models    → proxied from https://api.anthropic.com/v1/models
 //
 // The `:provider_name` matches the `name` column of the providers table.
-// An optional query parameter `?q=gpt` filters by model ID substring
-// (performed in-process on the provider's response, not by the provider).
 func (h *Handler) ProviderModels(c *gin.Context) {
 	if middleware.GetClaims(c) == nil {
 		abortErr(c, http.StatusUnauthorized, "unauthorized", "Missing authentication")
@@ -1649,20 +1652,43 @@ func (h *Handler) ProviderModels(c *gin.Context) {
 
 	providerName := c.Param("provider_name")
 
-	// Load the provider row so we have credentials and transport config.
+	// Load the full provider row — credentials AND complete transport config.
+	// Using the same column list as catalog.ProviderStore.Get() so transport
+	// settings (proxy, TLS, timeouts, pool) are applied identically to how
+	// chat completions and catalog sync reach the provider.
 	var prov struct {
-		ID          string `db:"id"`
-		Name        string `db:"name"`
-		BackendType string `db:"backend_type"`
-		BaseURL     string `db:"base_url"`
-		APIKey      string `db:"api_key"`
+		ID           string `db:"id"`
+		Name         string `db:"name"`
+		BackendType  string `db:"backend_type"`
+		BaseURL      string `db:"base_url"`
+		APIKey       string `db:"api_key"`
 		APIKeyHeader string `db:"api_key_header"`
-		ProxyURL    string `db:"proxy_url"`
+
+		// Full transport config — mirrors catalog.Provider transport fields.
+		ProxyURL                     string `db:"proxy_url"`
+		TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
+		TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
+		ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
+		ReadTimeoutSeconds           int    `db:"read_timeout_seconds"`
+		IdleConnTimeoutSeconds       int    `db:"idle_conn_timeout_seconds"`
+		ResponseHeaderTimeoutSeconds int    `db:"response_header_timeout_seconds"`
+		MaxIdleConnsPerHost          int    `db:"max_idle_conns_per_host"`
+		MaxConnsPerHost              int    `db:"max_conns_per_host"`
+		DisableHTTP2                 bool   `db:"disable_http2"`
 	}
 	err := h.db.GetContext(c.Request.Context(), &prov, `
 		SELECT id::text, name, backend_type, base_url, api_key,
-		       COALESCE(api_key_header,'Authorization') AS api_key_header,
-		       COALESCE(proxy_url,'') AS proxy_url
+		       COALESCE(api_key_header,'Authorization')  AS api_key_header,
+		       COALESCE(proxy_url,'')                    AS proxy_url,
+		       tls_insecure_skip_verify,
+		       COALESCE(tls_root_ca_pem,'')              AS tls_root_ca_pem,
+		       connect_timeout_seconds,
+		       read_timeout_seconds,
+		       idle_conn_timeout_seconds,
+		       response_header_timeout_seconds,
+		       max_idle_conns_per_host,
+		       max_conns_per_host,
+		       disable_http2
 		FROM providers
 		WHERE name = $1 AND enabled = TRUE
 		LIMIT 1`, providerName)
@@ -1685,44 +1711,61 @@ func (h *Handler) ProviderModels(c *gin.Context) {
 	default:
 		modelsURL += "/v1/models"
 	}
-
-	// Append any query string the caller passed (e.g. ?supported_parameters=tools).
+	// Forward any query string the caller passed (e.g. ?supported_parameters=tools).
 	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
 		modelsURL += "?" + rawQuery
 	}
 
-	// Build an isolated HTTP client for this provider.
-	provClient := h.httpClient
-	if prov.ProxyURL != "" {
-		if pf := h.factory; pf != nil {
-			provClient = pf.ClientFor(prov.ProxyURL)
-		}
+	// Build an isolated HTTP client from the provider's full transport config.
+	// This is identical to how virtual endpoint clients are built for chat
+	// completions — ensures the outbound proxy and TLS settings are applied.
+	transport := runtime.ProviderTransportConfig{
+		ProxyURL:                     prov.ProxyURL,
+		TLSInsecureSkipVerify:        prov.TLSInsecureSkipVerify,
+		TLSRootCAPEM:                 prov.TLSRootCAPEM,
+		ConnectTimeoutSeconds:        prov.ConnectTimeoutSeconds,
+		ReadTimeoutSeconds:           prov.ReadTimeoutSeconds,
+		IdleConnTimeoutSeconds:       prov.IdleConnTimeoutSeconds,
+		ResponseHeaderTimeoutSeconds: prov.ResponseHeaderTimeoutSeconds,
+		MaxIdleConnsPerHost:          prov.MaxIdleConnsPerHost,
+		MaxConnsPerHost:              prov.MaxConnsPerHost,
+		DisableHTTP2:                 prov.DisableHTTP2,
+	}
+	provClient, clientErr := runtime.BuildProviderClient(transport)
+	if clientErr != nil {
+		// Non-fatal: fall back to the shared direct client so the request
+		// still works, but log so operators can fix the transport config.
+		h.log.Warn("provider models: failed to build provider client, using fallback",
+			zap.String("provider", providerName),
+			zap.Error(clientErr),
+		)
+		provClient = h.httpClient
 	}
 
 	// Build and fire the upstream request.
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, modelsURL, nil)
+	upstreamReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, modelsURL, nil)
 	if err != nil {
 		abortErr(c, http.StatusInternalServerError, "request_error", err.Error())
 		return
 	}
 
-	// Inject API key using the provider's configured header.
+	// Inject API key using the provider's configured header convention.
 	if prov.APIKey != "" {
 		if prov.APIKeyHeader == "Authorization" || prov.APIKeyHeader == "" {
-			req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+			upstreamReq.Header.Set("Authorization", "Bearer "+prov.APIKey)
 		} else {
-			req.Header.Set(prov.APIKeyHeader, prov.APIKey)
+			upstreamReq.Header.Set(prov.APIKeyHeader, prov.APIKey)
 		}
 	}
 
-	// Forward any extra headers the client sent that aren't auth-related.
+	// Forward benign client headers.
 	for _, hdr := range []string{"Accept", "Accept-Encoding", "User-Agent"} {
 		if v := c.Request.Header.Get(hdr); v != "" {
-			req.Header.Set(hdr, v)
+			upstreamReq.Header.Set(hdr, v)
 		}
 	}
 
-	resp, err := provClient.Do(req)
+	resp, err := provClient.Do(upstreamReq)
 	if err != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_error",
 			fmt.Sprintf("failed to reach provider %q: %s", providerName, err.Error()))
