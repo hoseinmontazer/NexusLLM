@@ -755,14 +755,18 @@ func (h *Handler) Models(c *gin.Context) {
 			SupportsReasoning   bool     `db:"supports_reasoning"`
 			SupportsJsonMode    bool     `db:"supports_json_mode"`
 			ServiceType         string   `db:"service_type"`
+			// metadata JSONB stores the raw provider response fields including
+			// supported_parameters, canonical_slug, owned_by, and created epoch.
 			MetadataRaw         string   `db:"metadata_raw"`
+			// created_at from last_seen_at used as stable created timestamp
+			LastSeenAt          time.Time `db:"last_seen_at"`
 		}
 		var metaRows []metaRow
 		if h.db != nil && len(entries) > 0 {
 			_ = h.db.SelectContext(c.Request.Context(), &metaRows, `
 				SELECT provider_id::text, provider_model_id,
-				       COALESCE(display_name,'')         AS display_name,
-				       COALESCE(description,'')          AS description,
+				       COALESCE(display_name,'')          AS display_name,
+				       COALESCE(description,'')           AS description,
 				       context_length,
 				       max_output_tokens,
 				       input_cost_per_1m,
@@ -772,9 +776,10 @@ func (h *Handler) Models(c *gin.Context) {
 				       supports_streaming, supports_tools,
 				       supports_vision, supports_audio,
 				       supports_embeddings, supports_reasoning,
-				       COALESCE(supports_json_mode, FALSE) AS supports_json_mode,
-				       COALESCE(service_type,'chat')      AS service_type,
-				       COALESCE(metadata::text,'{}')      AS metadata_raw
+				       COALESCE(supports_json_mode, FALSE)  AS supports_json_mode,
+				       COALESCE(service_type,'chat')        AS service_type,
+				       COALESCE(metadata::text,'{}')        AS metadata_raw,
+				       last_seen_at
 				FROM provider_remote_models
 				WHERE enabled = TRUE`)
 		}
@@ -806,22 +811,38 @@ func (h *Handler) Models(c *gin.Context) {
 						obj.Description = row.Description
 					}
 					obj.ContextLength = row.ContextLength
-					// Build architecture block from capability flags.
-					arch := buildModelArchitecture(row.SupportsVision, row.SupportsAudio, row.ServiceType)
-					obj.Architecture = arch
-					// Build pricing block — prefer provider_* cost columns if set,
-					// fall back to input_cost_per_1m / output_cost_per_1m.
+
+					// Use actual last_seen_at as the created timestamp so
+					// it matches what the provider reported.
+					if !row.LastSeenAt.IsZero() {
+						obj.Created = row.LastSeenAt.Unix()
+					}
+
+					// Architecture block from capability flags.
+					obj.Architecture = buildModelArchitecture(row.SupportsVision, row.SupportsAudio, row.ServiceType)
+
+					// Pricing — prefer provider_* cost columns (written by syncer
+					// from provider's own pricing data) over legacy per-1M columns.
 					obj.Pricing = buildModelPricing(
 						row.ProviderInputCost, row.ProviderOutputCost,
 						row.InputCostPer1M, row.OutputCostPer1M,
 					)
-					// Build top_provider block.
+
+					// top_provider block.
 					obj.TopProvider = buildTopProvider(row.ContextLength, row.MaxOutputTokens)
-					// Build supported_parameters from capability flags.
-					obj.SupportedParameters = buildSupportedParameters(
-						row.SupportsStreaming, row.SupportsTools,
-						row.SupportsJsonMode, row.SupportsReasoning,
-					)
+
+					// supported_parameters — prefer the stored list from the
+					// provider's /models response (via metadata JSONB), which
+					// contains the full provider-specific parameter list.
+					// Fall back to deriving from capability flags.
+					if params := extractSupportedParameters(row.MetadataRaw); len(params) > 0 {
+						obj.SupportedParameters = params
+					} else {
+						obj.SupportedParameters = buildSupportedParameters(
+							row.SupportsStreaming, row.SupportsTools,
+							row.SupportsJsonMode, row.SupportsReasoning,
+						)
+					}
 				}
 			}
 			data = append(data, obj)
@@ -1572,4 +1593,155 @@ func buildSupportedParameters(streaming, tools, jsonMode, reasoning bool) []stri
 		params = append(params, "reasoning")
 	}
 	return params
+}
+
+// extractSupportedParameters reads the supported_parameters list from the
+// JSONB metadata column written by the catalog syncer.
+// OpenRouter stores this as metadata["supported_parameters"] = ["temperature", "tools", ...].
+// Returns nil when the metadata is absent or doesn't contain the field.
+func extractSupportedParameters(metadataRaw string) []string {
+	if metadataRaw == "" || metadataRaw == "{}" || metadataRaw == "null" {
+		return nil
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(metadataRaw), &meta); err != nil {
+		return nil
+	}
+	raw, ok := meta["supported_parameters"]
+	if !ok {
+		return nil
+	}
+	var params []string
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil
+	}
+	return params
+}
+
+// ProviderModels handles GET /v1/providers/:provider_name/models
+//
+// Proxies the raw /models response directly from the named cloud provider
+// back to the caller without any transformation. This lets clients get the
+// exact JSON the provider returns — including every provider-specific field
+// (canonical_slug, alias_target, supported_parameters, pricing, reasoning,
+// knowledge_cutoff, per_request_limits, etc.) — for any configured provider.
+//
+// Auth still applies. The caller must have a valid NexusLLM API key.
+//
+// Examples:
+//
+//	GET /v1/providers/openrouter/models   → proxied from https://openrouter.ai/api/v1/models
+//	GET /v1/providers/openai/models       → proxied from https://api.openai.com/v1/models
+//	GET /v1/providers/anthropic/models    → proxied from https://api.anthropic.com/v1/models
+//
+// The `:provider_name` matches the `name` column of the providers table.
+// An optional query parameter `?q=gpt` filters by model ID substring
+// (performed in-process on the provider's response, not by the provider).
+func (h *Handler) ProviderModels(c *gin.Context) {
+	if middleware.GetClaims(c) == nil {
+		abortErr(c, http.StatusUnauthorized, "unauthorized", "Missing authentication")
+		return
+	}
+	if h.db == nil {
+		abortErr(c, http.StatusServiceUnavailable, "no_db", "Database not available")
+		return
+	}
+
+	providerName := c.Param("provider_name")
+
+	// Load the provider row so we have credentials and transport config.
+	var prov struct {
+		ID          string `db:"id"`
+		Name        string `db:"name"`
+		BackendType string `db:"backend_type"`
+		BaseURL     string `db:"base_url"`
+		APIKey      string `db:"api_key"`
+		APIKeyHeader string `db:"api_key_header"`
+		ProxyURL    string `db:"proxy_url"`
+	}
+	err := h.db.GetContext(c.Request.Context(), &prov, `
+		SELECT id::text, name, backend_type, base_url, api_key,
+		       COALESCE(api_key_header,'Authorization') AS api_key_header,
+		       COALESCE(proxy_url,'') AS proxy_url
+		FROM providers
+		WHERE name = $1 AND enabled = TRUE
+		LIMIT 1`, providerName)
+	if err != nil {
+		abortErr(c, http.StatusNotFound, "provider_not_found",
+			fmt.Sprintf("provider %q not found or not enabled", providerName))
+		return
+	}
+
+	// Build the models URL for this provider's backend type.
+	// Mirrors the path logic in CatalogSyncer.fetchModels().
+	modelsURL := strings.TrimSuffix(prov.BaseURL, "/")
+	switch prov.BackendType {
+	case "openrouter_provider":
+		modelsURL += "/api/v1/models"
+	case "groq_provider":
+		modelsURL += "/openai/v1/models"
+	case "google_provider":
+		modelsURL += "/v1beta/openai/models"
+	default:
+		modelsURL += "/v1/models"
+	}
+
+	// Append any query string the caller passed (e.g. ?supported_parameters=tools).
+	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
+		modelsURL += "?" + rawQuery
+	}
+
+	// Build an isolated HTTP client for this provider.
+	provClient := h.httpClient
+	if prov.ProxyURL != "" {
+		if pf := h.factory; pf != nil {
+			provClient = pf.ClientFor(prov.ProxyURL)
+		}
+	}
+
+	// Build and fire the upstream request.
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, modelsURL, nil)
+	if err != nil {
+		abortErr(c, http.StatusInternalServerError, "request_error", err.Error())
+		return
+	}
+
+	// Inject API key using the provider's configured header.
+	if prov.APIKey != "" {
+		if prov.APIKeyHeader == "Authorization" || prov.APIKeyHeader == "" {
+			req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+		} else {
+			req.Header.Set(prov.APIKeyHeader, prov.APIKey)
+		}
+	}
+
+	// Forward any extra headers the client sent that aren't auth-related.
+	for _, hdr := range []string{"Accept", "Accept-Encoding", "User-Agent"} {
+		if v := c.Request.Header.Get(hdr); v != "" {
+			req.Header.Set(hdr, v)
+		}
+	}
+
+	resp, err := provClient.Do(req)
+	if err != nil {
+		abortErr(c, http.StatusBadGateway, "upstream_error",
+			fmt.Sprintf("failed to reach provider %q: %s", providerName, err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Pass the provider's status code, content-type and body straight through.
+	// No parsing, no transformation — the client gets exactly what the provider sent.
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/json"
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		abortErr(c, http.StatusBadGateway, "read_error", readErr.Error())
+		return
+	}
+	c.Header("X-Nexus-Provider", prov.Name)
+	c.Header("X-Nexus-Provider-URL", modelsURL)
+	c.Data(resp.StatusCode, ct, body)
 }

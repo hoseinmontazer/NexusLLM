@@ -212,6 +212,13 @@ func main() {
 		v1.GET("/models", proxyHandler.Models)
 		v1.GET("/models/:model_id", proxyHandler.ModelByID) // single-model lookup (Cline, Continue, Kilo Code)
 
+		// Provider passthrough — returns the raw /models response from a
+		// configured provider without any transformation. Useful for browsing
+		// the full provider catalog with all provider-specific metadata intact.
+		// GET /v1/providers/:provider_name/models
+		// e.g. GET /v1/providers/openrouter/models
+		v1.GET("/providers/:provider_name/models", proxyHandler.ProviderModels)
+
 		// Additional inference endpoints
 		v1.POST("/rerank", proxyHandler.Rerank)
 		v1.POST("/audio/transcriptions", proxyHandler.Transcriptions)

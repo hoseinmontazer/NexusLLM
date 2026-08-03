@@ -35,6 +35,101 @@ Model
 
 ---
 
+## `GET /v1/providers/:name/models` — Raw provider passthrough
+
+This endpoint proxies the provider's own `/models` response **without any transformation**. The client gets exactly what OpenRouter (or any other configured provider) returns — including every provider-specific field:
+
+```bash
+# OpenRouter — all 600+ models with full metadata
+curl http://localhost:8880/v1/providers/openrouter/models \
+  -H "Authorization: Bearer <your-nexus-api-key>"
+
+# OpenAI
+curl http://localhost:8880/v1/providers/openai/models \
+  -H "Authorization: Bearer <your-nexus-api-key>"
+
+# Anthropic
+curl http://localhost:8880/v1/providers/anthropic/models \
+  -H "Authorization: Bearer <your-nexus-api-key>"
+```
+
+The `:name` segment matches the `name` column of the `providers` table — the internal name you set when creating the provider (e.g. `openrouter`, `openai`, `anthropic`).
+
+**The response is the provider's raw JSON.** For OpenRouter it looks like:
+
+```json
+{
+  "data": [
+    {
+      "id": "openai/gpt-5",
+      "canonical_slug": "openai/gpt-5",
+      "name": "GPT-5",
+      "created": 1785606009,
+      "description": "...",
+      "context_length": 1048576,
+      "architecture": {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "tokenizer": "Router",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.00000009",
+        "completion": "0.00000018",
+        "input_cache_read": "0.000000018"
+      },
+      "top_provider": {
+        "context_length": 1048576,
+        "max_completion_tokens": 65536,
+        "is_moderated": false
+      },
+      "supported_parameters": [
+        "frequency_penalty", "include_reasoning", "logit_bias",
+        "logprobs", "max_tokens", "presence_penalty", "reasoning",
+        "reasoning_effort", "response_format", "seed", "stop",
+        "structured_outputs", "temperature", "tool_choice", "tools",
+        "top_k", "top_logprobs", "top_p"
+      ],
+      "per_request_limits": null,
+      "reasoning": {
+        "mandatory": false,
+        "default_enabled": true,
+        "supported_efforts": ["max", "high", "low"],
+        "default_effort": "high"
+      }
+    }
+  ]
+}
+```
+
+**Auth still applies.** A valid NexusLLM API key is required. The request is not counted against rate limits (it's a catalog read, not an inference request).
+
+**Query parameters are forwarded.** Any query string you pass is appended to the upstream URL unchanged:
+
+```bash
+# OpenRouter supports ?supported_parameters=tools to filter tool-capable models
+curl "http://localhost:8880/v1/providers/openrouter/models?supported_parameters=tools" \
+  -H "Authorization: Bearer <nexus-key>"
+```
+
+**How the upstream URL is built per provider:**
+
+| Provider name | Backend type | Upstream URL called |
+|---|---|---|
+| `openrouter` | `openrouter_provider` | `https://openrouter.ai/api/v1/models` |
+| `openai` | `openai_provider` | `https://api.openai.com/v1/models` |
+| `anthropic` | `anthropic_provider` | `https://api.anthropic.com/v1/models` |
+| `groq` | `groq_provider` | `https://api.groq.com/openai/v1/models` |
+| `gemini` | `google_provider` | `https://generativelanguage.googleapis.com/v1beta/openai/models` |
+| any other | `*_provider` | `<base_url>/v1/models` |
+
+The provider's stored `api_key` is injected as `Authorization: Bearer <key>` (or the configured `api_key_header`) on the upstream request. The outbound proxy (if configured on the provider) is used automatically.
+
+Response headers `X-Nexus-Provider` and `X-Nexus-Provider-URL` indicate which provider was called and the exact URL that was used.
+
+---
+
 ## Option A — Catalog Mode (OpenRouter-style, recommended for large providers)
 
 Catalog mode lets you expose an entire provider catalogue (e.g. all 600+ OpenRouter models) without registering each one individually. Models appear as virtual names in `GET /v1/models`. Authorization is at the project level, not the model level.
