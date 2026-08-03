@@ -28,3 +28,8 @@
 20. [Automatic Scheduler & Placement](20-automatic-scheduler.md)
 21. [Weighted Priority & Scheduling](21-weighted-priority.md)
 22. [High Availability & Self-Healing](22-high-availability.md)
+23. [Model Capabilities](23-model-capabilities.md)
+24. [Upstream Model Names](24-upstream-model-name.md)
+25. [External / Cloud Provider Models](25-external-provider-models.md)
+26. [Provider Catalog Architecture](26-provider-catalog-architecture.md)
+27. [Cloud Model Access — Operational Guide](27-cloud-model-quickstart.md)

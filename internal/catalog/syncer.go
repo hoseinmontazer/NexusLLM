@@ -16,20 +16,24 @@ import (
 
 // RemoteModel is a catalog entry fetched from a provider.
 type RemoteModel struct {
-	ProviderModelID   string
-	DisplayName       string
-	Description       string
-	ContextLength     *int
-	InputCostPer1M    *float64
-	OutputCostPer1M   *float64
-	SupportsStreaming  bool
-	SupportsTools     bool
-	SupportsVision    bool
-	SupportsAudio     bool
-	SupportsEmbedding bool
-	SupportsReasoning bool
-	SupportsImages    bool
-	Tags              []string
+	ProviderModelID    string
+	DisplayName        string
+	Description        string
+	ContextLength      *int
+	MaxOutputTokens    *int
+	InputCostPer1M     *float64
+	OutputCostPer1M    *float64
+	ProviderInputCost  *float64
+	ProviderOutputCost *float64
+	SupportsStreaming   bool
+	SupportsTools      bool
+	SupportsVision     bool
+	SupportsAudio      bool
+	SupportsEmbedding  bool
+	SupportsReasoning  bool
+	SupportsImages     bool
+	SupportsJsonMode   bool
+	Tags               []string
 	Metadata          map[string]interface{}
 }
 
@@ -151,10 +155,36 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 
 	type modelListResponse struct {
 		Data []struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
+			ID          string  `json:"id"`
+			Object      string  `json:"object"`
+			Created     int64   `json:"created"`
+			OwnedBy     string  `json:"owned_by"`
+			Name        string  `json:"name"`
+			Description string  `json:"description"`
+			// OpenRouter and similar providers return rich metadata.
+			ContextLength *int   `json:"context_length"`
+			Architecture  *struct {
+				Modality         string   `json:"modality"`
+				InputModalities  []string `json:"input_modalities"`
+				OutputModalities []string `json:"output_modalities"`
+				Tokenizer        string   `json:"tokenizer"`
+				InstructType     *string  `json:"instruct_type"`
+			} `json:"architecture"`
+			Pricing *struct {
+				Prompt          string `json:"prompt"`
+				Completion      string `json:"completion"`
+				InputCacheRead  string `json:"input_cache_read"`
+				InputCacheWrite string `json:"input_cache_write"`
+				Image           string `json:"image"`
+			} `json:"pricing"`
+			TopProvider *struct {
+				ContextLength       *int  `json:"context_length"`
+				MaxCompletionTokens *int  `json:"max_completion_tokens"`
+				IsModerated         bool  `json:"is_moderated"`
+			} `json:"top_provider"`
+			SupportedParameters []string               `json:"supported_parameters"`
+			HuggingFaceID       *string                `json:"hugging_face_id"`
+			CanonicalSlug       string                 `json:"canonical_slug"`
 		} `json:"data"`
 	}
 	var list modelListResponse
@@ -164,33 +194,110 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 
 	out := make([]RemoteModel, 0, len(list.Data))
 	for _, m := range list.Data {
-		// Capability flags are NOT inferred from the model ID string.
-		//
-		// Architecture rule: routing and capability decisions must be based on
-		// explicit metadata, never on pattern-matching names. The basic
-		// /v1/models response carries no structured capability data — only id,
-		// object, created, and owned_by. Storing guesses as facts would cause
-		// incorrect routing (e.g. "openai/gpt-oss-20b" falsely claiming vision
-		// because the ID contains "4o", or being treated as a local runtime
-		// because the name looks like a local model).
-		//
-		// All capability flags default to false. Operators update them via:
-		//   PUT /admin/v1/providers/:id/models/:model_id
-		// or through a richer provider-specific sync that returns capability
-		// metadata (e.g. OpenRouter's /api/v1/models includes context_length,
-		// pricing, and supported parameters — that data can be used when the
-		// provider exposes it explicitly).
-		//
-		// SupportsStreaming is the only safe default to set true — every chat
-		// model endpoint advertised by the providers we integrate with supports
-		// SSE streaming. The ON CONFLICT … DO UPDATE in upsertCatalog preserves
-		// values for existing rows, so hand-edited flags are never clobbered.
+		// Capability flags: derive from the architecture block when available
+		// (OpenRouter provides it explicitly), otherwise fall back to safe
+		// defaults. This avoids the forbidden pattern of inferring capabilities
+		// from model name strings.
+		supportsVision    := false
+		supportsAudio     := false
+		supportsEmbedding := false
+		supportsImageGen  := false
+		description       := m.Description
+		if description == "" {
+			description = m.Name
+		}
+
+		// Parse architecture input/output modalities when provided.
+		if m.Architecture != nil {
+			for _, mod := range m.Architecture.InputModalities {
+				switch mod {
+				case "image":
+					supportsVision = true
+				case "audio":
+					supportsAudio = true
+				}
+			}
+			for _, mod := range m.Architecture.OutputModalities {
+				switch mod {
+				case "image":
+					supportsImageGen = true
+				case "embedding":
+					supportsEmbedding = true
+				}
+			}
+		}
+
+		// Derive supports_tools from supported_parameters when available.
+		supportsTools    := false
+		supportsJsonMode := false
+		supportsReasoning := false
+		for _, param := range m.SupportedParameters {
+			switch param {
+			case "tools", "tool_choice":
+				supportsTools = true
+			case "response_format":
+				supportsJsonMode = true
+			case "reasoning", "include_reasoning":
+				supportsReasoning = true
+			}
+		}
+
+		// Parse pricing into float64 per-1M-token values.
+		var inputCost, outputCost *float64
+		if m.Pricing != nil {
+			if v, err := parseProviderCost(m.Pricing.Prompt); err == nil {
+				inputCost = &v
+			}
+			if v, err := parseProviderCost(m.Pricing.Completion); err == nil {
+				outputCost = &v
+			}
+		}
+
+		// Context length from top_provider overrides the model-level field
+		// when both are present (top_provider is per-instance, model is nominal).
+		ctxLen := m.ContextLength
+		var maxOutput *int
+		if m.TopProvider != nil {
+			if m.TopProvider.ContextLength != nil {
+				ctxLen = m.TopProvider.ContextLength
+			}
+			maxOutput = m.TopProvider.MaxCompletionTokens
+		}
+
+		displayName := m.Name
+		if displayName == "" {
+			displayName = m.ID
+		}
+
 		rm := RemoteModel{
-			ProviderModelID:  m.ID,
-			DisplayName:      m.ID,
-			SupportsStreaming: true,
-			Tags:             extractTags(m.ID),
-			Metadata:         map[string]interface{}{"object": m.Object, "owned_by": m.OwnedBy},
+			ProviderModelID:   m.ID,
+			DisplayName:       displayName,
+			Description:       description,
+			ContextLength:     ctxLen,
+			MaxOutputTokens:   maxOutput,
+			InputCostPer1M:    inputCost,
+			OutputCostPer1M:   outputCost,
+			ProviderInputCost: inputCost,
+			ProviderOutputCost: outputCost,
+			// SupportsStreaming defaults true — every chat model supports SSE.
+			// The ON CONFLICT … DO UPDATE in upsertCatalog preserves existing
+			// values so hand-edited flags are never clobbered on re-sync.
+			SupportsStreaming:  true,
+			SupportsTools:     supportsTools,
+			SupportsVision:    supportsVision,
+			SupportsAudio:     supportsAudio,
+			SupportsEmbedding: supportsEmbedding,
+			SupportsImages:    supportsImageGen,
+			// Derived from supported_parameters.
+			SupportsJsonMode:  supportsJsonMode,
+			SupportsReasoning: supportsReasoning,
+			Tags:              extractTags(m.ID),
+			Metadata: map[string]interface{}{
+				"object":               m.Object,
+				"owned_by":             m.OwnedBy,
+				"supported_parameters": m.SupportedParameters,
+				"canonical_slug":       m.CanonicalSlug,
+			},
 		}
 		out = append(out, rm)
 	}
@@ -220,30 +327,47 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			tagsArray = pq.Array([]string{})
 		}
 
-		// On conflict we intentionally do NOT overwrite supports_* capability
-		// flags. Those are set once on first insert (all false for a basic
-		// /v1/models response) and then managed exclusively by the operator via
-		// PUT /admin/v1/providers/:id/models/:model_id. Re-syncing must never
-		// reset hand-edited capability data back to the conservative defaults.
-		// Only display metadata (display_name, tags, last_seen_at, enabled) is
-		// refreshed from the provider on every sync.
+		// On conflict, update display metadata AND the new rich columns
+		// (context_length, pricing, description) from the provider's latest
+		// /models response. Capability flags (supports_*) are still preserved
+		// for existing rows — operators can override them manually and
+		// re-syncing should not reset intentional overrides.
+		// Exception: on first insert the capability flags come from the parsed
+		// architecture block, giving better defaults than all-false.
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO provider_remote_models
 			  (provider_id, provider_model_id, display_name, description,
+			   context_length, max_output_tokens,
+			   input_cost_per_1m, output_cost_per_1m,
+			   provider_input_cost, provider_output_cost,
 			   supports_streaming, supports_tools, supports_vision,
 			   supports_audio, supports_embeddings, supports_reasoning, supports_images,
+			   supports_json_mode,
 			   tags, enabled, last_seen_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW())
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,TRUE,NOW())
 			ON CONFLICT (provider_id, provider_model_id) DO UPDATE
-			SET display_name = EXCLUDED.display_name,
-			    tags         = EXCLUDED.tags,
-			    enabled      = TRUE,
-			    removed_at   = NULL,
-			    last_seen_at = NOW()`,
+			SET display_name         = EXCLUDED.display_name,
+			    description          = EXCLUDED.description,
+			    context_length       = EXCLUDED.context_length,
+			    max_output_tokens    = COALESCE(EXCLUDED.max_output_tokens, provider_remote_models.max_output_tokens),
+			    input_cost_per_1m    = COALESCE(EXCLUDED.input_cost_per_1m,  provider_remote_models.input_cost_per_1m),
+			    output_cost_per_1m   = COALESCE(EXCLUDED.output_cost_per_1m, provider_remote_models.output_cost_per_1m),
+			    provider_input_cost  = COALESCE(EXCLUDED.provider_input_cost,  provider_remote_models.provider_input_cost),
+			    provider_output_cost = COALESCE(EXCLUDED.provider_output_cost, provider_remote_models.provider_output_cost),
+			    tags                 = EXCLUDED.tags,
+			    enabled              = TRUE,
+			    removed_at           = NULL,
+			    last_seen_at         = NOW()`,
 			providerID,
 			m.ProviderModelID,
 			m.DisplayName,
 			m.Description,
+			m.ContextLength,
+			m.MaxOutputTokens,
+			m.InputCostPer1M,
+			m.OutputCostPer1M,
+			m.ProviderInputCost,
+			m.ProviderOutputCost,
 			m.SupportsStreaming,
 			m.SupportsTools,
 			m.SupportsVision,
@@ -251,6 +375,7 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			m.SupportsEmbedding,
 			m.SupportsReasoning,
 			m.SupportsImages,
+			m.SupportsJsonMode,
 			tagsArray,
 		)
 		if err != nil {
@@ -319,4 +444,24 @@ func (s *CatalogSyncer) SyncInterval(p *Provider) time.Duration {
 		return 60 * time.Minute
 	}
 	return time.Duration(p.CatalogSyncInterval) * time.Second
+}
+
+// parseProviderCost converts a provider-reported cost string (e.g. "0.000001"
+// or "1e-06") to a per-1M-token float64 value stored in input_cost_per_1m /
+// output_cost_per_1m columns.  Returns an error for empty or unparseable values.
+//
+// OpenRouter reports costs as per-token strings (e.g. prompt="0.000001" means
+// $1 per 1M tokens).  We store them as per-1M-token values for consistency with
+// the existing schema.
+func parseProviderCost(s string) (float64, error) {
+	if s == "" || s == "0" {
+		return 0, fmt.Errorf("zero or empty cost")
+	}
+	var v float64
+	_, err := fmt.Sscanf(s, "%g", &v)
+	if err != nil {
+		return 0, err
+	}
+	// Convert per-token → per-1M-token.
+	return v * 1_000_000, nil
 }

@@ -97,6 +97,101 @@ func (r *VirtualModelResolver) ListExposed(ctx context.Context) ([]string, error
 	return cache.list, nil
 }
 
+// ListExposedForProject returns the virtual model names the given project is
+// allowed to call, based on its project_provider_access grants.
+//
+// It reads the full exposed catalog from the in-memory cache (fast) and
+// filters each name through the project's provider ACL grants (also fast —
+// the ACL is a small in-memory list loaded once per call from the DB).
+//
+// Returns an empty slice when the project has no provider grants or when
+// no virtual models are exposed.  Never returns an error for missing grants
+// (just an empty list), to avoid blocking the Models endpoint on a DB error.
+func (r *VirtualModelResolver) ListExposedForProject(ctx context.Context, projectID string) ([]string, error) {
+	cache, err := r.getCache(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(cache.list) == 0 {
+		return nil, nil
+	}
+
+	// Load project's provider access grants from DB.
+	store := NewProjectProviderAccessStore(r.db)
+	grants, err := store.ListForProject(ctx, projectID)
+	if err != nil || len(grants) == 0 {
+		return nil, nil
+	}
+
+	out := make([]string, 0, len(cache.list))
+	for _, name := range cache.list {
+		for i := range grants {
+			if grants[i].IsAllowed(name) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// ListExposedForProjectWithMeta is like ListExposedForProject but also returns
+// the VirtualEndpoint for each name so the proxy handler can enrich the
+// ModelObject response with catalog metadata.
+// Returns a slice of (virtualName, *VirtualEndpoint) pairs in the same order
+// as ListExposedForProject.
+func (r *VirtualModelResolver) ListExposedForProjectWithEndpoints(ctx context.Context, projectID string) ([]ExposedEntry, error) {
+	names, err := r.ListExposedForProject(ctx, projectID)
+	if err != nil || len(names) == 0 {
+		return nil, err
+	}
+	cache, cerr := r.getCache(ctx)
+	if cerr != nil {
+		return nil, cerr
+	}
+	out := make([]ExposedEntry, 0, len(names))
+	for _, name := range names {
+		if vep, ok := cache.byName[name]; ok {
+			out = append(out, ExposedEntry{Name: name, VEP: vep})
+		}
+	}
+	return out, nil
+}
+
+// ExposedEntry pairs a resolved virtual model name with its VirtualEndpoint.
+type ExposedEntry struct {
+	Name string
+	VEP  *VirtualEndpoint
+}
+
+// SplitVirtID splits "virt:<providerID>:<providerModelID>" into three parts.
+// Returns nil when the format is unexpected.
+// Exported so the proxy handler can extract provider + model IDs for metadata lookups.
+func SplitVirtID(id string) []string {
+	return splitVirtID(id)
+}
+
+func splitVirtID(id string) []string {
+	if len(id) < 6 || id[:5] != "virt:" {
+		return nil
+	}
+	rest := id[5:] // "<providerID>:<providerModelID>"
+	idx := indexOf(rest, ':')
+	if idx < 0 {
+		return nil
+	}
+	return []string{"virt", rest[:idx], rest[idx+1:]}
+}
+
+func indexOf(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
 // Capabilities returns the capability list for a virtual model.
 // Returns (nil, false) if the model is not in the exposed catalog.
 func (r *VirtualModelResolver) Capabilities(ctx context.Context, modelName string) ([]runtime.Capability, bool) {
@@ -144,14 +239,22 @@ func (r *VirtualModelResolver) getCache(ctx context.Context) (*virtualCache, err
 }
 
 // buildCache queries providers + catalog + rules and produces the in-memory map.
+//
+// After migration 050 the authoritative filter is exposure_mode IN ('catalog','hybrid').
+// The legacy catalog_direct_expose boolean is kept in sync by a DB trigger so
+// existing installations that have not yet run migration 050 still work via the
+// fallback WHERE clause.
 func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, error) {
-	// Load all direct-expose providers.
+	// Load all catalog/hybrid-mode providers.
+	// We query on exposure_mode first; COALESCE keeps the fallback safe on
+	// pre-050 installations where the column does not exist yet.
 	type provRow struct {
 		ID                   string `db:"id"`
 		Name                 string `db:"name"`
 		BackendType          string `db:"backend_type"`
 		BaseURL              string `db:"base_url"`
 		APIKey               string `db:"api_key"`
+		ExposureMode         string `db:"exposure_mode"`
 		CatalogExposePrefix  string `db:"catalog_expose_prefix"`
 		ProxyURL             string `db:"proxy_url"`
 		TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
@@ -167,6 +270,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 	var providers []provRow
 	if err := r.db.SelectContext(ctx, &providers, `
 		SELECT id::text, name, backend_type, base_url, api_key,
+		       COALESCE(exposure_mode,'managed') AS exposure_mode,
 		       catalog_expose_prefix,
 		       COALESCE(proxy_url,'') AS proxy_url,
 		       tls_insecure_skip_verify,
@@ -262,6 +366,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				UpstreamAPIKey:    prov.APIKey,
 				UpstreamModelName: e.ProviderModelID,
 				Transport:         transport,
+				ExposureMode:      ExposureMode(prov.ExposureMode),
 				// Capability flags come directly from provider_remote_models.
 				// Never inferred from the model name string.
 				SupportsStreaming:  e.SupportsStreaming,

@@ -407,6 +407,15 @@ func main() {
 	a.GET("/projects/:id/quota", ppH2.GetQuotaStatus)
 	a.GET("/projects/:id/usage/daily", ppH2.GetDailyUsage)
 	a.GET("/projects/:id/usage/summary", ppH2.GetUsageSummary)
+	// Project provider access — catalog/hybrid mode authorization
+	// GET    /admin/v1/projects/:project_id/provider-access        — list grants
+	// POST   /admin/v1/projects/:project_id/provider-access        — create/update grant
+	// PUT    /admin/v1/projects/:project_id/provider-access/:provider_id — update prefix rules
+	// DELETE /admin/v1/projects/:project_id/provider-access/:provider_id — revoke grant
+	a.GET("/projects/:project_id/provider-access", catalogH.ListProjectProviderAccess)
+	a.POST("/projects/:project_id/provider-access", catalogH.GrantProjectProviderAccess)
+	a.PUT("/projects/:project_id/provider-access/:provider_id", catalogH.UpdateProjectProviderAccess)
+	a.DELETE("/projects/:project_id/provider-access/:provider_id", catalogH.RevokeProjectProviderAccess)
 
 	// ── Agent API (called by node agents, not human operators) ────────────────
 	// Registration does NOT require auth (bootstrapping)

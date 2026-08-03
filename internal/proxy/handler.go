@@ -660,6 +660,22 @@ func (h *Handler) Embeddings(c *gin.Context) {
 }
 
 // Models handles GET /v1/models
+//
+// Response combines two sources depending on the caller's context:
+//
+//  1. Public Models (Managed / Hybrid)
+//     Every model from claims.Permissions that is currently routable in the
+//     registry. This is the unchanged, existing behaviour.
+//
+//  2. Virtual catalog models (Catalog / Hybrid)
+//     When the caller has a project context (ProjectID ≠ ""), models from
+//     providers in catalog/hybrid mode that the project has been granted
+//     access to via project_provider_access are appended.
+//     These are deduplicated — if a virtual name also exists as a Public Model
+//     it is not listed twice.
+//
+// Managed mode providers only ever appear via path 1.
+// catalog/hybrid providers appear via path 2 (and path 1 if also registered).
 func (h *Handler) Models(c *gin.Context) {
 	claims := middleware.GetClaims(c)
 	if claims == nil {
@@ -688,28 +704,15 @@ func (h *Handler) Models(c *gin.Context) {
 	}
 	fallbackCreated := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 
-	// Unified model list: iterate permissions once.
-	// All callable models — local and remote — are in claims.Permissions.
-	// claims.Permissions is loaded from team_model_permissions JOIN models,
-	// which covers every backend type. No separate virtual model path.
-	//
-	// The registry check (registered[modelName]) filters out models the team
-	// has permission for but whose endpoint is not yet routable (e.g. loading,
-	// disabled, or pending registry reload). This is the correct behavior —
-	// we only advertise models that can actually serve requests right now.
-	//
-	// For Mode-A remote models (RegisterCatalogAlias, RegisterExternalModel),
-	// the registry is populated immediately after creation, so they appear here
-	// on the next registry reload (≤10s). modelCreatedAt is loaded from the DB
-	// to ensure a stable `created` timestamp across calls.
+	// ── Path 1: Public Models (Managed / Hybrid) ──────────────────────────
+	// All callable models in claims.Permissions — local and remote Public
+	// Models — filtered to those currently routable in the registry.
+	seen := make(map[string]bool)
 	var data []models.ModelObject
 	for _, modelName := range claims.Permissions {
 		created, ok := modelCreatedAt[modelName]
 		if !ok {
-			// Model is granted but not in the DB-loaded timestamp map.
-			// Could be a race between grant and DB query — use fallback.
 			if !registered[modelName] {
-				// Not in registry either — skip: not routable yet.
 				continue
 			}
 			created = fallbackCreated
@@ -717,6 +720,113 @@ func (h *Handler) Models(c *gin.Context) {
 		data = append(data, models.ModelObject{
 			ID: modelName, Object: "model", Created: created, OwnedBy: "nexusllm",
 		})
+		seen[modelName] = true
+	}
+
+	// ── Path 2: Virtual catalog models (Catalog / Hybrid) ─────────────────
+	// Only available to project-scoped callers — virtual models require a
+	// project context for rate limiting and provider ACL enforcement.
+	if claims.ProjectID != "" && h.virtualResolver != nil {
+		entries, err := h.virtualResolver.ListExposedForProjectWithEndpoints(c.Request.Context(), claims.ProjectID)
+		if err != nil {
+			h.log.Warn("models: virtual resolver list error", zap.Error(err))
+		}
+
+		// Bulk-fetch catalog metadata for all virtual models in one query.
+		// The result enriches ModelObject with name, description, context_length,
+		// pricing, architecture and supported_parameters — the same fields
+		// OpenRouter returns on its /api/v1/models endpoint.
+		type metaRow struct {
+			ProviderID          string   `db:"provider_id"`
+			ProviderModelID     string   `db:"provider_model_id"`
+			DisplayName         string   `db:"display_name"`
+			Description         string   `db:"description"`
+			ContextLength       *int     `db:"context_length"`
+			MaxOutputTokens     *int     `db:"max_output_tokens"`
+			InputCostPer1M      *float64 `db:"input_cost_per_1m"`
+			OutputCostPer1M     *float64 `db:"output_cost_per_1m"`
+			ProviderInputCost   *float64 `db:"provider_input_cost"`
+			ProviderOutputCost  *float64 `db:"provider_output_cost"`
+			SupportsStreaming    bool     `db:"supports_streaming"`
+			SupportsTools       bool     `db:"supports_tools"`
+			SupportsVision      bool     `db:"supports_vision"`
+			SupportsAudio       bool     `db:"supports_audio"`
+			SupportsEmbedding   bool     `db:"supports_embeddings"`
+			SupportsReasoning   bool     `db:"supports_reasoning"`
+			SupportsJsonMode    bool     `db:"supports_json_mode"`
+			ServiceType         string   `db:"service_type"`
+			MetadataRaw         string   `db:"metadata_raw"`
+		}
+		var metaRows []metaRow
+		if h.db != nil && len(entries) > 0 {
+			_ = h.db.SelectContext(c.Request.Context(), &metaRows, `
+				SELECT provider_id::text, provider_model_id,
+				       COALESCE(display_name,'')         AS display_name,
+				       COALESCE(description,'')          AS description,
+				       context_length,
+				       max_output_tokens,
+				       input_cost_per_1m,
+				       output_cost_per_1m,
+				       provider_input_cost,
+				       provider_output_cost,
+				       supports_streaming, supports_tools,
+				       supports_vision, supports_audio,
+				       supports_embeddings, supports_reasoning,
+				       COALESCE(supports_json_mode, FALSE) AS supports_json_mode,
+				       COALESCE(service_type,'chat')      AS service_type,
+				       COALESCE(metadata::text,'{}')      AS metadata_raw
+				FROM provider_remote_models
+				WHERE enabled = TRUE`)
+		}
+		// Index: (providerID, providerModelID) → metaRow.
+		type metaKey struct{ p, m string }
+		metaByKey := make(map[metaKey]*metaRow, len(metaRows))
+		for i := range metaRows {
+			metaByKey[metaKey{metaRows[i].ProviderID, metaRows[i].ProviderModelID}] = &metaRows[i]
+		}
+
+		for _, e := range entries {
+			if seen[e.Name] {
+				continue
+			}
+			obj := models.ModelObject{
+				ID:      e.Name,
+				Object:  "model",
+				Created: fallbackCreated,
+				OwnedBy: "nexusllm",
+			}
+			// Enrich with catalog metadata if available.
+			parts := catalog.SplitVirtID(e.VEP.ID)
+			if len(parts) == 3 {
+				if row := metaByKey[metaKey{parts[1], parts[2]}]; row != nil {
+					if row.DisplayName != "" {
+						obj.Name = row.DisplayName
+					}
+					if row.Description != "" {
+						obj.Description = row.Description
+					}
+					obj.ContextLength = row.ContextLength
+					// Build architecture block from capability flags.
+					arch := buildModelArchitecture(row.SupportsVision, row.SupportsAudio, row.ServiceType)
+					obj.Architecture = arch
+					// Build pricing block — prefer provider_* cost columns if set,
+					// fall back to input_cost_per_1m / output_cost_per_1m.
+					obj.Pricing = buildModelPricing(
+						row.ProviderInputCost, row.ProviderOutputCost,
+						row.InputCostPer1M, row.OutputCostPer1M,
+					)
+					// Build top_provider block.
+					obj.TopProvider = buildTopProvider(row.ContextLength, row.MaxOutputTokens)
+					// Build supported_parameters from capability flags.
+					obj.SupportedParameters = buildSupportedParameters(
+						row.SupportsStreaming, row.SupportsTools,
+						row.SupportsJsonMode, row.SupportsReasoning,
+					)
+				}
+			}
+			data = append(data, obj)
+			seen[e.Name] = true
+		}
 	}
 
 	c.JSON(http.StatusOK, models.ModelListResponse{Object: "list", Data: data})
@@ -774,6 +884,10 @@ func (h *Handler) LegacyCompletions(c *gin.Context) {
 // Cline, Continue, and Kilo Code all call this endpoint to verify a model
 // exists before submitting a request. Without it they receive 404 and fall
 // back to disabled mode or show a configuration error.
+//
+// Resolution order:
+//  1. Public Models in registry + claims.Permissions (existing behaviour).
+//  2. Virtual catalog models accessible to the caller's project (new).
 func (h *Handler) ModelByID(c *gin.Context) {
 	claims := middleware.GetClaims(c)
 	if claims == nil {
@@ -782,7 +896,7 @@ func (h *Handler) ModelByID(c *gin.Context) {
 	}
 	modelID := c.Param("model_id")
 
-	// Check the model is registered and the caller has permission.
+	// ── Path 1: Public Model ───────────────────────────────────────────────
 	registered := make(map[string]bool)
 	for _, name := range h.registry.ListModels() {
 		registered[name] = true
@@ -794,31 +908,51 @@ func (h *Handler) ModelByID(c *gin.Context) {
 			break
 		}
 	}
-	if !allowed || !registered[modelID] {
-		c.JSON(http.StatusNotFound, models.ErrorResponse{
-			Error: models.ErrorDetail{
-				Message: "The model '" + modelID + "' does not exist",
-				Type:    "invalid_request_error",
-				Code:    "model_not_found",
-			},
+	if allowed && registered[modelID] {
+		var createdAt int64
+		if h.db != nil {
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM models WHERE name=$1 AND enabled=TRUE`,
+				modelID,
+			).Scan(&createdAt)
+		}
+		if createdAt == 0 {
+			createdAt = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+		}
+		c.JSON(http.StatusOK, models.ModelObject{
+			ID: modelID, Object: "model", Created: createdAt, OwnedBy: "nexusllm",
 		})
 		return
 	}
 
-	// Look up stable created_at from DB.
-	var createdAt int64
-	if h.db != nil {
-		_ = h.db.QueryRowContext(c.Request.Context(),
-			`SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM models WHERE name=$1 AND enabled=TRUE`,
-			modelID,
-		).Scan(&createdAt)
-	}
-	if createdAt == 0 {
-		createdAt = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	// ── Path 2: Virtual catalog model ─────────────────────────────────────
+	// Only available for project-scoped callers.
+	if claims.ProjectID != "" && h.virtualResolver != nil {
+		vep, verr := h.virtualResolver.Resolve(c.Request.Context(), modelID)
+		if verr == nil && vep != nil {
+			// Verify the project has provider access before confirming the model.
+			store := catalog.NewProjectProviderAccessStore(h.db)
+			grants, _ := store.ListForProject(c.Request.Context(), claims.ProjectID)
+			for _, g := range grants {
+				if g.IsAllowed(modelID) {
+					c.JSON(http.StatusOK, models.ModelObject{
+						ID:      modelID,
+						Object:  "model",
+						Created: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+						OwnedBy: "nexusllm",
+					})
+					return
+				}
+			}
+		}
 	}
 
-	c.JSON(http.StatusOK, models.ModelObject{
-		ID: modelID, Object: "model", Created: createdAt, OwnedBy: "nexusllm",
+	c.JSON(http.StatusNotFound, models.ErrorResponse{
+		Error: models.ErrorDetail{
+			Message: "The model '" + modelID + "' does not exist",
+			Type:    "invalid_request_error",
+			Code:    "model_not_found",
+		},
 	})
 }
 
@@ -1338,3 +1472,104 @@ func abortErr(c *gin.Context, status int, code, msg string) {
 // keep compiler happy — transitively used
 var _ = bytes.NewReader
 var _ = bufio.NewReader
+
+// ── Catalog model response helpers ───────────────────────────────────────────
+// These convert provider_remote_models capability flags into the rich
+// ModelObject fields that match OpenRouter's /v1/models response shape.
+
+func buildModelArchitecture(supportsVision, supportsAudio bool, serviceType string) *models.ModelArchitecture {
+	arch := &models.ModelArchitecture{
+		Tokenizer: "Router",
+	}
+	inputs := []string{"text"}
+	if supportsVision {
+		inputs = append(inputs, "image")
+	}
+	if supportsAudio {
+		inputs = append(inputs, "audio")
+	}
+	outputs := []string{"text"}
+	switch serviceType {
+	case "image", "image_generation":
+		outputs = []string{"image"}
+		arch.Modality = "text->image"
+	case "speech", "tts":
+		outputs = []string{"audio"}
+		arch.Modality = "text->audio"
+	case "embedding":
+		outputs = []string{"embedding"}
+		arch.Modality = "text->embedding"
+	default:
+		if supportsVision {
+			arch.Modality = "text+image->text"
+		} else {
+			arch.Modality = "text->text"
+		}
+	}
+	arch.InputModalities = inputs
+	arch.OutputModalities = outputs
+	return arch
+}
+
+func buildModelPricing(provIn, provOut, legacyIn, legacyOut *float64) *models.ModelPricing {
+	p := &models.ModelPricing{}
+	set := false
+	// Prefer provider_input_cost / provider_output_cost (migration 050 columns);
+	// fall back to input_cost_per_1m / output_cost_per_1m (pre-050).
+	in := provIn
+	if in == nil {
+		in = legacyIn
+	}
+	out := provOut
+	if out == nil {
+		out = legacyOut
+	}
+	if in != nil {
+		// Convert per-1M tokens → per-token (OpenRouter format).
+		p.Prompt = formatCostPerToken(*in)
+		set = true
+	}
+	if out != nil {
+		p.Completion = formatCostPerToken(*out)
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return p
+}
+
+// formatCostPerToken converts a per-1M-token price to a decimal string
+// matching OpenRouter's format (e.g. 0.000001 per token from $1/1M).
+func formatCostPerToken(perMillion float64) string {
+	perToken := perMillion / 1_000_000
+	return fmt.Sprintf("%g", perToken)
+}
+
+func buildTopProvider(contextLen, maxOutput *int) *models.ModelTopProvider {
+	if contextLen == nil && maxOutput == nil {
+		return nil
+	}
+	return &models.ModelTopProvider{
+		ContextLength:       contextLen,
+		MaxCompletionTokens: maxOutput,
+		IsModerated:         false,
+	}
+}
+
+func buildSupportedParameters(streaming, tools, jsonMode, reasoning bool) []string {
+	params := []string{"temperature", "top_p", "max_tokens"}
+	if streaming {
+		params = append(params, "stream")
+	}
+	if tools {
+		params = append(params, "tools", "tool_choice")
+	}
+	if jsonMode {
+		params = append(params, "response_format")
+	}
+	if reasoning {
+		params = append(params, "reasoning")
+	}
+	return params
+}

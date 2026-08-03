@@ -60,6 +60,7 @@ func (h *CatalogHandler) ListProviders(c *gin.Context) {
 		BackendType         string     `json:"backend_type"`
 		BaseURL             string     `json:"base_url"`
 		APIKeySet           bool       `json:"api_key_set"`
+		ExposureMode        string     `json:"exposure_mode"`
 		CatalogSyncEnabled  bool       `json:"catalog_sync_enabled"`
 		CatalogSyncInterval int        `json:"catalog_sync_interval"`
 		CatalogDirectExpose bool       `json:"catalog_direct_expose"`
@@ -77,10 +78,15 @@ func (h *CatalogHandler) ListProviders(c *gin.Context) {
 	}
 	out := make([]safeProvider, len(providers))
 	for i, p := range providers {
+		em := string(p.ExposureMode)
+		if em == "" {
+			em = "managed"
+		}
 		out[i] = safeProvider{
 			ID: p.ID, Name: p.Name, DisplayName: p.DisplayName,
 			BackendType: p.BackendType, BaseURL: p.BaseURL,
 			APIKeySet:           p.APIKey != "",
+			ExposureMode:        em,
 			CatalogSyncEnabled:  p.CatalogSyncEnabled,
 			CatalogSyncInterval: p.CatalogSyncInterval,
 			CatalogDirectExpose: p.CatalogDirectExpose,
@@ -121,6 +127,7 @@ func (h *CatalogHandler) CreateProvider(c *gin.Context) {
 		BaseURL             string `json:"base_url"     binding:"required"`
 		APIKey              string `json:"api_key"`
 		APIKeyHeader        string `json:"api_key_header"`
+		ExposureMode        string `json:"exposure_mode"`
 		CatalogSyncEnabled  bool   `json:"catalog_sync_enabled"`
 		CatalogSyncInterval int    `json:"catalog_sync_interval"`
 		CatalogDirectExpose bool   `json:"catalog_direct_expose"`
@@ -151,23 +158,36 @@ func (h *CatalogHandler) CreateProvider(c *gin.Context) {
 	if in.MaxRetries <= 0 {
 		in.MaxRetries = 2
 	}
+	// Validate and default exposure_mode.
+	switch in.ExposureMode {
+	case "managed", "catalog", "hybrid":
+		// valid
+	case "":
+		in.ExposureMode = "managed"
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exposure_mode must be one of: managed, catalog, hybrid"})
+		return
+	}
 	id := uuid.New().String()
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO providers
 		  (id, name, display_name, backend_type, base_url, api_key, api_key_header,
+		   exposure_mode,
 		   catalog_sync_enabled, catalog_sync_interval, catalog_direct_expose,
 		   catalog_expose_prefix, proxy_url, request_timeout_seconds, max_retries)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULLIF($12,''),$13,$14)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13,''),$14,$15)`,
 		id, in.Name, in.DisplayName, in.BackendType, in.BaseURL,
 		in.APIKey, in.APIKeyHeader,
-		in.CatalogSyncEnabled, in.CatalogSyncInterval, in.CatalogDirectExpose,
+		in.ExposureMode,
+		in.CatalogSyncEnabled, in.CatalogSyncInterval,
+		in.ExposureMode == "catalog" || in.ExposureMode == "hybrid",
 		in.CatalogExposePrefix, in.ProxyURL, in.RequestTimeoutSec, in.MaxRetries,
 	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "provider name already exists or DB error: " + err.Error()})
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"id": id, "name": in.Name, "status": "created"})
+	c.JSON(http.StatusCreated, gin.H{"id": id, "name": in.Name, "exposure_mode": in.ExposureMode, "status": "created"})
 }
 
 // UpdateProvider handles PUT /admin/v1/providers/:id
@@ -177,6 +197,7 @@ func (h *CatalogHandler) UpdateProvider(c *gin.Context) {
 		DisplayName         *string `json:"display_name"`
 		BaseURL             *string `json:"base_url"`
 		APIKey              *string `json:"api_key"`
+		ExposureMode        *string `json:"exposure_mode"`
 		CatalogSyncEnabled  *bool   `json:"catalog_sync_enabled"`
 		CatalogSyncInterval *int    `json:"catalog_sync_interval"`
 		CatalogDirectExpose *bool   `json:"catalog_direct_expose"`
@@ -203,6 +224,22 @@ func (h *CatalogHandler) UpdateProvider(c *gin.Context) {
 	}
 	if in.APIKey != nil {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET api_key=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.APIKey)
+	}
+	if in.ExposureMode != nil {
+		switch *in.ExposureMode {
+		case "managed", "catalog", "hybrid":
+			// valid — the DB trigger will update catalog_direct_expose automatically.
+			if err := h.store.UpdateExposureMode(ctx, id, catalog.ExposureMode(*in.ExposureMode)); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update exposure_mode: " + err.Error()})
+				return
+			}
+			if h.resolver != nil {
+				h.resolver.Invalidate()
+			}
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "exposure_mode must be one of: managed, catalog, hybrid"})
+			return
+		}
 	}
 	if in.CatalogSyncEnabled != nil {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET catalog_sync_enabled=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.CatalogSyncEnabled)
@@ -921,5 +958,150 @@ func (h *CatalogHandler) BulkRegisterFromCatalog(c *gin.Context) {
 		"results": results,
 		"note": "Registered models are now first-class Public Models. " +
 			"Grant team access via POST /admin/v1/teams/:id/models.",
+	})
+}
+
+// ── Project Provider Access (Catalog / Hybrid mode) ──────────────────────────
+//
+// These endpoints manage the project_provider_access table, which controls
+// which projects may call virtual (catalog/hybrid) models from a provider.
+// They are orthogonal to team_model_permissions — the latter covers Public
+// Models (managed mode), while these cover the dynamic catalog path.
+
+// ListProjectProviderAccess handles GET /admin/v1/projects/:project_id/provider-access
+func (h *CatalogHandler) ListProjectProviderAccess(c *gin.Context) {
+	projectID := c.Param("project_id")
+	store := catalog.NewProjectProviderAccessStore(h.db)
+	grants, err := store.ListForProject(c.Request.Context(), projectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": grants, "total": len(grants), "project_id": projectID})
+}
+
+// GrantProjectProviderAccess handles POST /admin/v1/projects/:project_id/provider-access
+//
+// Grants a project access to a provider's virtual catalog models.
+// Request body:
+//
+//	{
+//	  "provider_id":      "uuid",
+//	  "allowed_prefixes": ["openrouter/openai/*"],   // optional; empty = allow all
+//	  "denied_prefixes":  ["openrouter/openai/gpt-4-*"] // optional
+//	}
+func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
+	projectID := c.Param("project_id")
+	var in struct {
+		ProviderID      string   `json:"provider_id" binding:"required"`
+		AllowedPrefixes []string `json:"allowed_prefixes"`
+		DeniedPrefixes  []string `json:"denied_prefixes"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify the provider exists and is in catalog/hybrid mode.
+	p, err := h.store.Get(c.Request.Context(), in.ProviderID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found: " + in.ProviderID})
+		return
+	}
+	if !p.ExposureMode.IsVirtual() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "provider '" + p.Name + "' is in managed mode — " +
+				"set exposure_mode to 'catalog' or 'hybrid' before granting project access",
+		})
+		return
+	}
+
+	// Upsert the access grant.
+	allowArr := pq.Array(in.AllowedPrefixes)
+	denyArr := pq.Array(in.DeniedPrefixes)
+	grantID := uuid.New().String()
+	_, err = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO project_provider_access
+		  (id, project_id, provider_id, allowed_prefixes, denied_prefixes)
+		VALUES ($1, $2::uuid, $3::uuid, $4, $5)
+		ON CONFLICT (project_id, provider_id) DO UPDATE
+		SET allowed_prefixes = EXCLUDED.allowed_prefixes,
+		    denied_prefixes  = EXCLUDED.denied_prefixes,
+		    enabled          = TRUE,
+		    updated_at       = NOW()`,
+		grantID, projectID, p.ID, allowArr, denyArr,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":               grantID,
+		"project_id":       projectID,
+		"provider_id":      p.ID,
+		"provider_name":    p.Name,
+		"exposure_mode":    string(p.ExposureMode),
+		"allowed_prefixes": in.AllowedPrefixes,
+		"denied_prefixes":  in.DeniedPrefixes,
+		"note": "Project can now call virtual models from this provider. " +
+			"Redis ACL will be refreshed on the next gateway reload cycle (≤60s) " +
+			"or by calling POST /admin/v1/seed-permissions.",
+	})
+}
+
+// UpdateProjectProviderAccess handles PUT /admin/v1/projects/:project_id/provider-access/:provider_id
+//
+// Updates the prefix filters on an existing grant.
+func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
+	projectID := c.Param("project_id")
+	providerID := c.Param("provider_id")
+	var in struct {
+		AllowedPrefixes []string `json:"allowed_prefixes"`
+		DeniedPrefixes  []string `json:"denied_prefixes"`
+		Enabled         *bool    `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	if in.AllowedPrefixes != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE project_provider_access SET allowed_prefixes=$3, updated_at=NOW()
+			 WHERE project_id::text=$1 AND provider_id::text=$2`,
+			projectID, providerID, pq.Array(in.AllowedPrefixes))
+	}
+	if in.DeniedPrefixes != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE project_provider_access SET denied_prefixes=$3, updated_at=NOW()
+			 WHERE project_id::text=$1 AND provider_id::text=$2`,
+			projectID, providerID, pq.Array(in.DeniedPrefixes))
+	}
+	if in.Enabled != nil {
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE project_provider_access SET enabled=$3, updated_at=NOW()
+			 WHERE project_id::text=$1 AND provider_id::text=$2`,
+			projectID, providerID, *in.Enabled)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "provider access updated",
+		"project_id": projectID,
+		"provider_id": providerID,
+	})
+}
+
+// RevokeProjectProviderAccess handles DELETE /admin/v1/projects/:project_id/provider-access/:provider_id
+func (h *CatalogHandler) RevokeProjectProviderAccess(c *gin.Context) {
+	projectID := c.Param("project_id")
+	providerID := c.Param("provider_id")
+	_, _ = h.db.ExecContext(c.Request.Context(),
+		`UPDATE project_provider_access SET enabled=FALSE, updated_at=NOW()
+		 WHERE project_id::text=$1 AND provider_id::text=$2`,
+		projectID, providerID)
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "provider access revoked",
+		"project_id": projectID,
+		"provider_id": providerID,
 	})
 }

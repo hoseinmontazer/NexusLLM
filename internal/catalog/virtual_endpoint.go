@@ -19,6 +19,11 @@ type VirtualEndpoint struct {
 	UpstreamModelName string
 	Transport         runtime.ProviderTransportConfig
 
+	// ExposureMode from the parent provider (catalog or hybrid).
+	// Used by GET /v1/models and ModelByID to decide which callers may see
+	// this endpoint (project_provider_access check vs team_model_permissions).
+	ExposureMode ExposureMode
+
 	// Capability flags — loaded directly from provider_remote_models.supports_*
 	// columns at cache-build time. These are the sole source of truth for
 	// capability validation of virtual (Mode-B) models. They are NEVER inferred

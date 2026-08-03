@@ -155,6 +155,7 @@ func main() {
 
 	seedModelPermissions(ctx, db, policyEngine, log)
 	seedProjectPolicies(ctx, db, policyEngine, log)
+	seedProjectProviderAccess(ctx, db, policyEngine, log)
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
 	catalogResolver := catalog.NewVirtualModelResolver(db, log)
@@ -180,6 +181,7 @@ func main() {
 				fresh := loadTeamPolicies(watchCtx, db, log)
 				seedModelPermissions(watchCtx, db, policyEngine, log)
 				seedProjectPolicies(watchCtx, db, policyEngine, log)
+				seedProjectProviderAccess(watchCtx, db, policyEngine, log)
 				proxyHandler.SwapTeamPolicies(fresh)
 			}
 		}
@@ -342,4 +344,59 @@ func seedProjectPolicies(ctx context.Context, db *sqlx.DB, engine *policy.Engine
 		})
 	}
 	log.Info("project policies seeded", zap.Int("count", len(rows)))
+}
+
+// seedProjectProviderAccess loads all project_provider_access rows for
+// catalog/hybrid providers and pushes them into the Redis vproviders hash
+// for each project. Called at startup and on the 60s reload cycle.
+//
+// This is the bridge between the DB-authoritative grant table and the
+// Redis-backed hot-path ACL check in policy.Engine.Evaluate().
+func seedProjectProviderAccess(ctx context.Context, db *sqlx.DB, engine *policy.Engine, log *zap.Logger) {
+	store := catalog.NewProjectProviderAccessStore(db)
+	grants, err := store.ListAll(ctx)
+	if err != nil {
+		log.Warn("could not seed project provider access (table may not exist yet)", zap.Error(err))
+		return
+	}
+	// We also need the expose_prefix for each provider so the Redis entry
+	// carries the correct prefix string for the fast-path prefix check.
+	// Load a name→prefix map from providers.
+	type provRow struct {
+		ID                  string `db:"id"`
+		Name                string `db:"name"`
+		CatalogExposePrefix string `db:"catalog_expose_prefix"`
+	}
+	var provRows []provRow
+	_ = db.SelectContext(ctx, &provRows,
+		`SELECT id::text, name, catalog_expose_prefix FROM providers
+		 WHERE enabled=TRUE AND exposure_mode IN ('catalog','hybrid')`)
+	prefixByID := make(map[string]string, len(provRows))
+	for _, r := range provRows {
+		prefix := r.CatalogExposePrefix
+		if prefix == "" {
+			prefix = r.Name
+		}
+		prefixByID[r.ID] = prefix
+	}
+
+	for _, g := range grants {
+		prefix := prefixByID[g.ProviderID]
+		if prefix == "" {
+			prefix = g.ProviderName
+		}
+		entry := policy.ProviderAccessEntry{
+			ProviderPrefix:  prefix,
+			AllowedPatterns: g.AllowedPrefixes,
+			DeniedPatterns:  g.DeniedPrefixes,
+		}
+		if err := engine.SetProjectProviderAccess(ctx, g.ProjectID, g.ProviderID, entry); err != nil {
+			log.Warn("failed to seed project provider access",
+				zap.String("project_id", g.ProjectID),
+				zap.String("provider_id", g.ProviderID),
+				zap.Error(err),
+			)
+		}
+	}
+	log.Info("project provider access seeded", zap.Int("count", len(grants)))
 }

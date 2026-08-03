@@ -11,6 +11,7 @@
 //	    • Daily / monthly token budgets
 //	    • Queue priority weight
 //	    • Allowed model ACL (per-project)
+//	    • Allowed provider ACL (per-project, catalog/hybrid mode)
 //	  The scheduler, rate limiter, queue manager, and autoscaler all operate
 //	  exclusively on Project Policy.
 //
@@ -27,7 +28,7 @@
 //
 // Request flow (project-scoped key or X-Nexus-Project header):
 //
-//  1. Model ACL check (project or team)
+//  1. Model ACL check (project or team) OR provider ACL (catalog/hybrid)
 //  2. Project policy evaluation (RPM, TPM, daily budget, concurrency)
 //  3. Org governance check (org disabled, org budget, GPU pool)
 //
@@ -40,8 +41,11 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -68,6 +72,13 @@ const (
 	quotaPrefix      = "nexus:quota:"     // nexus:quota:<teamID>:daily:<date> (legacy)
 	ratelimitPrefix  = "nexus:ratelimit:" // nexus:ratelimit:<teamID>:rpm (legacy)
 	inflightPrefix   = "nexus:inflight:"  // nexus:inflight:<teamID> (legacy)
+
+	// Project-provider ACL keys (catalog / hybrid exposure mode).
+	// nexus:project:<projectID>:vproviders  → Redis Hash
+	//   field = "<providerID>"
+	//   value = JSON-encoded providerAccessEntry
+	// One HGETALL per project retrieves all grant data for prefix evaluation.
+	vproviderPrefix = "nexus:project:" // nexus:project:<id>:vproviders (hash)
 )
 
 // ─── Decision ────────────────────────────────────────────────────────────────
@@ -136,6 +147,109 @@ func NewEngine(rdb *redis.Client) *Engine {
 	return &Engine{rdb: rdb}
 }
 
+// ─── Provider ACL (catalog / hybrid mode) ────────────────────────────────────
+
+// providerAccessEntry is the value stored per field in the
+// nexus:project:<id>:vproviders Redis hash.
+// Field key  = providerID (UUID string)
+// Field value = JSON-encoded providerAccessEntry
+type providerAccessEntry struct {
+	// ProviderPrefix is the catalog_expose_prefix used to build virtual model
+	// names: "<ProviderPrefix>/<provider_model_id>". Used for fast prefix
+	// matching before evaluating allow/deny patterns.
+	ProviderPrefix  string   `json:"prefix"`
+	AllowedPatterns []string `json:"allowed"` // empty = allow all
+	DeniedPatterns  []string `json:"denied"`  // empty = deny none
+}
+
+// isAllowed reports whether virtualModelName passes the entry's prefix rules.
+func (e *providerAccessEntry) isAllowed(virtualModelName string) bool {
+	// Fast pre-check: the model name must start with this provider's prefix.
+	// This avoids pattern evaluation for every provider in the hash when the
+	// model clearly belongs to a different provider.
+	if e.ProviderPrefix != "" && !strings.HasPrefix(virtualModelName, e.ProviderPrefix+"/") {
+		return false
+	}
+	// Deny wins.
+	for _, pat := range e.DeniedPatterns {
+		if globMatch(pat, virtualModelName) {
+			return false
+		}
+	}
+	// Empty allow list = allow all (subject to deny above).
+	if len(e.AllowedPatterns) == 0 {
+		return true
+	}
+	for _, pat := range e.AllowedPatterns {
+		if globMatch(pat, virtualModelName) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch is the same glob helper used in catalog/rules.go.
+// Duplicated here to avoid an import cycle (policy → catalog would be circular).
+func globMatch(pattern, name string) bool {
+	if pattern == "" {
+		return false
+	}
+	matched, _ := path.Match(pattern, name)
+	return matched
+}
+
+// isVirtualModelAllowedForProject checks whether a project's provider ACL
+// (from the nexus:project:<id>:vproviders Redis hash) permits calling
+// virtualModelName.  Returns false when no grant covers the model.
+func (e *Engine) isVirtualModelAllowedForProject(ctx context.Context, projectID, virtualModelName string) bool {
+	key := vproviderPrefix + projectID + ":vproviders"
+	fields, err := e.rdb.HGetAll(ctx, key).Result()
+	if err != nil || len(fields) == 0 {
+		return false
+	}
+	for _, raw := range fields {
+		var entry providerAccessEntry
+		if json.Unmarshal([]byte(raw), &entry) != nil {
+			continue
+		}
+		if entry.isAllowed(virtualModelName) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetProjectProviderAccess stores a single provider grant into the project's
+// vproviders Redis hash.  Called by the gateway's startup seed and 60s reload.
+func (e *Engine) SetProjectProviderAccess(ctx context.Context, projectID, providerID string, entry providerAccessEntry) error {
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	key := vproviderPrefix + projectID + ":vproviders"
+	pipe := e.rdb.Pipeline()
+	pipe.HSet(ctx, key, providerID, raw)
+	pipe.Expire(ctx, key, 48*time.Hour)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// RemoveProjectProviderAccess removes a single provider grant from a project's
+// vproviders hash.  Called when an access row is deleted.
+func (e *Engine) RemoveProjectProviderAccess(ctx context.Context, projectID, providerID string) error {
+	key := vproviderPrefix + projectID + ":vproviders"
+	return e.rdb.HDel(ctx, key, providerID).Err()
+}
+
+// ClearProjectProviderAccess deletes the entire vproviders hash for a project.
+// Used when a project is deleted or all grants are revoked.
+func (e *Engine) ClearProjectProviderAccess(ctx context.Context, projectID string) error {
+	return e.rdb.Del(ctx, vproviderPrefix+projectID+":vproviders").Err()
+}
+
+// ProviderAccessEntry is the exported type used by the gateway seed function.
+type ProviderAccessEntry = providerAccessEntry
+
 // ─── Evaluate ────────────────────────────────────────────────────────────────
 
 // Evaluate runs the two-layer policy check for an inference request.
@@ -159,11 +273,19 @@ func (e *Engine) Evaluate(
 ) PolicyDecision {
 
 	// ── Step 0: Model ACL ────────────────────────────────────────────────────
-	// Organization is the root for model permissions.
-	// The canonical ACL set is nexus:org:<OrgID>:models.
-	// For legacy team-only keys (OrgID resolved via team), we also accept
-	// the team-level set (nexus:team:<TeamID>:models) as a fallback so that
-	// existing integrations continue to work before migration 031 is run.
+	// Two parallel authorization paths:
+	//
+	// A. Public Model (managed / hybrid): model must be in the org's allowed-models
+	//    set (nexus:org:<OrgID>:models) or the legacy team set. This covers every
+	//    model registered via team_model_permissions, regardless of backend type.
+	//
+	// B. Virtual catalog model (catalog / hybrid): model is NOT registered as a
+	//    Public Model, but the project has been granted access to its provider via
+	//    project_provider_access. The check reads the project's vproviders hash
+	//    and evaluates the prefix allow/deny rules.
+	//
+	// Either path passing is sufficient — OR semantics.
+	// For the legacy team-only path (no ProjectID), only path A applies.
 	modelAllowed := false
 	if req.OrgID != "" {
 		ok, _ := e.rdb.SIsMember(ctx, orgPrefix+req.OrgID+":models", req.Model).Result()
@@ -173,6 +295,12 @@ func (e *Engine) Evaluate(
 		// Legacy fallback — team-level ACL set (pre-031 schema)
 		ok, _ := e.rdb.SIsMember(ctx, teamModelsPrefix+req.TeamID+":models", req.Model).Result()
 		modelAllowed = ok
+	}
+	// Path B: project-level provider ACL (catalog / hybrid virtual models).
+	// Only checked when a project is in scope — virtual models have no meaning
+	// for legacy team-only keys.
+	if !modelAllowed && req.ProjectID != "" {
+		modelAllowed = e.isVirtualModelAllowedForProject(ctx, req.ProjectID, req.Model)
 	}
 	if !modelAllowed {
 		return PolicyDecision{Allowed: false, RejectReason: "model_not_allowed"}

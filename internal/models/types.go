@@ -318,11 +318,55 @@ type ModelListResponse struct {
 }
 
 // ModelObject describes a single model.
+// The base fields (id, object, created, owned_by) match the OpenAI spec and
+// are always present. The extended fields are populated for catalog/virtual
+// models (Catalog and Hybrid exposure modes) and are omitted for local models
+// and legacy Public Models so the response stays backward-compatible.
 type ModelObject struct {
+	// OpenAI base fields
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+
+	// Extended fields — populated for provider catalog models.
+	// nil/zero → omitted from JSON (omitempty).
+	Name        string               `json:"name,omitempty"`
+	Description string               `json:"description,omitempty"`
+	ContextLength *int               `json:"context_length,omitempty"`
+	Architecture  *ModelArchitecture `json:"architecture,omitempty"`
+	Pricing       *ModelPricing      `json:"pricing,omitempty"`
+	TopProvider   *ModelTopProvider  `json:"top_provider,omitempty"`
+	// SupportedParameters lists inference parameters the model accepts.
+	// Mirrors OpenRouter's field of the same name.
+	SupportedParameters []string `json:"supported_parameters,omitempty"`
+}
+
+// ModelArchitecture describes the input/output modalities of a model.
+type ModelArchitecture struct {
+	Modality         string   `json:"modality"`
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+	Tokenizer        string   `json:"tokenizer,omitempty"`
+	InstructType     *string  `json:"instruct_type,omitempty"`
+}
+
+// ModelPricing holds per-token cost information.
+// Values are strings in scientific notation (e.g. "0.000001") to match
+// OpenRouter's response format exactly.
+type ModelPricing struct {
+	Prompt           string `json:"prompt,omitempty"`
+	Completion       string `json:"completion,omitempty"`
+	InputCacheRead   string `json:"input_cache_read,omitempty"`
+	InputCacheWrite  string `json:"input_cache_write,omitempty"`
+	Image            string `json:"image,omitempty"`
+}
+
+// ModelTopProvider holds provider-level limits reported alongside the model.
+type ModelTopProvider struct {
+	ContextLength       *int  `json:"context_length,omitempty"`
+	MaxCompletionTokens *int  `json:"max_completion_tokens,omitempty"`
+	IsModerated         bool  `json:"is_moderated"`
 }
 
 // ErrorResponse is the standard OpenAI-compatible error envelope.
