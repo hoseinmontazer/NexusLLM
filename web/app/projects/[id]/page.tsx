@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy } from '@/lib/api'
+import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy, type CatalogProvider, type ProjectProviderAccess } from '@/lib/api'
 import { PriorityBadge, PriorityBar, EffectivePriorityCard, weightLabel } from '@/components/projects/PriorityBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,8 @@ import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, Shield, Zap, Activity, AlertTriangle,
   Server, BarChart2, Clock, DollarSign, Layers, Gauge,
-  Settings2, TrendingUp, Percent,
+  Settings2, TrendingUp, Percent, Globe, CheckCircle2,
+  Loader2, Trash2, Plus,
 } from 'lucide-react'
 
 // ── Policy & Quota panel ──────────────────────────────────────────────────────
@@ -607,12 +608,430 @@ function RuntimesTable({ projectId }: { projectId: string }) {
   )
 }
 
+// ── Provider Access panel (catalog / hybrid mode) ────────────────────────────
+// Lets admins grant this project access to one or more catalog/hybrid-mode
+// providers. Each grant optionally restricts callable models via glob prefixes.
+
+function ProviderAccessPanel({ projectId }: { projectId: string }) {
+  const qc = useQueryClient()
+
+  // Existing grants for this project
+  const { data: grantsData, isLoading: grantsLoading } = useQuery({
+    queryKey: ['project-provider-access', projectId],
+    queryFn: () => api.providerAccess.list(projectId),
+    refetchInterval: 30_000,
+  })
+  const grants: ProjectProviderAccess[] = grantsData?.data ?? []
+
+  // All providers — filtered to catalog/hybrid when displaying grant candidates
+  const { data: providersData } = useQuery({
+    queryKey: ['providers'],
+    queryFn: api.providers.list,
+    staleTime: 60_000,
+  })
+  const allProviders: CatalogProvider[] = providersData?.data ?? []
+  const virtualProviders = allProviders.filter(
+    p => p.exposure_mode === 'catalog' || p.exposure_mode === 'hybrid',
+  )
+  // Providers not yet granted to this project
+  const grantedIds = new Set(grants.map(g => g.provider_id))
+  const availableToGrant = virtualProviders.filter(p => !grantedIds.has(p.id))
+
+  // Grant form state
+  const [showForm, setShowForm] = useState(false)
+  const [selectedProvider, setSelectedProvider] = useState('')
+  const [allowedRaw, setAllowedRaw] = useState('')
+  const [deniedRaw, setDeniedRaw] = useState('')
+
+  // Edit prefix state — keyed by grant provider_id
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editAllowed, setEditAllowed] = useState('')
+  const [editDenied, setEditDenied] = useState('')
+
+  const splitPrefixes = (raw: string) =>
+    raw.split('\n').map(s => s.trim()).filter(Boolean)
+
+  // Grant
+  const grantMut = useMutation({
+    mutationFn: () =>
+      api.providerAccess.grant(projectId, {
+        provider_id: selectedProvider,
+        allowed_prefixes: splitPrefixes(allowedRaw),
+        denied_prefixes: splitPrefixes(deniedRaw),
+      }),
+    onSuccess: (r) => {
+      toast({ title: `Access granted`, description: `Provider: ${r.provider_name}` })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+      setShowForm(false)
+      setSelectedProvider('')
+      setAllowedRaw('')
+      setDeniedRaw('')
+    },
+    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Update prefixes
+  const updateMut = useMutation({
+    mutationFn: ({ pid, allowed, denied }: { pid: string; allowed: string[]; denied: string[] }) =>
+      api.providerAccess.update(projectId, pid, {
+        allowed_prefixes: allowed,
+        denied_prefixes: denied,
+      }),
+    onSuccess: () => {
+      toast({ title: 'Prefix rules updated' })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+      setEditingId(null)
+    },
+    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Revoke
+  const revokeMut = useMutation({
+    mutationFn: (pid: string) => api.providerAccess.revoke(projectId, pid),
+    onSuccess: () => {
+      toast({ title: 'Access revoked' })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+    },
+    onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const selectedProviderObj = allProviders.find(p => p.id === selectedProvider)
+  const exposePrefix = selectedProviderObj?.catalog_expose_prefix || selectedProviderObj?.name || ''
+
+  return (
+    <div className="space-y-5">
+      {/* Header explainer */}
+      <div className="rounded-md bg-violet-50 border border-violet-200 px-4 py-3 text-xs text-violet-800 space-y-1">
+        <p className="font-semibold flex items-center gap-1.5">
+          <Globe className="w-3.5 h-3.5" />Provider Catalog Access
+        </p>
+        <p>
+          Grant this project access to <strong>Catalog</strong> or <strong>Hybrid</strong> mode providers.
+          Once granted, users calling the gateway with an API key scoped to this project can access any
+          virtual model from the provider — subject to the project's rate limits and quota.
+        </p>
+        <p>
+          Only providers with <strong>exposure_mode = catalog or hybrid</strong> are shown. To add a
+          provider, change its mode in <strong>Providers → Overview</strong>.
+        </p>
+      </div>
+
+      {/* No virtual providers at all */}
+      {virtualProviders.length === 0 && !grantsLoading && (
+        <div className="rounded-lg border bg-white p-8 text-center space-y-2">
+          <Globe className="w-8 h-8 mx-auto text-muted-foreground opacity-30" />
+          <p className="text-sm font-medium text-muted-foreground">No catalog/hybrid providers configured</p>
+          <p className="text-xs text-muted-foreground">
+            Go to <strong>Providers</strong>, open a provider, and set its Exposure Mode to
+            <strong> Catalog</strong> or <strong>Hybrid</strong>.
+          </p>
+        </div>
+      )}
+
+      {/* Existing grants */}
+      {(grants.length > 0 || grantsLoading) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-green-600" />
+              Active Provider Grants
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {grantsLoading && (
+              <p className="text-sm text-muted-foreground flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />Loading grants…
+              </p>
+            )}
+            {grants.map(g => {
+              const isEditing = editingId === g.provider_id
+              return (
+                <div key={g.id} className={`rounded-lg border p-3 space-y-2 ${
+                  g.enabled ? 'border-violet-200 bg-violet-50/40' : 'border-gray-200 bg-gray-50 opacity-60'
+                }`}>
+                  {/* Grant header */}
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex-1 space-y-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-sm">{g.provider_name}</span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-full border font-medium ${
+                          g.exposure_mode === 'catalog'
+                            ? 'bg-violet-100 text-violet-700 border-violet-200'
+                            : 'bg-blue-100 text-blue-700 border-blue-200'
+                        }`}>
+                          {g.exposure_mode}
+                        </span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-full border font-medium ${
+                          g.enabled
+                            ? 'bg-green-100 text-green-700 border-green-200'
+                            : 'bg-gray-100 text-gray-500 border-gray-200'
+                        }`}>
+                          {g.enabled ? 'active' : 'revoked'}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-muted-foreground">
+                        Granted {new Date(g.created_at).toLocaleDateString()}
+                        {g.updated_at !== g.created_at && ` · Updated ${new Date(g.updated_at).toLocaleDateString()}`}
+                      </p>
+                    </div>
+                    <div className="flex gap-1 shrink-0">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => {
+                          if (isEditing) {
+                            setEditingId(null)
+                          } else {
+                            setEditingId(g.provider_id)
+                            setEditAllowed((g.allowed_prefixes ?? []).join('\n'))
+                            setEditDenied((g.denied_prefixes ?? []).join('\n'))
+                          }
+                        }}
+                      >
+                        {isEditing ? 'Cancel' : 'Edit prefixes'}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs text-red-600 hover:text-red-700 hover:bg-red-50"
+                        disabled={revokeMut.isPending || !g.enabled}
+                        onClick={() => revokeMut.mutate(g.provider_id)}
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* Prefix summary — collapsed view */}
+                  {!isEditing && (
+                    <div className="text-xs space-y-1">
+                      {(!g.allowed_prefixes?.length && !g.denied_prefixes?.length) ? (
+                        <span className="text-green-700 flex items-center gap-1">
+                          <CheckCircle2 className="w-3 h-3" />
+                          All virtual models allowed (no prefix restrictions)
+                        </span>
+                      ) : (
+                        <>
+                          {g.allowed_prefixes?.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span className="text-muted-foreground">Allow:</span>
+                              {g.allowed_prefixes.map(p => (
+                                <code key={p} className="bg-white border border-violet-200 px-1.5 py-0.5 rounded text-violet-700">{p}</code>
+                              ))}
+                            </div>
+                          )}
+                          {g.denied_prefixes?.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span className="text-muted-foreground">Deny:</span>
+                              {g.denied_prefixes.map(p => (
+                                <code key={p} className="bg-white border border-red-200 px-1.5 py-0.5 rounded text-red-700">{p}</code>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Inline prefix editor */}
+                  {isEditing && (
+                    <div className="space-y-2 pt-1 border-t border-violet-200">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <Label className="text-[10px]">
+                            Allowed prefixes <span className="text-muted-foreground font-normal">(one glob per line; empty = allow all)</span>
+                          </Label>
+                          <textarea
+                            rows={3}
+                            value={editAllowed}
+                            onChange={e => setEditAllowed(e.target.value)}
+                            className="w-full mt-1 border rounded-md px-2 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            placeholder={`${g.provider_name}/*`}
+                          />
+                        </div>
+                        <div>
+                          <Label className="text-[10px]">
+                            Denied prefixes <span className="text-muted-foreground font-normal">(one glob per line)</span>
+                          </Label>
+                          <textarea
+                            rows={3}
+                            value={editDenied}
+                            onChange={e => setEditDenied(e.target.value)}
+                            className="w-full mt-1 border rounded-md px-2 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            placeholder={`${g.provider_name}/openai/gpt-4-*`}
+                          />
+                        </div>
+                      </div>
+                      <Button
+                        size="sm"
+                        disabled={updateMut.isPending}
+                        onClick={() =>
+                          updateMut.mutate({
+                            pid: g.provider_id,
+                            allowed: splitPrefixes(editAllowed),
+                            denied: splitPrefixes(editDenied),
+                          })
+                        }
+                      >
+                        {updateMut.isPending ? (
+                          <><Loader2 className="w-3 h-3 animate-spin mr-1" />Saving…</>
+                        ) : 'Save prefix rules'}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Grant new access */}
+      {virtualProviders.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                <Plus className="w-4 h-4" />Grant Provider Access
+              </span>
+              {!showForm && availableToGrant.length > 0 && (
+                <Button size="sm" onClick={() => setShowForm(true)}>
+                  + Grant Access
+                </Button>
+              )}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {availableToGrant.length === 0 && !showForm && (
+              <p className="text-sm text-muted-foreground">
+                All available catalog/hybrid providers have been granted to this project.
+              </p>
+            )}
+
+            {showForm && (
+              <div className="space-y-4">
+                {/* Provider selector */}
+                <div>
+                  <Label className="text-xs">Provider</Label>
+                  <select
+                    className="w-full border rounded-md h-9 px-3 text-sm mt-1"
+                    value={selectedProvider}
+                    onChange={e => {
+                      setSelectedProvider(e.target.value)
+                      setAllowedRaw('')
+                      setDeniedRaw('')
+                    }}
+                  >
+                    <option value="">— select provider —</option>
+                    {availableToGrant.map(p => (
+                      <option key={p.id} value={p.id}>
+                        {p.display_name} ({p.exposure_mode}) · {p.catalog_model_count} models
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {selectedProvider && (
+                  <>
+                    <div className="rounded-md bg-gray-50 border px-3 py-2.5 text-xs text-muted-foreground space-y-1">
+                      <p className="font-medium text-foreground">
+                        Virtual model names from this provider look like:
+                      </p>
+                      <code className="block bg-white border rounded px-2 py-1 font-mono text-xs">
+                        {exposePrefix}/openai/gpt-5<br />
+                        {exposePrefix}/anthropic/claude-opus-4<br />
+                        {exposePrefix}/google/gemini-2.5-pro
+                      </code>
+                      <p>Leave prefix rules empty to allow <strong>all</strong> virtual models from this provider.</p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <Label className="text-xs">
+                          Allowed prefixes{' '}
+                          <span className="text-muted-foreground font-normal">(one glob per line, empty&nbsp;=&nbsp;all)</span>
+                        </Label>
+                        <textarea
+                          rows={4}
+                          value={allowedRaw}
+                          onChange={e => setAllowedRaw(e.target.value)}
+                          className="w-full mt-1 border rounded-md px-2 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                          placeholder={`${exposePrefix}/openai/*\n${exposePrefix}/anthropic/*`}
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">
+                          Denied prefixes{' '}
+                          <span className="text-muted-foreground font-normal">(one glob per line)</span>
+                        </Label>
+                        <textarea
+                          rows={4}
+                          value={deniedRaw}
+                          onChange={e => setDeniedRaw(e.target.value)}
+                          className="w-full mt-1 border rounded-md px-2 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                          placeholder={`${exposePrefix}/openai/gpt-4-*`}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="rounded-md bg-blue-50 border border-blue-200 px-3 py-2 text-[11px] text-blue-800 space-y-0.5">
+                      <p><strong>Evaluation order:</strong> denied prefixes are checked first (deny wins).</p>
+                      <p>Pattern <code className="bg-white px-0.5 rounded">*</code> matches within one path segment.
+                        Use <code className="bg-white px-0.5 rounded">{exposePrefix}/*</code> to allow all models.</p>
+                      <p><strong>Rate limits still apply:</strong> RPM, TPM, daily and monthly budgets are enforced regardless of which virtual model is called.</p>
+                    </div>
+                  </>
+                )}
+
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    disabled={grantMut.isPending || !selectedProvider}
+                    onClick={() => grantMut.mutate()}
+                  >
+                    {grantMut.isPending ? (
+                      <><Loader2 className="w-3 h-3 animate-spin mr-1" />Granting…</>
+                    ) : (
+                      <><Globe className="w-3 h-3 mr-1" />Grant Access</>
+                    )}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => {
+                    setShowForm(false)
+                    setSelectedProvider('')
+                    setAllowedRaw('')
+                    setDeniedRaw('')
+                  }}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Rate limit reminder */}
+      {grants.length > 0 && (
+        <div className="rounded-md border bg-white px-4 py-3 text-xs text-muted-foreground space-y-1">
+          <p className="font-medium text-foreground">Rate limits apply to all virtual models equally</p>
+          <p>
+            All calls to virtual models from any granted provider consume the same project budget
+            (RPM, TPM, daily tokens, monthly tokens). Configure limits in the{' '}
+            <strong>Policy &amp; Quotas</strong> tab.
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main detail page ──────────────────────────────────────────────────────────
 export default function ProjectDetailPage() {
   const params  = useParams<{ id: string }>()
   const router  = useRouter()
   const id      = params.id
-  const [activeTab, setActiveTab] = useState<'usage' | 'policy' | 'config' | 'runtimes'>('usage')
+  const [activeTab, setActiveTab] = useState<'usage' | 'policy' | 'config' | 'runtimes' | 'providers'>('usage')
 
   // ── All hooks must be declared before any conditional returns ──────────────
   const { data: project, isLoading, error } = useQuery({
@@ -722,10 +1141,11 @@ export default function ProjectDetailPage() {
       <div>
         <div className="flex gap-0 border-b mb-5">
           {([
-            { key: 'usage',    label: 'Usage Analytics' },
-            { key: 'policy',   label: 'Policy & Quotas' },
-            { key: 'config',   label: 'Configuration' },
-            { key: 'runtimes', label: 'Runtimes & Queue' },
+            { key: 'usage',     label: 'Usage Analytics' },
+            { key: 'policy',    label: 'Policy & Quotas' },
+            { key: 'config',    label: 'Configuration' },
+            { key: 'runtimes',  label: 'Runtimes & Queue' },
+            { key: 'providers', label: 'Provider Access' },
           ] as const).map(t => (
             <button key={t.key}
               onClick={() => setActiveTab(t.key)}
@@ -804,6 +1224,8 @@ export default function ProjectDetailPage() {
             </Card>
           </div>
         )}
+
+        {activeTab === 'providers' && <ProviderAccessPanel projectId={id} />}
       </div>
     </div>
   )

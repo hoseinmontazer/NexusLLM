@@ -507,17 +507,33 @@ export interface ClusterHAStatus {
   recoveries_triggered: number
 }
 
-// ── Provider Catalog types (migration 047) ────────────────────────────────
+// ── Provider Catalog types (migration 047 + 050) ─────────────────────────
+export type ExposureMode = 'managed' | 'catalog' | 'hybrid'
+
 export interface CatalogProvider {
   id: string; name: string; display_name: string
   backend_type: string; base_url: string
   api_key_set: boolean
+  exposure_mode: ExposureMode
   catalog_sync_enabled: boolean; catalog_sync_interval: number
   catalog_direct_expose: boolean; catalog_expose_prefix: string
   catalog_last_synced_at?: string; catalog_model_count: number
   catalog_sync_status: string; catalog_sync_error?: string
   proxy_url?: string; enabled: boolean; health: string
   last_health_check?: string; created_at: string; updated_at: string
+}
+
+export interface ProjectProviderAccess {
+  id: string
+  project_id: string
+  provider_id: string
+  provider_name: string
+  exposure_mode: string
+  allowed_prefixes: string[]
+  denied_prefixes: string[]
+  enabled: boolean
+  created_at: string
+  updated_at: string
 }
 
 export interface CatalogEntry {
@@ -894,12 +910,14 @@ export const api = {
     get: (id: string) => req<CatalogProvider>('GET', `/providers/${id}`),
     create: (b: {
       name: string; display_name: string; backend_type: string; base_url: string
-      api_key?: string; catalog_sync_enabled?: boolean; catalog_sync_interval?: number
+      api_key?: string; exposure_mode?: ExposureMode
+      catalog_sync_enabled?: boolean; catalog_sync_interval?: number
       catalog_direct_expose?: boolean; catalog_expose_prefix?: string; proxy_url?: string
       request_timeout_seconds?: number; max_retries?: number
-    }) => req<{ id: string; name: string; status: string }>('POST', '/providers', b),
+    }) => req<{ id: string; name: string; exposure_mode: string; status: string }>('POST', '/providers', b),
     update: (id: string, b: Partial<{
       display_name: string; base_url: string; api_key: string
+      exposure_mode: ExposureMode
       catalog_sync_enabled: boolean; catalog_sync_interval: number
       catalog_direct_expose: boolean; catalog_expose_prefix: string
       proxy_url: string; enabled: boolean
@@ -943,6 +961,31 @@ export const api = {
         results: { public_name: string; provider_model_id: string; model_id?: string; endpoint_id?: string; error?: string }[]
         note: string
       }>('POST', `/providers/${id}/register-models`, { models }),
+  },
+
+  // ── Project Provider Access (migration 050) ──────────────────────────────
+  providerAccess: {
+    list: (projectId: string) =>
+      req<{ data: ProjectProviderAccess[]; total: number; project_id: string }>(
+        'GET', `/projects/${projectId}/provider-access`),
+    grant: (projectId: string, b: {
+      provider_id: string
+      allowed_prefixes?: string[]
+      denied_prefixes?: string[]
+    }) => req<{
+      id: string; project_id: string; provider_id: string
+      provider_name: string; exposure_mode: string
+      allowed_prefixes: string[]; denied_prefixes: string[]; note: string
+    }>('POST', `/projects/${projectId}/provider-access`, b),
+    update: (projectId: string, providerId: string, b: {
+      allowed_prefixes?: string[]
+      denied_prefixes?: string[]
+      enabled?: boolean
+    }) => req<{ message: string; project_id: string; provider_id: string }>(
+      'PUT', `/projects/${projectId}/provider-access/${providerId}`, b),
+    revoke: (projectId: string, providerId: string) =>
+      req<{ message: string; project_id: string; provider_id: string }>(
+        'DELETE', `/projects/${projectId}/provider-access/${providerId}`),
   },
 
   // ── Project policy & quota (migration 023) ────────────────────────────────

@@ -3,14 +3,14 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type CatalogEntry, type ExposureRule } from '@/lib/api'
+import { api, type CatalogEntry, type ExposureRule, type ExposureMode, type ProjectProviderAccess } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, RefreshCw, Zap, Search, CheckCircle2,
-  XCircle, Loader2, Settings, Shield, Eye, PackageCheck,
+  XCircle, Loader2, Settings, Shield, Eye, PackageCheck, Users,
 } from 'lucide-react'
 
 // ── Capability badges ──────────────────────────────────────────────────────────
@@ -547,64 +547,517 @@ function RulesTab({ providerId }: { providerId: string }) {
   )
 }
 
+// ── ExposureMode selector ─────────────────────────────────────────────────────
+
+const EXPOSURE_META: Record<string, { label: string; desc: string; color: string; bg: string; border: string }> = {
+  managed: {
+    label: 'Managed',
+    desc: 'Administrators explicitly register Public Models. Only registered models appear in GET /v1/models. Uses team_model_permissions for authorization.',
+    color: 'text-gray-700',
+    bg: 'bg-gray-50',
+    border: 'border-gray-300',
+  },
+  catalog: {
+    label: 'Catalog',
+    desc: 'Provider catalogue exposed directly as virtual models — no registration required. GET /v1/models returns prefix/provider-model-id names. Uses project_provider_access for authorization.',
+    color: 'text-violet-700',
+    bg: 'bg-violet-50',
+    border: 'border-violet-400',
+  },
+  hybrid: {
+    label: 'Hybrid',
+    desc: 'Both mechanisms run simultaneously. Registered Public Models AND virtual catalog models are visible. Managed authorization for Public Models, project_provider_access for virtual models.',
+    color: 'text-blue-700',
+    bg: 'bg-blue-50',
+    border: 'border-blue-400',
+  },
+}
+
+function ExposureModeSelector({
+  current,
+  onChange,
+  disabled,
+}: {
+  current: string
+  onChange: (m: ExposureMode) => void
+  disabled?: boolean
+}) {
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Exposure Mode</p>
+      <div className="grid grid-cols-3 gap-2">
+        {(['managed', 'catalog', 'hybrid'] as ExposureMode[]).map(m => {
+          const meta = EXPOSURE_META[m]
+          const active = current === m
+          return (
+            <button
+              key={m}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(m)}
+              className={`rounded-lg border-2 px-3 py-2.5 text-left transition-all ${
+                active
+                  ? `${meta.border} ${meta.bg} ${meta.color}`
+                  : 'border-gray-200 hover:border-gray-300 hover:bg-gray-50 text-gray-600'
+              } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+            >
+              <div className="flex items-center gap-1.5 mb-1">
+                {active && (
+                  <CheckCircle2 className={`w-3 h-3 shrink-0 ${meta.color}`} />
+                )}
+                <span className="text-xs font-semibold">{meta.label}</span>
+              </div>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">{meta.desc}</p>
+            </button>
+          )
+        })}
+      </div>
+      {(current === 'catalog' || current === 'hybrid') && (
+        <div className="rounded-md bg-violet-50 border border-violet-200 px-3 py-2 text-xs text-violet-800 space-y-1">
+          <p><strong>Next steps for {current} mode:</strong></p>
+          <ol className="list-decimal pl-4 space-y-0.5">
+            <li>Trigger a catalog sync (Sync Catalog button above)</li>
+            <li>Add exposure rules in the <strong>Exposure Rules</strong> tab to control which models are visible</li>
+            <li>Go to <strong>Projects → Provider Access</strong> to grant projects access to this provider</li>
+          </ol>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Overview tab ───────────────────────────────────────────────────────────────
 
 function OverviewTab({ providerId }: { providerId: string }) {
   const qc = useQueryClient()
-  const { data: p } = useQuery({ queryKey: ['provider', providerId], queryFn: () => api.providers.get(providerId) })
+  const { data: p, isLoading } = useQuery({
+    queryKey: ['provider', providerId],
+    queryFn: () => api.providers.get(providerId),
+  })
+
+  const [baseUrl, setBaseUrl] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [exposePrefix, setExposePrefix] = useState('')
+
+  // Sync defaults when provider loads
+  const [initialised, setInitialised] = useState(false)
+  if (p && !initialised) {
+    setBaseUrl(p.base_url)
+    setProxyUrl(p.proxy_url ?? '')
+    setExposePrefix(p.catalog_expose_prefix ?? '')
+    setInitialised(true)
+  }
 
   const updateMut = useMutation({
     mutationFn: (b: Parameters<typeof api.providers.update>[1]) => api.providers.update(providerId, b),
-    onSuccess: () => { toast({ title: 'Updated' }); qc.invalidateQueries({ queryKey: ['provider', providerId] }) },
+    onSuccess: () => {
+      toast({ title: 'Provider updated' })
+      qc.invalidateQueries({ queryKey: ['provider', providerId] })
+      qc.invalidateQueries({ queryKey: ['providers'] })
+    },
     onError: (e: any) => toast({ title: 'Failed', description: e.message, variant: 'destructive' }),
   })
 
-  if (!p) return <p className="text-sm text-muted-foreground">Loading…</p>
+  const exposureMut = useMutation({
+    mutationFn: (mode: ExposureMode) => api.providers.update(providerId, { exposure_mode: mode }),
+    onSuccess: (_, mode) => {
+      toast({ title: `Exposure mode → ${mode}` })
+      qc.invalidateQueries({ queryKey: ['provider', providerId] })
+      qc.invalidateQueries({ queryKey: ['providers'] })
+    },
+    onError: (e: any) => toast({ title: 'Failed to change mode', description: e.message, variant: 'destructive' }),
+  })
+
+  if (isLoading || !p) return <p className="text-sm text-muted-foreground">Loading…</p>
+
+  const currentMode: ExposureMode = (p.exposure_mode as ExposureMode) || 'managed'
 
   return (
-    <div className="grid grid-cols-2 gap-6 max-w-2xl">
-      <div className="space-y-1">
-        <p className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Provider</p>
-        <p className="font-medium">{p.display_name}</p>
-        <p className="text-xs text-muted-foreground font-mono">{p.name}</p>
-        <p className="text-xs text-muted-foreground">{p.backend_type}</p>
-      </div>
-      <div className="space-y-1">
-        <p className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Health</p>
-        <p className="text-sm">{p.health}</p>
-        <p className="text-xs text-muted-foreground">Last checked: {p.last_health_check ? new Date(p.last_health_check).toLocaleString() : '—'}</p>
-      </div>
-      <div className="space-y-1">
-        <p className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Catalog</p>
-        <p className="text-sm tabular-nums">{p.catalog_model_count} models</p>
-        <p className="text-xs text-muted-foreground">Last sync: {p.catalog_last_synced_at ? new Date(p.catalog_last_synced_at).toLocaleString() : 'never'}</p>
-        <p className="text-xs text-muted-foreground">Status: {p.catalog_sync_status}</p>
-        {p.catalog_sync_error && <p className="text-xs text-red-500">{p.catalog_sync_error}</p>}
-      </div>
-      <div className="space-y-1">
-        <p className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Transport</p>
-        <p className="text-xs font-mono">{p.proxy_url || 'direct (no proxy)'}</p>
+    <div className="space-y-6 max-w-2xl">
+      {/* Stats row */}
+      <div className="grid grid-cols-4 gap-4 text-sm">
+        <div className="rounded-lg border bg-white p-3 space-y-0.5">
+          <p className="text-xs text-muted-foreground">Health</p>
+          <p className="font-medium capitalize">{p.health}</p>
+          <p className="text-[10px] text-muted-foreground">
+            {p.last_health_check ? new Date(p.last_health_check).toLocaleString() : 'not checked'}
+          </p>
+        </div>
+        <div className="rounded-lg border bg-white p-3 space-y-0.5">
+          <p className="text-xs text-muted-foreground">Catalog models</p>
+          <p className="font-medium tabular-nums">{p.catalog_model_count}</p>
+          <p className="text-[10px] text-muted-foreground">{p.catalog_sync_status}</p>
+        </div>
+        <div className="rounded-lg border bg-white p-3 space-y-0.5">
+          <p className="text-xs text-muted-foreground">Last sync</p>
+          <p className="font-medium text-xs">
+            {p.catalog_last_synced_at ? new Date(p.catalog_last_synced_at).toLocaleDateString() : 'never'}
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            {p.catalog_last_synced_at ? new Date(p.catalog_last_synced_at).toLocaleTimeString() : '—'}
+          </p>
+        </div>
+        <div className="rounded-lg border bg-white p-3 space-y-0.5">
+          <p className="text-xs text-muted-foreground">Transport</p>
+          <p className="font-medium text-xs truncate font-mono">{p.proxy_url || 'direct'}</p>
+          <p className="text-[10px] text-muted-foreground">backend: {p.backend_type}</p>
+        </div>
       </div>
 
-      <div className="col-span-2 border-t pt-4 space-y-3">
-        <p className="text-xs font-semibold">Quick Update</p>
+      {p.catalog_sync_error && (
+        <div className="rounded-md bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">
+          <strong>Sync error:</strong> {p.catalog_sync_error}
+        </div>
+      )}
+
+      {/* Exposure mode selector */}
+      <div className="rounded-lg border bg-white p-4">
+        <ExposureModeSelector
+          current={currentMode}
+          onChange={(m) => exposureMut.mutate(m)}
+          disabled={exposureMut.isPending}
+        />
+      </div>
+
+      {/* Connection settings */}
+      <div className="rounded-lg border bg-white p-4 space-y-3">
+        <p className="text-xs font-semibold">Connection Settings</p>
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label className="text-xs">Base URL</Label>
-            <Input defaultValue={p.base_url} id="base-url" className="mt-1 font-mono text-xs h-8" />
+            <Input
+              value={baseUrl}
+              onChange={e => setBaseUrl(e.target.value)}
+              className="mt-1 font-mono text-xs h-8"
+            />
           </div>
           <div>
-            <Label className="text-xs">Proxy URL</Label>
-            <Input defaultValue={p.proxy_url ?? ''} id="proxy-url" className="mt-1 font-mono text-xs h-8" placeholder="socks5://…" />
+            <Label className="text-xs">Outbound Proxy</Label>
+            <Input
+              value={proxyUrl}
+              onChange={e => setProxyUrl(e.target.value)}
+              className="mt-1 font-mono text-xs h-8"
+              placeholder="socks5://host:port"
+            />
+          </div>
+          <div>
+            <Label className="text-xs">New API Key <span className="text-muted-foreground font-normal">(leave blank to keep current)</span></Label>
+            <Input
+              type="password"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              className="mt-1 h-8"
+              placeholder="sk-…"
+              autoComplete="new-password"
+            />
+          </div>
+          <div>
+            <Label className="text-xs">Expose Prefix</Label>
+            <Input
+              value={exposePrefix}
+              onChange={e => setExposePrefix(e.target.value)}
+              className="mt-1 font-mono text-xs h-8"
+              placeholder={p.name}
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Virtual models appear as <code className="bg-gray-100 px-0.5 rounded">{exposePrefix || p.name}/model-id</code>
+            </p>
           </div>
         </div>
-        <Button size="sm" onClick={() => {
-          const base = (document.getElementById('base-url') as HTMLInputElement)?.value
-          const proxy = (document.getElementById('proxy-url') as HTMLInputElement)?.value
-          updateMut.mutate({ base_url: base || undefined, proxy_url: proxy !== undefined ? proxy : undefined })
-        }} disabled={updateMut.isPending}>
-          {updateMut.isPending ? 'Saving…' : 'Save Changes'}
+        <Button
+          size="sm"
+          onClick={() => updateMut.mutate({
+            base_url: baseUrl || undefined,
+            proxy_url: proxyUrl !== undefined ? proxyUrl : undefined,
+            api_key: apiKey || undefined,
+            catalog_expose_prefix: exposePrefix || undefined,
+          })}
+          disabled={updateMut.isPending}
+        >
+          {updateMut.isPending ? 'Saving…' : 'Save Connection Settings'}
         </Button>
+      </div>
+
+      {/* Sync settings */}
+      <div className="rounded-lg border bg-white p-4 space-y-3">
+        <p className="text-xs font-semibold">Catalog Sync</p>
+        <div className="flex items-center gap-4 text-sm">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              defaultChecked={p.catalog_sync_enabled}
+              className="h-4 w-4"
+              onChange={e => updateMut.mutate({ catalog_sync_enabled: e.target.checked })}
+            />
+            Enable automatic sync
+          </label>
+          <div className="flex items-center gap-2">
+            <Label className="text-xs">Interval (s)</Label>
+            <Input
+              type="number"
+              defaultValue={p.catalog_sync_interval}
+              className="w-24 h-8 text-xs"
+              onBlur={e => {
+                const v = Number(e.target.value)
+                if (v > 0) updateMut.mutate({ catalog_sync_interval: v })
+              }}
+            />
+          </div>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Sync fetches the provider's <code>/v1/models</code> list and updates <code>provider_remote_models</code>.
+          Capability flags (tools, vision, etc.) are preserved across syncs.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+// ── Project Access tab (shown on provider detail page) ────────────────────────
+// Lists every project that has been granted access to this provider's virtual
+// catalog models, with inline revoke and prefix-edit capabilities.
+
+function ProjectAccessTab({ providerId, providerName }: { providerId: string; providerName: string }) {
+  const qc = useQueryClient()
+
+  // We load all projects so the grant form can pick one from a dropdown.
+  const { data: projectsData } = useQuery({
+    queryKey: ['projects'],
+    queryFn: () => api.projects.list(),
+    staleTime: 60_000,
+  })
+  const allProjects = projectsData?.data ?? []
+
+  // Load all grants for this provider by querying each project's access list.
+  // The admin API doesn't expose a "list by provider" endpoint, so we use the
+  // project list then filter client-side. For large deployments this is fine
+  // because the project count is typically small (tens, not thousands).
+  // A simpler approach: just let the user paste a project ID.
+  const [grantProjectId, setGrantProjectId] = useState('')
+  const [allowedPrefixes, setAllowedPrefixes] = useState('')
+  const [deniedPrefixes, setDeniedPrefixes] = useState('')
+  const [showGrantForm, setShowGrantForm] = useState(false)
+
+  // Per-project grant list — only fetch for a selected project for preview.
+  const [previewProjectId, setPreviewProjectId] = useState<string | null>(null)
+  const { data: previewData } = useQuery({
+    queryKey: ['project-provider-access', previewProjectId],
+    queryFn: () => api.providerAccess.list(previewProjectId!),
+    enabled: !!previewProjectId,
+  })
+
+  // Grant mutation
+  const grantMut = useMutation({
+    mutationFn: () =>
+      api.providerAccess.grant(grantProjectId, {
+        provider_id: providerId,
+        allowed_prefixes: allowedPrefixes
+          ? allowedPrefixes.split('\n').map(s => s.trim()).filter(Boolean)
+          : [],
+        denied_prefixes: deniedPrefixes
+          ? deniedPrefixes.split('\n').map(s => s.trim()).filter(Boolean)
+          : [],
+      }),
+    onSuccess: (r) => {
+      toast({ title: `Access granted to project ${r.provider_name ?? ''}` })
+      setShowGrantForm(false)
+      setGrantProjectId('')
+      setAllowedPrefixes('')
+      setDeniedPrefixes('')
+      // Refresh the preview if we just granted the same project
+      if (previewProjectId === grantProjectId) {
+        qc.invalidateQueries({ queryKey: ['project-provider-access', previewProjectId] })
+      }
+    },
+    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Revoke mutation
+  const revokeMut = useMutation({
+    mutationFn: ({ projectId, pId }: { projectId: string; pId: string }) =>
+      api.providerAccess.revoke(projectId, pId),
+    onSuccess: (_, { projectId }) => {
+      toast({ title: 'Access revoked' })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+    },
+    onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Filter grants belonging to this provider from the preview
+  const grantsForThisProvider = (previewData?.data ?? []).filter(
+    (g) => g.provider_id === providerId,
+  )
+
+  return (
+    <div className="space-y-5 max-w-2xl">
+      {/* Explainer */}
+      <div className="rounded-md bg-violet-50 border border-violet-200 px-4 py-3 text-xs text-violet-800 space-y-1">
+        <p className="font-semibold">Project-level authorization for Catalog / Hybrid mode</p>
+        <p>
+          In <strong>Catalog</strong> or <strong>Hybrid</strong> mode, projects must be explicitly granted
+          access to this provider before their API keys can call virtual models. Rate limits, quota, and
+          usage accounting continue to apply — only model discovery changes.
+        </p>
+      </div>
+
+      {/* Grant access form */}
+      <div className="rounded-lg border bg-white p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold">Grant Project Access</p>
+          <Button size="sm" variant={showGrantForm ? 'outline' : 'default'}
+            onClick={() => setShowGrantForm(v => !v)}>
+            {showGrantForm ? 'Cancel' : '+ Grant Access'}
+          </Button>
+        </div>
+
+        {showGrantForm && (
+          <div className="space-y-3 pt-1">
+            <div>
+              <Label className="text-xs">Project</Label>
+              <select
+                className="w-full border rounded-md h-9 px-3 text-sm mt-1"
+                value={grantProjectId}
+                onChange={e => setGrantProjectId(e.target.value)}
+              >
+                <option value="">— select project —</option>
+                {allProjects.map(p => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label className="text-xs">
+                  Allowed prefixes{' '}
+                  <span className="text-muted-foreground font-normal">(one glob per line, empty = allow all)</span>
+                </Label>
+                <textarea
+                  rows={3}
+                  value={allowedPrefixes}
+                  onChange={e => setAllowedPrefixes(e.target.value)}
+                  className="w-full border rounded-md px-3 py-2 text-xs font-mono mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                  placeholder={`${providerName}/openai/*\n${providerName}/anthropic/*`}
+                />
+              </div>
+              <div>
+                <Label className="text-xs">
+                  Denied prefixes{' '}
+                  <span className="text-muted-foreground font-normal">(one glob per line, empty = deny none)</span>
+                </Label>
+                <textarea
+                  rows={3}
+                  value={deniedPrefixes}
+                  onChange={e => setDeniedPrefixes(e.target.value)}
+                  className="w-full border rounded-md px-3 py-2 text-xs font-mono mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                  placeholder={`${providerName}/openai/gpt-4-*`}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-md bg-gray-50 border px-3 py-2 text-[11px] text-muted-foreground space-y-0.5">
+              <p>• Leave both lists empty to allow the project to call <strong>all</strong> virtual models from this provider.</p>
+              <p>• Glob patterns use <code className="bg-white px-0.5 rounded">*</code> for single-segment wildcard. Example: <code className="bg-white px-0.5 rounded">{providerName}/openai/*</code></p>
+              <p>• Denied prefixes are checked first — deny wins over allow.</p>
+            </div>
+
+            <Button
+              size="sm"
+              onClick={() => grantMut.mutate()}
+              disabled={grantMut.isPending || !grantProjectId}
+            >
+              {grantMut.isPending ? (
+                <><Loader2 className="w-3 h-3 animate-spin mr-1" />Granting…</>
+              ) : (
+                <><Users className="w-3 h-3 mr-1" />Grant Access</>
+              )}
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* Look up existing grants for a project */}
+      <div className="rounded-lg border bg-white p-4 space-y-3">
+        <p className="text-xs font-semibold">Check Project Access</p>
+        <div className="flex gap-2 items-center">
+          <select
+            className="flex-1 border rounded-md h-9 px-3 text-sm"
+            value={previewProjectId ?? ''}
+            onChange={e => setPreviewProjectId(e.target.value || null)}
+          >
+            <option value="">— select project to view its grants —</option>
+            {allProjects.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </div>
+
+        {previewProjectId && (
+          <div>
+            {grantsForThisProvider.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-2">
+                This project has no access grant for this provider.
+              </p>
+            ) : (
+              <div className="space-y-2 mt-2">
+                {grantsForThisProvider.map(g => (
+                  <div key={g.id}
+                    className="rounded-md border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="space-y-1 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                            g.enabled
+                              ? 'bg-green-50 text-green-700 border-green-200'
+                              : 'bg-gray-100 text-gray-500 border-gray-200'
+                          }`}>
+                            {g.enabled ? 'active' : 'revoked'}
+                          </span>
+                          <span className="text-muted-foreground">granted {new Date(g.created_at).toLocaleDateString()}</span>
+                        </div>
+                        {g.allowed_prefixes?.length > 0 && (
+                          <div>
+                            <span className="text-muted-foreground">Allow: </span>
+                            {g.allowed_prefixes.map(p => (
+                              <code key={p} className="bg-white border border-violet-200 px-1 py-0.5 rounded mr-1">{p}</code>
+                            ))}
+                          </div>
+                        )}
+                        {g.denied_prefixes?.length > 0 && (
+                          <div>
+                            <span className="text-muted-foreground">Deny: </span>
+                            {g.denied_prefixes.map(p => (
+                              <code key={p} className="bg-white border border-red-200 px-1 py-0.5 rounded mr-1 text-red-700">{p}</code>
+                            ))}
+                          </div>
+                        )}
+                        {(!g.allowed_prefixes?.length && !g.denied_prefixes?.length) && (
+                          <span className="text-green-700">All virtual models allowed (no prefix restrictions)</span>
+                        )}
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs text-red-600 border-red-300 hover:bg-red-50 shrink-0"
+                        disabled={revokeMut.isPending || !g.enabled}
+                        onClick={() => revokeMut.mutate({ projectId: previewProjectId, pId: g.provider_id })}
+                      >
+                        Revoke
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!previewProjectId && (
+          <p className="text-xs text-muted-foreground">
+            Select a project to inspect its current access grants for this provider.
+          </p>
+        )}
       </div>
     </div>
   )
@@ -612,7 +1065,7 @@ function OverviewTab({ providerId }: { providerId: string }) {
 
 // ── Main provider detail page ──────────────────────────────────────────────────
 
-type Tab = 'overview' | 'catalog' | 'rules'
+type Tab = 'overview' | 'catalog' | 'rules' | 'access'
 
 export default function ProviderDetailPage() {
   const params = useParams()
@@ -629,10 +1082,13 @@ export default function ProviderDetailPage() {
     onError: (e: any) => toast({ title: 'Sync failed', description: e.message, variant: 'destructive' }),
   })
 
+  const isVirtual = p?.exposure_mode === 'catalog' || p?.exposure_mode === 'hybrid'
+
   const tabs: { key: Tab; label: string; icon: React.ElementType }[] = [
-    { key: 'overview', label: 'Overview', icon: Settings },
-    { key: 'catalog',  label: `Catalog (${p?.catalog_model_count ?? '…'})`, icon: Zap },
-    { key: 'rules',    label: 'Exposure Rules', icon: Shield },
+    { key: 'overview', label: 'Overview',                                              icon: Settings },
+    { key: 'catalog',  label: `Catalog (${p?.catalog_model_count ?? '…'})`,           icon: Zap },
+    { key: 'rules',    label: 'Exposure Rules',                                        icon: Shield },
+    { key: 'access',   label: 'Project Access',                                        icon: Users },
   ]
 
   return (
@@ -643,7 +1099,18 @@ export default function ProviderDetailPage() {
             <ArrowLeft className="w-4 h-4 mr-1" />Providers
           </Button>
           <div>
-            <h1 className="text-xl font-bold">{p?.display_name ?? id}</h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-xl font-bold">{p?.display_name ?? id}</h1>
+              {p?.exposure_mode && p.exposure_mode !== 'managed' && (
+                <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${
+                  p.exposure_mode === 'catalog'
+                    ? 'bg-violet-50 text-violet-700 border-violet-200'
+                    : 'bg-blue-50 text-blue-700 border-blue-200'
+                }`}>
+                  {p.exposure_mode}
+                </span>
+              )}
+            </div>
             <p className="text-xs text-muted-foreground font-mono">{p?.backend_type} · {p?.base_url}</p>
           </div>
         </div>
@@ -653,6 +1120,20 @@ export default function ProviderDetailPage() {
         </Button>
       </div>
 
+      {/* Prompt to switch to catalog/hybrid if still in managed mode */}
+      {p && !isVirtual && (
+        <div className="rounded-md bg-amber-50 border border-amber-200 px-4 py-2.5 text-xs text-amber-800 flex items-center gap-3">
+          <span>
+            This provider is in <strong>Managed</strong> mode. Switch to <strong>Catalog</strong> or <strong>Hybrid</strong>
+            in the Overview tab to enable project-level access and dynamic virtual models.
+          </span>
+          <Button size="sm" variant="outline" className="h-7 shrink-0 border-amber-400 text-amber-800 hover:bg-amber-100"
+            onClick={() => setTab('overview')}>
+            Go to Overview
+          </Button>
+        </div>
+      )}
+
       <div className="flex gap-0 border-b">
         {tabs.map(t => (
           <button key={t.key} onClick={() => setTab(t.key)}
@@ -660,14 +1141,23 @@ export default function ProviderDetailPage() {
               tab === t.key ? 'border-blue-600 text-blue-700' : 'border-transparent text-muted-foreground hover:text-foreground'
             }`}>
             <t.icon className="w-3.5 h-3.5" />{t.label}
+            {t.key === 'access' && isVirtual && (
+              <span className="ml-1 w-1.5 h-1.5 rounded-full bg-violet-500" title="Catalog/Hybrid mode active" />
+            )}
           </button>
         ))}
       </div>
 
       <div>
-        {tab === 'overview' && <OverviewTab providerId={id} />}
-        {tab === 'catalog'  && <CatalogTab  providerId={id} />}
-        {tab === 'rules'    && <RulesTab    providerId={id} />}
+        {tab === 'overview' && <OverviewTab    providerId={id} />}
+        {tab === 'catalog'  && <CatalogTab     providerId={id} />}
+        {tab === 'rules'    && <RulesTab        providerId={id} />}
+        {tab === 'access'   && (
+          <ProjectAccessTab
+            providerId={id}
+            providerName={p?.catalog_expose_prefix || p?.name || id}
+          />
+        )}
       </div>
     </div>
   )
