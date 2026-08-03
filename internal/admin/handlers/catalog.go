@@ -114,8 +114,35 @@ func (h *CatalogHandler) GetProvider(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + id})
 		return
 	}
-	p.APIKey = "" // never return key
-	c.JSON(http.StatusOK, p)
+	// Return the same snake_case shape as ListProviders — never the raw struct,
+	// which serialises Go field names as PascalCase and omits the api_key safely.
+	em := string(p.ExposureMode)
+	if em == "" {
+		em = "managed"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id":                    p.ID,
+		"name":                  p.Name,
+		"display_name":          p.DisplayName,
+		"backend_type":          p.BackendType,
+		"base_url":              p.BaseURL,
+		"api_key_set":           p.APIKey != "",
+		"exposure_mode":         em,
+		"catalog_sync_enabled":  p.CatalogSyncEnabled,
+		"catalog_sync_interval": p.CatalogSyncInterval,
+		"catalog_direct_expose": p.CatalogDirectExpose,
+		"catalog_expose_prefix": p.CatalogExposePrefix,
+		"catalog_last_synced_at": p.CatalogLastSyncedAt,
+		"catalog_model_count":   p.CatalogModelCount,
+		"catalog_sync_status":   p.CatalogSyncStatus,
+		"catalog_sync_error":    p.CatalogSyncError,
+		"proxy_url":             p.ProxyURL,
+		"enabled":               p.Enabled,
+		"health":                p.Health,
+		"last_health_check":     p.LastHealthCheck,
+		"created_at":            p.CreatedAt,
+		"updated_at":            p.UpdatedAt,
+	})
 }
 
 // CreateProvider handles POST /admin/v1/providers
