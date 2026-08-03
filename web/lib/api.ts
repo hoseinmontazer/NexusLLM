@@ -1,7 +1,9 @@
 // Typed API client — all calls go to /api/admin/* which Next.js proxies
-// to http://localhost:8081/admin/v1/*
+// to http://nexus-admin:8081/admin/v1/*
+// Gateway calls go to /api/gateway/* which proxies to http://nexus-gateway:8080/v1/*
 
 const BASE = '/api/admin'
+const GATEWAY = '/api/gateway'
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -15,6 +17,27 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     throw new Error(err.error ?? res.statusText)
   }
   // For 204 No Content or empty body responses, return undefined
+  const text = await res.text()
+  if (!text) return undefined as T
+  return JSON.parse(text) as T
+}
+
+// Gateway request — auth token is read from localStorage (set by the UI on login
+// or hardcoded in settings). Falls back to an empty token so the request still
+// reaches the gateway (which will return 401 if auth is truly missing).
+async function gatewayReq<T>(path: string, apiKey?: string): Promise<T> {
+  // Try to read the key from localStorage if not provided directly.
+  const key = apiKey
+    ?? (typeof window !== 'undefined' ? localStorage.getItem('nexus_api_key') ?? '' : '')
+  const res = await fetch(`${GATEWAY}${path}`, {
+    method: 'GET',
+    headers: key ? { 'Authorization': `Bearer ${key}` } : {},
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(text || res.statusText)
+  }
   const text = await res.text()
   if (!text) return undefined as T
   return JSON.parse(text) as T
@@ -555,6 +578,46 @@ export interface ExposureRule {
   deny_tags_raw?: string; priority: number; enabled: boolean
 }
 
+// ── Live provider model (raw shape from provider's /models endpoint) ─────────
+export interface ProviderLiveModel {
+  id: string
+  canonical_slug?: string
+  name?: string
+  description?: string
+  created?: number
+  context_length?: number
+  architecture?: {
+    modality?: string
+    input_modalities?: string[]
+    output_modalities?: string[]
+    tokenizer?: string
+    instruct_type?: string | null
+  }
+  pricing?: {
+    prompt?: string
+    completion?: string
+    input_cache_read?: string
+    input_cache_write?: string
+    image?: string
+  }
+  top_provider?: {
+    context_length?: number
+    max_completion_tokens?: number
+    is_moderated?: boolean
+  }
+  supported_parameters?: string[]
+  per_request_limits?: unknown
+  reasoning?: {
+    mandatory?: boolean
+    default_enabled?: boolean
+    supported_efforts?: string[]
+    default_effort?: string
+  }
+  hugging_face_id?: string | null
+  knowledge_cutoff?: string | null
+  expiration_date?: string | null
+}
+
 // ── Organisations ─────────────────────────────────────────────────────────────
 export const api = {
   orgs: {
@@ -1005,5 +1068,16 @@ export const api = {
       const qs = [from && `from=${from}`, to && `to=${to}`].filter(Boolean).join('&')
       return req<ProjectUsageSummary>('GET', `/projects/${projectId}/usage/summary${qs ? '?' + qs : ''}`)
     },
+  },
+
+  // ── Gateway passthrough (calls /v1/* on the inference server) ─────────────
+  // The API key must be provided or stored in localStorage as 'nexus_api_key'.
+  gateway: {
+    /** Fetch the provider's raw /models response via the gateway passthrough.
+     *  Returns exactly what the upstream provider returns — no transformation.
+     *  e.g. gateway.providerModels('openrouter') returns OpenRouter's full list. */
+    providerModels: (providerName: string, apiKey?: string) =>
+      gatewayReq<{ data: ProviderLiveModel[] }>(
+        `/providers/${providerName}/models`, apiKey),
   },
 }

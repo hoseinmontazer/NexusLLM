@@ -1,16 +1,17 @@
 'use client'
+'use client'
 
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type CatalogEntry, type ExposureRule, type ExposureMode, type ProjectProviderAccess } from '@/lib/api'
+import { api, type CatalogEntry, type ExposureRule, type ExposureMode, type ProjectProviderAccess, type ProviderLiveModel } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, RefreshCw, Zap, Search, CheckCircle2,
-  XCircle, Loader2, Settings, Shield, Eye, PackageCheck, Users,
+  XCircle, Loader2, Settings, Shield, Eye, PackageCheck, Users, Globe,
 } from 'lucide-react'
 
 // ── Capability badges ──────────────────────────────────────────────────────────
@@ -1063,9 +1064,219 @@ function ProjectAccessTab({ providerId, providerName }: { providerId: string; pr
   )
 }
 
+// ── Live Models tab ────────────────────────────────────────────────────────────
+// Calls GET /v1/providers/:name/models on the gateway and renders the raw
+// provider response — exactly what you'd get calling the provider directly.
+
+function LiveModelsTab({ providerName }: { providerName: string }) {
+  const [apiKey, setApiKey] = useState<string>(() =>
+    typeof window !== 'undefined' ? localStorage.getItem('nexus_api_key') ?? '' : ''
+  )
+  const [q, setQ] = useState('')
+
+  const saveKey = (k: string) => {
+    setApiKey(k)
+    if (typeof window !== 'undefined') localStorage.setItem('nexus_api_key', k)
+  }
+
+  const { data, isLoading, error, refetch, isFetching } = useQuery({
+    queryKey: ['provider-live-models', providerName, apiKey],
+    queryFn: () => api.gateway.providerModels(providerName, apiKey || undefined),
+    enabled: !!apiKey,
+    staleTime: 5 * 60 * 1000, // cache 5 min — provider catalog doesn't change often
+    retry: false,
+  })
+
+  const models = (data?.data ?? []).filter(m =>
+    !q || m.id.toLowerCase().includes(q.toLowerCase()) ||
+    (m.name ?? '').toLowerCase().includes(q.toLowerCase())
+  )
+
+  const fmtCtx = (n?: number) => n ? (n >= 1_000_000 ? (n/1_000_000).toFixed(1)+'M' : (n/1_000).toFixed(0)+'K') : '—'
+  const fmtPrice = (s?: string) => {
+    if (!s || s === '0') return '—'
+    const v = parseFloat(s)
+    if (isNaN(v)) return s
+    // Convert per-token → per-1M for readability
+    const perM = v * 1_000_000
+    return '$' + (perM < 0.01 ? perM.toExponential(2) : perM.toFixed(perM < 1 ? 3 : 2))
+  }
+
+  const modalityIcon = (mod?: string) => {
+    if (!mod) return null
+    if (mod.includes('image')) return '🖼'
+    if (mod.includes('audio') || mod.includes('video')) return '🎤'
+    return '💬'
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* API key input — needed because this calls the gateway, not the admin API */}
+      <div className="rounded-lg border bg-amber-50 border-amber-200 p-3 space-y-2">
+        <p className="text-xs font-semibold text-amber-900 flex items-center gap-1.5">
+          <Zap className="w-3.5 h-3.5" />Gateway API Key Required
+        </p>
+        <p className="text-xs text-amber-800">
+          This tab calls <code className="bg-amber-100 px-1 rounded">GET /v1/providers/{providerName}/models</code> on the
+          gateway server with your NexusLLM API key, which proxies the request through to the provider using the
+          configured proxy. Enter any active API key below.
+        </p>
+        <div className="flex gap-2">
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={e => saveKey(e.target.value)}
+            placeholder="nxs_…"
+            className="font-mono text-xs h-8 flex-1"
+          />
+          <Button size="sm" variant="outline" className="h-8 shrink-0"
+            disabled={!apiKey || isFetching}
+            onClick={() => refetch()}>
+            <RefreshCw className={`w-3 h-3 mr-1 ${isFetching ? 'animate-spin' : ''}`} />
+            {isFetching ? 'Loading…' : 'Fetch'}
+          </Button>
+        </div>
+      </div>
+
+      {/* Search */}
+      {data && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-1.5 border rounded-md px-2.5 h-8 bg-white text-xs flex-1 min-w-48">
+            <Search className="w-3 h-3 text-muted-foreground shrink-0" />
+            <input className="outline-none bg-transparent w-full" placeholder="filter models…"
+              value={q} onChange={e => setQ(e.target.value)} />
+          </div>
+          <span className="text-xs text-muted-foreground">
+            {models.length} / {data.data.length} models
+          </span>
+          <span className="text-xs text-green-700 font-medium">
+            ✓ Live from {providerName}
+          </span>
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-xs text-red-800">
+          <strong>Error:</strong> {(error as Error).message}
+          <p className="mt-1 opacity-70">Make sure the API key is valid and the gateway is reachable.</p>
+        </div>
+      )}
+
+      {/* Loading skeleton */}
+      {isLoading && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground py-8 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin" />Fetching from provider…
+        </div>
+      )}
+
+      {/* No key yet */}
+      {!apiKey && !isLoading && (
+        <div className="rounded-lg border bg-white p-10 text-center text-muted-foreground">
+          <Zap className="w-8 h-8 mx-auto mb-2 opacity-20" />
+          <p className="text-sm font-medium">Enter your NexusLLM API key above to load live models</p>
+        </div>
+      )}
+
+      {/* Model table */}
+      {models.length > 0 && (
+        <div className="rounded-lg border bg-white overflow-hidden">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-gray-50 border-b text-muted-foreground">
+                <th className="text-left px-3 py-2 font-medium">Model ID</th>
+                <th className="text-left px-3 py-2 font-medium">Name</th>
+                <th className="text-left px-3 py-2 font-medium">Modality</th>
+                <th className="text-left px-3 py-2 font-medium">Context</th>
+                <th className="text-left px-3 py-2 font-medium">$/1M in</th>
+                <th className="text-left px-3 py-2 font-medium">$/1M out</th>
+                <th className="text-left px-3 py-2 font-medium">Parameters</th>
+                <th className="text-left px-3 py-2 font-medium">Reasoning</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {models.map(m => (
+                <tr key={m.id} className="hover:bg-gray-50 transition-colors">
+                  <td className="px-3 py-2 font-mono text-[10px] max-w-[200px] truncate" title={m.id}>
+                    {m.id}
+                  </td>
+                  <td className="px-3 py-2 max-w-[160px]">
+                    <p className="font-medium truncate" title={m.name}>{m.name || m.id}</p>
+                    {m.description && (
+                      <p className="text-[10px] text-muted-foreground truncate max-w-[150px]" title={m.description}>
+                        {m.description}
+                      </p>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-lg" title={m.architecture?.modality}>
+                    {modalityIcon(m.architecture?.modality)}
+                    <span className="text-[9px] text-muted-foreground ml-0.5">{m.architecture?.modality}</span>
+                  </td>
+                  <td className="px-3 py-2 tabular-nums whitespace-nowrap">
+                    {fmtCtx(m.context_length)}
+                    {m.top_provider?.max_completion_tokens && (
+                      <div className="text-[9px] text-muted-foreground">out: {fmtCtx(m.top_provider.max_completion_tokens)}</div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 tabular-nums font-mono">{fmtPrice(m.pricing?.prompt)}</td>
+                  <td className="px-3 py-2 tabular-nums font-mono">{fmtPrice(m.pricing?.completion)}</td>
+                  <td className="px-3 py-2 max-w-[180px]">
+                    <div className="flex flex-wrap gap-0.5">
+                      {(m.supported_parameters ?? []).slice(0, 6).map(p => (
+                        <span key={p} className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-600 whitespace-nowrap">{p}</span>
+                      ))}
+                      {(m.supported_parameters?.length ?? 0) > 6 && (
+                        <span className="text-[9px] text-muted-foreground">+{(m.supported_parameters?.length ?? 0) - 6}</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2">
+                    {m.reasoning ? (
+                      <div className="space-y-0.5">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded-full border font-medium ${
+                          m.reasoning.mandatory
+                            ? 'bg-orange-50 text-orange-700 border-orange-200'
+                            : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                        }`}>
+                          {m.reasoning.mandatory ? 'required' : 'optional'}
+                        </span>
+                        {m.reasoning.default_effort && (
+                          <div className="text-[9px] text-muted-foreground">
+                            default: {m.reasoning.default_effort}
+                          </div>
+                        )}
+                        {(m.reasoning.supported_efforts ?? []).length > 0 && (
+                          <div className="flex flex-wrap gap-0.5 mt-0.5">
+                            {m.reasoning.supported_efforts!.map(e => (
+                              <span key={e} className="text-[8px] px-1 py-0.5 rounded bg-indigo-50 text-indigo-600">{e}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-[9px] text-muted-foreground">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Empty filter result */}
+      {data && models.length === 0 && q && (
+        <p className="text-sm text-muted-foreground text-center py-6">
+          No models match <strong>{q}</strong>
+        </p>
+      )}
+    </div>
+  )
+}
+
 // ── Main provider detail page ──────────────────────────────────────────────────
 
-type Tab = 'overview' | 'catalog' | 'rules' | 'access'
+type Tab = 'overview' | 'catalog' | 'rules' | 'access' | 'live'
 
 export default function ProviderDetailPage() {
   const params = useParams()
@@ -1089,6 +1300,7 @@ export default function ProviderDetailPage() {
     { key: 'catalog',  label: `Catalog (${p?.catalog_model_count ?? '…'})`,           icon: Zap },
     { key: 'rules',    label: 'Exposure Rules',                                        icon: Shield },
     { key: 'access',   label: 'Project Access',                                        icon: Users },
+    { key: 'live',     label: 'Live Models',                                           icon: Globe },
   ]
 
   return (
@@ -1157,6 +1369,9 @@ export default function ProviderDetailPage() {
             providerId={id}
             providerName={p?.catalog_expose_prefix || p?.name || id}
           />
+        )}
+        {tab === 'live' && (
+          <LiveModelsTab providerName={p?.name ?? id} />
         )}
       </div>
     </div>
