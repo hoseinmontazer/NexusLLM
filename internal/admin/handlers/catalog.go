@@ -968,9 +968,9 @@ func (h *CatalogHandler) BulkRegisterFromCatalog(c *gin.Context) {
 // They are orthogonal to team_model_permissions — the latter covers Public
 // Models (managed mode), while these cover the dynamic catalog path.
 
-// ListProjectProviderAccess handles GET /admin/v1/projects/:project_id/provider-access
+// ListProjectProviderAccess handles GET /admin/v1/projects/:id/provider-access
 func (h *CatalogHandler) ListProjectProviderAccess(c *gin.Context) {
-	projectID := c.Param("project_id")
+	projectID := c.Param("id")
 	store := catalog.NewProjectProviderAccessStore(h.db)
 	grants, err := store.ListForProject(c.Request.Context(), projectID)
 	if err != nil {
@@ -980,7 +980,7 @@ func (h *CatalogHandler) ListProjectProviderAccess(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": grants, "total": len(grants), "project_id": projectID})
 }
 
-// GrantProjectProviderAccess handles POST /admin/v1/projects/:project_id/provider-access
+// GrantProjectProviderAccess handles POST /admin/v1/projects/:id/provider-access
 //
 // Grants a project access to a provider's virtual catalog models.
 // Request body:
@@ -991,7 +991,7 @@ func (h *CatalogHandler) ListProjectProviderAccess(c *gin.Context) {
 //	  "denied_prefixes":  ["openrouter/openai/gpt-4-*"] // optional
 //	}
 func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
-	projectID := c.Param("project_id")
+	projectID := c.Param("id")
 	var in struct {
 		ProviderID      string   `json:"provider_id" binding:"required"`
 		AllowedPrefixes []string `json:"allowed_prefixes"`
@@ -1050,11 +1050,11 @@ func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
 	})
 }
 
-// UpdateProjectProviderAccess handles PUT /admin/v1/projects/:project_id/provider-access/:provider_id
+// UpdateProjectProviderAccess handles PUT /admin/v1/projects/:id/provider-access/:provider_id
 //
 // Updates the prefix filters on an existing grant.
 func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
-	projectID := c.Param("project_id")
+	projectID := c.Param("id")
 	providerID := c.Param("provider_id")
 	var in struct {
 		AllowedPrefixes []string `json:"allowed_prefixes"`
@@ -1091,9 +1091,9 @@ func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
 	})
 }
 
-// RevokeProjectProviderAccess handles DELETE /admin/v1/projects/:project_id/provider-access/:provider_id
+// RevokeProjectProviderAccess handles DELETE /admin/v1/projects/:id/provider-access/:provider_id
 func (h *CatalogHandler) RevokeProjectProviderAccess(c *gin.Context) {
-	projectID := c.Param("project_id")
+	projectID := c.Param("id")
 	providerID := c.Param("provider_id")
 	_, _ = h.db.ExecContext(c.Request.Context(),
 		`UPDATE project_provider_access SET enabled=FALSE, updated_at=NOW()
