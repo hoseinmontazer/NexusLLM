@@ -71,9 +71,9 @@ func (h *ProjectHandler) CreateProject(c *gin.Context) {
 		input.Status = "active"
 	}
 	switch input.Status {
-	case "active", "inactive", "archived":
+	case "active", "inactive", "archived", "pending":
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be one of: active, inactive, archived"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be one of: active, inactive, archived, pending"})
 		return
 	}
 
@@ -388,9 +388,9 @@ func (h *ProjectHandler) UpdateProject(c *gin.Context) {
 	}
 	if input.Status != nil {
 		switch *input.Status {
-		case "active", "inactive", "archived":
+		case "active", "inactive", "archived", "pending":
 		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be one of: active, inactive, archived"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be one of: active, inactive, archived, pending"})
 			return
 		}
 	}

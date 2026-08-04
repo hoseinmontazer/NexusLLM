@@ -295,7 +295,7 @@ export interface RegisterModelInput {
 }
 
 // ── Project types ─────────────────────────────────────────────────────────────
-export type ProjectStatus   = 'active' | 'inactive' | 'archived'
+export type ProjectStatus   = 'active' | 'inactive' | 'archived' | 'pending'
 export type AdmissionPolicy = 'queue' | 'preempt_then_queue' | 'reject'
 
 /** priority_weight is a continuous integer in [0, 1000]. Higher = scheduled sooner. */

@@ -14,13 +14,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { toast } from '@/components/ui/toaster'
 import { Plus, ChevronRight, FolderKanban, Shield, Zap } from 'lucide-react'
 
-const STATUSES: ProjectStatus[] = ['active', 'inactive', 'archived']
+const STATUSES: ProjectStatus[] = ['active', 'inactive', 'archived', 'pending']
 
 function StatusBadge({ status }: { status: ProjectStatus }) {
   const map: Record<ProjectStatus, string> = {
     active:   'bg-green-100 text-green-700',
     inactive: 'bg-yellow-100 text-yellow-700',
     archived: 'bg-gray-100 text-gray-500',
+    pending:  'bg-blue-100 text-blue-700',
   }
   return <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${map[status] ?? map.active}`}>{status}</span>
 }

@@ -22,6 +22,10 @@ ALTER TABLE projects
     ADD COLUMN IF NOT EXISTS expected_monthly_tokens BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS owner_user_id UUID;
 
+ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_status_check;
+ALTER TABLE projects ADD CONSTRAINT projects_status_check
+    CHECK (status IN ('active', 'inactive', 'archived', 'pending'));
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. project_access_requests
 -- ─────────────────────────────────────────────────────────────────────────────

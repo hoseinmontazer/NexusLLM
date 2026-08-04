@@ -18,9 +18,9 @@ CREATE TABLE IF NOT EXISTS projects (
     -- Priority tier: CRITICAL > HIGH > NORMAL > LOW > BEST_EFFORT
     priority        VARCHAR(20)  NOT NULL DEFAULT 'NORMAL'
                     CHECK (priority IN ('CRITICAL','HIGH','NORMAL','LOW','BEST_EFFORT')),
-    -- Status: active | inactive | archived
+    -- Status: active | inactive | archived | pending
     status          VARCHAR(20)  NOT NULL DEFAULT 'active'
-                    CHECK (status IN ('active','inactive','archived')),
+                    CHECK (status IN ('active','inactive','archived','pending')),
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     -- Name must be unique within a team
