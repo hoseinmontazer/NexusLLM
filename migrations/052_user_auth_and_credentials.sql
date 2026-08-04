@@ -28,11 +28,18 @@ BEGIN
             'Platform Administrator',
             'admin',
             -- bcrypt hash for password "admin123"
-            '$2a$10$w3V8Pj/7B0Tz0K5sZ8W2.O4e3V8Pj/7B0Tz0K5sZ8W2.O4e3V8Pj.',
+            '$2a$10$CWeP43NFxYSMK0nF.qt8EuQL.a2MhGYjekLxAeQ3XtfJsJewxWUXe',
             TRUE,
             NOW(),
             NOW()
         );
+    ELSE
+        -- Ensure default admin user has valid password_hash if previously seeded with placeholder/null
+        UPDATE users
+        SET password_hash = '$2a$10$CWeP43NFxYSMK0nF.qt8EuQL.a2MhGYjekLxAeQ3XtfJsJewxWUXe',
+            updated_at = NOW()
+        WHERE email = 'admin@nexusllm.io'
+          AND (password_hash IS NULL OR password_hash = '' OR password_hash = '$2a$10$w3V8Pj/7B0Tz0K5sZ8W2.O4e3V8Pj/7B0Tz0K5sZ8W2.O4e3V8Pj.');
     END IF;
 END $$;
 
