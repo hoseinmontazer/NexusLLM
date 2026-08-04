@@ -427,29 +427,31 @@ func main() {
 	a.POST("/portal/requests/:id/review", portalH.ReviewPortalAccessRequest)
 
 	// ── Developer Self-Service Portal (/portal/v1) ───────────────────────────
-	pGroup := r.Group("/portal/v1")
-	{
-		pGroup.POST("/auth/register", portalH.RegisterUser)
-		pGroup.POST("/auth/login", portalH.LoginUser)
+	registerPortalRoutes := func(g *gin.RouterGroup) {
+		g.POST("/auth/register", portalH.RegisterUser)
+		g.POST("/auth/login", portalH.LoginUser)
 
-		pGroup.POST("/projects", portalH.CreatePortalProject)
-		pGroup.GET("/projects", portalH.ListPortalProjects)
-		pGroup.GET("/projects/:id", portalH.GetPortalProject)
+		g.POST("/projects", portalH.CreatePortalProject)
+		g.GET("/projects", portalH.ListPortalProjects)
+		g.GET("/projects/:id", portalH.GetPortalProject)
 
-		pGroup.POST("/requests", portalH.CreateAccessRequest)
-		pGroup.GET("/requests", portalH.ListAccessRequests)
-		pGroup.GET("/requests/:id", portalH.GetAccessRequest)
-		pGroup.POST("/requests/:id/cancel", portalH.CancelAccessRequest)
+		g.POST("/requests", portalH.CreateAccessRequest)
+		g.GET("/requests", portalH.ListAccessRequests)
+		g.GET("/requests/:id", portalH.GetAccessRequest)
+		g.POST("/requests/:id/cancel", portalH.CancelAccessRequest)
 
-		pGroup.POST("/projects/:id/api-keys", portalH.CreatePortalAPIKey)
-		pGroup.POST("/api-keys/:key_id/rotate", portalH.RotatePortalAPIKey)
-		pGroup.DELETE("/api-keys/:key_id", portalH.DeletePortalAPIKey)
+		g.POST("/projects/:id/api-keys", portalH.CreatePortalAPIKey)
+		g.POST("/api-keys/:key_id/rotate", portalH.RotatePortalAPIKey)
+		g.DELETE("/api-keys/:key_id", portalH.DeletePortalAPIKey)
 
-		pGroup.GET("/models", portalH.GetPortalModels)
-		pGroup.GET("/usage", portalH.GetPortalUsage)
-		pGroup.GET("/notifications", portalH.GetPortalNotifications)
-		pGroup.POST("/notifications/:id/read", portalH.MarkNotificationRead)
+		g.GET("/models", portalH.GetPortalModels)
+		g.GET("/usage", portalH.GetPortalUsage)
+		g.GET("/notifications", portalH.GetPortalNotifications)
+		g.POST("/notifications/:id/read", portalH.MarkNotificationRead)
 	}
+
+	registerPortalRoutes(r.Group("/portal/v1"))
+	registerPortalRoutes(a.Group("/portal/v1"))
 
 	// ── Agent API (called by node agents, not human operators) ────────────────
 	// Registration does NOT require auth (bootstrapping)

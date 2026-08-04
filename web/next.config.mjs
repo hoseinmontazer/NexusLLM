@@ -13,6 +13,14 @@ const nextConfig = {
         source: '/api/admin/:path*',
         destination: 'http://nexus-admin:8081/admin/v1/:path*',
       },
+      {
+        source: '/portal/v1/:path*',
+        destination: 'http://nexus-admin:8081/portal/v1/:path*',
+      },
+      {
+        source: '/admin/v1/:path*',
+        destination: 'http://nexus-admin:8081/admin/v1/:path*',
+      },
     ]
   },
 }
