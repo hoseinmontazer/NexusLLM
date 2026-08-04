@@ -52,12 +52,29 @@ func NewPortalHandler(
 	}
 }
 
+func (h *PortalHandler) getAuthOrgID(c *gin.Context) string {
+	header := c.GetHeader("Authorization")
+	if header != "" && strings.HasPrefix(header, "Bearer ") {
+		tokenStr := strings.TrimPrefix(header, "Bearer ")
+		if h.authSvc != nil {
+			claims, err := h.authSvc.ValidateJWT(c.Request.Context(), tokenStr)
+			if err == nil && claims != nil && claims.OrgID != "" {
+				return claims.OrgID
+			}
+		}
+	}
+	if orgID := c.Query("org_id"); orgID != "" {
+		return orgID
+	}
+	return c.GetHeader("X-Organization-ID")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Developer Project Management
 // ─────────────────────────────────────────────────────────────────────────────
 
 type CreatePortalProjectInput struct {
-	OrganizationID          string `json:"organization_id" binding:"required"`
+	OrganizationID          string `json:"organization_id"`
 	TeamID                  string `json:"team_id"`
 	Name                    string `json:"name"            binding:"required"`
 	Description             string `json:"description"`
@@ -71,6 +88,13 @@ func (h *PortalHandler) CreatePortalProject(c *gin.Context) {
 	var in CreatePortalProjectInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if authOrg := h.getAuthOrgID(c); authOrg != "" {
+		in.OrganizationID = authOrg
+	}
+	if in.OrganizationID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization_id is required"})
 		return
 	}
 	if len(in.Name) > 200 {
@@ -136,7 +160,7 @@ func (h *PortalHandler) CreatePortalProject(c *gin.Context) {
 
 // ListPortalProjects handles GET /portal/v1/projects
 func (h *PortalHandler) ListPortalProjects(c *gin.Context) {
-	orgID := c.Query("org_id")
+	orgID := h.getAuthOrgID(c)
 	teamID := c.Query("team_id")
 
 	query := `
@@ -176,6 +200,7 @@ func (h *PortalHandler) ListPortalProjects(c *gin.Context) {
 // GetPortalProject handles GET /portal/v1/projects/:id
 func (h *PortalHandler) GetPortalProject(c *gin.Context) {
 	id := c.Param("id")
+	authOrg := h.getAuthOrgID(c)
 	var proj struct {
 		ID                      string    `db:"id"                        json:"id"`
 		OrganizationID          string    `db:"organization_id"           json:"organization_id"`
@@ -197,7 +222,7 @@ func (h *PortalHandler) GetPortalProject(c *gin.Context) {
 		       COALESCE(expected_monthly_requests, 0) AS expected_monthly_requests,
 		       COALESCE(expected_monthly_tokens, 0) AS expected_monthly_tokens,
 		       created_at, updated_at
-		FROM projects WHERE id = $1`, id)
+		FROM projects WHERE id = $1 AND ($2 = '' OR organization_id::text = $2)`, id, authOrg)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
 		return
@@ -273,7 +298,7 @@ func (h *PortalHandler) CreateAccessRequest(c *gin.Context) {
 // ListAccessRequests handles GET /portal/v1/requests
 func (h *PortalHandler) ListAccessRequests(c *gin.Context) {
 	projID := c.Query("project_id")
-	orgID := c.Query("org_id")
+	orgID := h.getAuthOrgID(c)
 
 	var rows []struct {
 		ID                  string    `db:"id"                    json:"id"`
@@ -592,6 +617,7 @@ func (h *PortalHandler) CreatePortalAPIKey(c *gin.Context) {
 		return
 	}
 
+	authOrg := h.getAuthOrgID(c)
 	var proj struct {
 		TeamID         string `db:"team_id"`
 		OrgID          string `db:"organization_id"`
@@ -599,9 +625,9 @@ func (h *PortalHandler) CreatePortalAPIKey(c *gin.Context) {
 		PriorityWeight int    `db:"priority_weight"`
 	}
 	if err := h.db.GetContext(c.Request.Context(), &proj,
-		`SELECT team_id::text, organization_id::text, name, priority_weight FROM projects WHERE id = $1 AND status = 'active'`,
-		projID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "active project not found"})
+		`SELECT team_id::text, organization_id::text, name, priority_weight FROM projects WHERE id = $1 AND ($2 = '' OR organization_id::text = $2)`,
+		projID, authOrg); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
 		return
 	}
 

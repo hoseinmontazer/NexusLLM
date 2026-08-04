@@ -11,11 +11,18 @@ interface AccessRequest {
   business_use_case: string;
   expected_rpm: number;
   expected_tpm: number;
-  created_at: string;
+  created_at?: string;
+}
+
+interface ProjectOption {
+  id: string;
+  name: string;
+  environment: string;
 }
 
 export default function AccessRequestsPage() {
   const [requests, setRequests] = useState<AccessRequest[]>([]);
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Form state
@@ -28,12 +35,23 @@ export default function AccessRequestsPage() {
   const [submitting, setSubmitting] = useState(false);
   const [successMsg, setSuccessMsg] = useState('');
 
-  const fetchRequests = async () => {
+  const fetchRequestsAndProjects = async () => {
     try {
-      const res = await fetch('/portal/v1/requests');
-      if (res.ok) {
-        const data = await res.json();
+      const [reqRes, projRes] = await Promise.all([
+        fetch('/portal/v1/requests'),
+        fetch('/portal/v1/projects')
+      ]);
+      if (reqRes.ok) {
+        const data = await reqRes.json();
         setRequests(data.data || []);
+      }
+      if (projRes.ok) {
+        const pData = await projRes.json();
+        const pList = pData.data || [];
+        setProjects(pList);
+        if (pList.length > 0 && !projectId) {
+          setProjectId(pList[0].id);
+        }
       }
     } catch (e) {
       console.error(e);
@@ -43,7 +61,7 @@ export default function AccessRequestsPage() {
   };
 
   useEffect(() => {
-    fetchRequests();
+    fetchRequestsAndProjects();
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -55,7 +73,7 @@ export default function AccessRequestsPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          project_id: projectId || 'demo-project-id',
+          project_id: projectId || (projects.length > 0 ? projects[0].id : 'demo-project-id'),
           requested_models: selectedModels,
           requested_providers: selectedProviders,
           business_use_case: useCase,
@@ -65,7 +83,7 @@ export default function AccessRequestsPage() {
       });
       if (res.ok) {
         setSuccessMsg('Access Request submitted successfully! Sent to Admin Review Queue.');
-        fetchRequests();
+        fetchRequestsAndProjects();
       }
     } catch (e) {
       console.error(e);
@@ -88,15 +106,30 @@ export default function AccessRequestsPage() {
         )}
         <form onSubmit={handleSubmit} style={{ display: 'grid', gap: '20px' }}>
           <div>
-            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Target Project ID</label>
-            <input
-              type="text"
-              value={projectId}
-              onChange={(e) => setProjectId(e.target.value)}
-              placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000"
-              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
-              required
-            />
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Target Project</label>
+            {projects.length > 0 ? (
+              <select
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+                required
+              >
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.environment}) — {p.id.slice(0, 8)}...
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+                placeholder="Enter Project ID or create a project first..."
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+                required
+              />
+            )}
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>

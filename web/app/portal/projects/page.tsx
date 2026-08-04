@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { useAuth } from '@/lib/auth-context';
 
 interface ProjectItem {
   id: string;
@@ -13,6 +14,7 @@ interface ProjectItem {
 }
 
 export default function PortalProjectsPage() {
+  const { user } = useAuth();
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -25,9 +27,16 @@ export default function PortalProjectsPage() {
   const [expectedTokens, setExpectedTokens] = useState(5000000);
   const [creating, setCreating] = useState(false);
 
+  useEffect(() => {
+    if (user?.org_id) {
+      setOrgId(user.org_id);
+    }
+  }, [user]);
+
   const fetchProjects = async () => {
     try {
-      const res = await fetch('/portal/v1/projects');
+      const url = user?.org_id ? `/portal/v1/projects?org_id=${user.org_id}` : '/portal/v1/projects';
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
         setProjects(data.data || []);
@@ -41,17 +50,18 @@ export default function PortalProjectsPage() {
 
   useEffect(() => {
     fetchProjects();
-  }, []);
+  }, [user]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setCreating(true);
+    const targetOrgId = orgId || user?.org_id || 'default-org-id';
     try {
       const res = await fetch('/portal/v1/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          organization_id: orgId || 'demo-org-id',
+          organization_id: targetOrgId,
           name: name,
           description: description,
           environment: environment,
@@ -75,25 +85,28 @@ export default function PortalProjectsPage() {
     <div style={{ minHeight: '100vh', background: '#0b0f19', color: '#f8fafc', fontFamily: 'Inter, sans-serif', padding: '32px 48px' }}>
       <h1 style={{ fontSize: '24px', fontWeight: 700, marginBottom: '8px' }}>Developer Projects & Environment Management</h1>
       <p style={{ color: '#94a3b8', fontSize: '14px', marginBottom: '32px' }}>
-        Organize your applications by environment (Development, Staging, Production), track monthly token expectations, and request access.
+        Organize your applications by environment (Development, Staging, Production), track monthly token expectations, and request model access.
       </p>
+
+      {/* User Org Context Banner */}
+      {user && (
+        <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: '12px', padding: '16px 24px', marginBottom: '28px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <span style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 600 }}>Logged in as: </span>
+            <span style={{ color: '#60a5fa', fontWeight: 600, fontSize: '14px' }}>{user.email}</span>
+          </div>
+          <div style={{ background: '#0f172a', border: '1px solid #334155', padding: '6px 14px', borderRadius: '8px', fontSize: '13px' }}>
+            <span style={{ color: '#94a3b8' }}>Organization ID: </span>
+            <span style={{ color: '#a855f7', fontFamily: 'monospace', fontWeight: 600 }}>{user.org_id || 'Default Org'}</span>
+          </div>
+        </div>
+      )}
 
       {/* Project Form */}
       <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: '12px', padding: '28px', marginBottom: '40px' }}>
         <h2 style={{ fontSize: '18px', fontWeight: 600, marginTop: 0, marginBottom: '16px' }}>Create New Project</h2>
         <form onSubmit={handleCreate} style={{ display: 'grid', gap: '20px' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-            <div>
-              <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Organization ID</label>
-              <input
-                type="text"
-                value={orgId}
-                onChange={(e) => setOrgId(e.target.value)}
-                placeholder="Organization ID..."
-                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
-                required
-              />
-            </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '20px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Project Name</label>
               <input
@@ -105,9 +118,6 @@ export default function PortalProjectsPage() {
                 required
               />
             </div>
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '20px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Environment</label>
               <select
@@ -120,6 +130,9 @@ export default function PortalProjectsPage() {
                 <option value="production">Production</option>
               </select>
             </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Expected Monthly Reqs</label>
               <input

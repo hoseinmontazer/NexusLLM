@@ -1,8 +1,15 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+
+interface ProjectOption {
+  id: string;
+  name: string;
+  environment: string;
+}
 
 export default function PortalUsagePage() {
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [projectId, setProjectId] = useState('');
   const [usageData, setUsageData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -23,6 +30,31 @@ export default function PortalUsagePage() {
     }
   };
 
+  useEffect(() => {
+    const fetchProjects = async () => {
+      try {
+        const res = await fetch('/portal/v1/projects');
+        if (res.ok) {
+          const data = await res.json();
+          const list = data.data || [];
+          setProjects(list);
+          if (list.length > 0) {
+            setProjectId(list[0].id);
+            handleFetchUsage(list[0].id);
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+    fetchProjects();
+  }, []);
+
+  const handleProjectChange = (pid: string) => {
+    setProjectId(pid);
+    handleFetchUsage(pid);
+  };
+
   return (
     <div style={{ minHeight: '100vh', background: '#0b0f19', color: '#f8fafc', fontFamily: 'Inter, sans-serif', padding: '32px 48px' }}>
       <h1 style={{ fontSize: '24px', fontWeight: 700, marginBottom: '8px' }}>Developer Usage & Quota Analytics</h1>
@@ -32,14 +64,28 @@ export default function PortalUsagePage() {
 
       <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: '12px', padding: '24px', marginBottom: '32px', display: 'flex', gap: '16px', alignItems: 'end' }}>
         <div style={{ flex: 1 }}>
-          <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Project ID</label>
-          <input
-            type="text"
-            value={projectId}
-            onChange={(e) => setProjectId(e.target.value)}
-            placeholder="Enter Project ID..."
-            style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
-          />
+          <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Select Project</label>
+          {projects.length > 0 ? (
+            <select
+              value={projectId}
+              onChange={(e) => handleProjectChange(e.target.value)}
+              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+            >
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name} ({p.environment}) — {p.id.slice(0, 8)}...
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              value={projectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              placeholder="Enter Project ID..."
+              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+            />
+          )}
         </div>
         <button
           onClick={() => handleFetchUsage(projectId)}

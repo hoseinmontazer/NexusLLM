@@ -1,20 +1,47 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+
+interface ProjectOption {
+  id: string;
+  name: string;
+  environment: string;
+}
 
 export default function DeveloperAPIKeysPage() {
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [projectId, setProjectId] = useState('');
   const [keyName, setKeyName] = useState('');
   const [createdSecret, setCreatedSecret] = useState<string | null>(null);
   const [rotatedSecret, setRotatedSecret] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    const fetchProjects = async () => {
+      try {
+        const res = await fetch('/portal/v1/projects');
+        if (res.ok) {
+          const data = await res.json();
+          const list = data.data || [];
+          setProjects(list);
+          if (list.length > 0 && !projectId) {
+            setProjectId(list[0].id);
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+    fetchProjects();
+  }, []);
+
   const handleCreateKey = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setCreatedSecret(null);
+    const targetProjId = projectId || (projects.length > 0 ? projects[0].id : 'demo-project-id');
     try {
-      const res = await fetch(`/portal/v1/projects/${projectId || 'demo-project-id'}/api-keys`, {
+      const res = await fetch(`/portal/v1/projects/${targetProjId}/api-keys`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: keyName || 'Developer Key' }),
@@ -22,6 +49,7 @@ export default function DeveloperAPIKeysPage() {
       if (res.ok) {
         const data = await res.json();
         setCreatedSecret(data.api_key_secret);
+        setKeyName('');
       }
     } catch (err) {
       console.error(err);
@@ -83,15 +111,30 @@ export default function DeveloperAPIKeysPage() {
         <h2 style={{ fontSize: '18px', fontWeight: 600, marginTop: 0, marginBottom: '16px' }}>Create Additional API Key</h2>
         <form onSubmit={handleCreateKey} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '16px', alignItems: 'end' }}>
           <div>
-            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Project ID</label>
-            <input
-              type="text"
-              value={projectId}
-              onChange={(e) => setProjectId(e.target.value)}
-              placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000"
-              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
-              required
-            />
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Target Project</label>
+            {projects.length > 0 ? (
+              <select
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+                required
+              >
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.environment}) — {p.id.slice(0, 8)}...
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+                placeholder="Enter Project ID or create a project first..."
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: '8px', fontSize: '14px' }}
+                required
+              />
+            )}
           </div>
           <div>
             <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: '#94a3b8', marginBottom: '6px' }}>Key Label / Name</label>
