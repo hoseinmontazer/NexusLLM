@@ -17,6 +17,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -102,11 +103,11 @@ type ProviderTransportConfig struct {
 func DefaultProviderTransportConfig() ProviderTransportConfig {
 	return ProviderTransportConfig{
 		ConnectTimeoutSeconds:        10,
-		ReadTimeoutSeconds:           0,  // streaming-safe; use context deadline
+		ReadTimeoutSeconds:           0, // streaming-safe; use context deadline
 		IdleConnTimeoutSeconds:       90,
 		ResponseHeaderTimeoutSeconds: 30,
 		MaxIdleConnsPerHost:          32,
-		MaxConnsPerHost:              0,  // unlimited
+		MaxConnsPerHost:              0, // unlimited
 		DisableHTTP2:                 false,
 	}
 }
@@ -257,13 +258,35 @@ func (rt *readTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// Non-streaming: add a deadline if the context does not already have one
 	// that is tighter than readTimeout.
 	ctx := req.Context()
+	var cancel context.CancelFunc
 	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > rt.readTimeout {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, rt.readTimeout)
-		defer cancel()
 		req = req.WithContext(ctx)
 	}
-	return rt.wrapped.RoundTrip(req)
+
+	resp, err := rt.wrapped.RoundTrip(req)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, err
+	}
+
+	if cancel != nil && resp != nil && resp.Body != nil {
+		resp.Body = &readTimeoutBody{ReadCloser: resp.Body, cancel: cancel}
+	}
+	return resp, nil
+}
+
+type readTimeoutBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *readTimeoutBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

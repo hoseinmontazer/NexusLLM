@@ -57,7 +57,7 @@ func (b *cpuNativeBackend) ContainerPort() int { return 0 }
 //   - PORT         — generic convention (PaaS, gunicorn, hypercorn)
 //   - HTTP_PORT    — used by some custom server wrappers
 //   - UVICORN_PORT — read by faster-whisper-server and most uvicorn-based
-//                    Python AI servers (the most common cpu_native runtime)
+//     Python AI servers (the most common cpu_native runtime)
 //
 // All three are set to the same allocated host port so whichever variable the
 // server image reads, it binds to the correct port.

@@ -25,7 +25,7 @@ type RemoteModel struct {
 	OutputCostPer1M    *float64
 	ProviderInputCost  *float64
 	ProviderOutputCost *float64
-	SupportsStreaming   bool
+	SupportsStreaming  bool
 	SupportsTools      bool
 	SupportsVision     bool
 	SupportsAudio      bool
@@ -34,15 +34,16 @@ type RemoteModel struct {
 	SupportsImages     bool
 	SupportsJsonMode   bool
 	Tags               []string
-	Metadata          map[string]interface{}
+	Metadata           map[string]interface{}
 }
 
 // CatalogSyncer synchronizes provider catalogs into provider_remote_models.
 type CatalogSyncer struct {
-	db      *sqlx.DB
-	store   *ProviderStore
-	factory *runtime.Factory
-	log     *zap.Logger
+	db       *sqlx.DB
+	store    *ProviderStore
+	factory  *runtime.Factory
+	resolver *VirtualModelResolver
+	log      *zap.Logger
 }
 
 // NewCatalogSyncer constructs a CatalogSyncer.
@@ -53,6 +54,12 @@ func NewCatalogSyncer(db *sqlx.DB, factory *runtime.Factory, log *zap.Logger) *C
 		factory: factory,
 		log:     log,
 	}
+}
+
+// WithResolver attaches a VirtualModelResolver so cache is invalidated after sync.
+func (s *CatalogSyncer) WithResolver(r *VirtualModelResolver) *CatalogSyncer {
+	s.resolver = r
+	return s
 }
 
 // SyncProvider performs an immediate catalog sync for one provider.
@@ -93,6 +100,9 @@ func (s *CatalogSyncer) SyncProvider(ctx context.Context, providerID string) err
 		p.ID).Scan(&count)
 
 	_ = s.store.UpdateSyncStatus(ctx, p.ID, "ok", "", count)
+	if s.resolver != nil {
+		s.resolver.Invalidate()
+	}
 	s.log.Info("catalog sync complete",
 		zap.String("provider", p.Name),
 		zap.Int("models", len(models)),
@@ -106,22 +116,16 @@ func (s *CatalogSyncer) SyncProvider(ctx context.Context, providerID string) err
 // the Backend.Models() method, which does not accept an api key parameter.
 func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *http.Client) ([]RemoteModel, error) {
 	// Determine the correct models URL based on backend type.
-	// These mirror the path logic in each provider's Models() implementation.
-	modelsURL := p.BaseURL
+	path := "/v1/models"
 	switch runtime.BackendType(p.BackendType) {
 	case runtime.BackendOpenRouter:
-		// OpenRouter: /api/v1/models
-		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/api/v1/models"
+		path = "/api/v1/models"
 	case runtime.BackendGroq:
-		// Groq: /openai/v1/models
-		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/openai/v1/models"
+		path = "/openai/v1/models"
 	case runtime.BackendGemini:
-		// Gemini: /v1beta/openai/models
-		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/v1beta/openai/models"
-	default:
-		// All others: standard /v1/models
-		modelsURL = strings.TrimSuffix(p.BaseURL, "/") + "/v1/models"
+		path = "/v1beta/openai/models"
 	}
+	modelsURL := runtime.NormalizeProviderEndpointURL(p.BaseURL, path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
@@ -155,14 +159,14 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 
 	type modelListResponse struct {
 		Data []struct {
-			ID          string  `json:"id"`
-			Object      string  `json:"object"`
-			Created     int64   `json:"created"`
-			OwnedBy     string  `json:"owned_by"`
-			Name        string  `json:"name"`
-			Description string  `json:"description"`
+			ID          string `json:"id"`
+			Object      string `json:"object"`
+			Created     int64  `json:"created"`
+			OwnedBy     string `json:"owned_by"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
 			// OpenRouter and similar providers return rich metadata.
-			ContextLength *int   `json:"context_length"`
+			ContextLength *int `json:"context_length"`
 			Architecture  *struct {
 				Modality         string   `json:"modality"`
 				InputModalities  []string `json:"input_modalities"`
@@ -178,13 +182,13 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 				Image           string `json:"image"`
 			} `json:"pricing"`
 			TopProvider *struct {
-				ContextLength       *int  `json:"context_length"`
-				MaxCompletionTokens *int  `json:"max_completion_tokens"`
-				IsModerated         bool  `json:"is_moderated"`
+				ContextLength       *int `json:"context_length"`
+				MaxCompletionTokens *int `json:"max_completion_tokens"`
+				IsModerated         bool `json:"is_moderated"`
 			} `json:"top_provider"`
-			SupportedParameters []string               `json:"supported_parameters"`
-			HuggingFaceID       *string                `json:"hugging_face_id"`
-			CanonicalSlug       string                 `json:"canonical_slug"`
+			SupportedParameters []string `json:"supported_parameters"`
+			HuggingFaceID       *string  `json:"hugging_face_id"`
+			CanonicalSlug       string   `json:"canonical_slug"`
 		} `json:"data"`
 	}
 	var list modelListResponse
@@ -198,11 +202,11 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 		// (OpenRouter provides it explicitly), otherwise fall back to safe
 		// defaults. This avoids the forbidden pattern of inferring capabilities
 		// from model name strings.
-		supportsVision    := false
-		supportsAudio     := false
+		supportsVision := false
+		supportsAudio := false
 		supportsEmbedding := false
-		supportsImageGen  := false
-		description       := m.Description
+		supportsImageGen := false
+		description := m.Description
 		if description == "" {
 			description = m.Name
 		}
@@ -228,7 +232,7 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 		}
 
 		// Derive supports_tools from supported_parameters when available.
-		supportsTools    := false
+		supportsTools := false
 		supportsJsonMode := false
 		supportsReasoning := false
 		for _, param := range m.SupportedParameters {
@@ -270,19 +274,19 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 		}
 
 		rm := RemoteModel{
-			ProviderModelID:   m.ID,
-			DisplayName:       displayName,
-			Description:       description,
-			ContextLength:     ctxLen,
-			MaxOutputTokens:   maxOutput,
-			InputCostPer1M:    inputCost,
-			OutputCostPer1M:   outputCost,
-			ProviderInputCost: inputCost,
+			ProviderModelID:    m.ID,
+			DisplayName:        displayName,
+			Description:        description,
+			ContextLength:      ctxLen,
+			MaxOutputTokens:    maxOutput,
+			InputCostPer1M:     inputCost,
+			OutputCostPer1M:    outputCost,
+			ProviderInputCost:  inputCost,
 			ProviderOutputCost: outputCost,
 			// SupportsStreaming defaults true — every chat model supports SSE.
 			// The ON CONFLICT … DO UPDATE in upsertCatalog preserves existing
 			// values so hand-edited flags are never clobbered on re-sync.
-			SupportsStreaming:  true,
+			SupportsStreaming: true,
 			SupportsTools:     supportsTools,
 			SupportsVision:    supportsVision,
 			SupportsAudio:     supportsAudio,

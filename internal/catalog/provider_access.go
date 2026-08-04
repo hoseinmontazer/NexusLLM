@@ -31,8 +31,8 @@ type ProjectProviderAccess struct {
 	ID              string    `db:"id"`
 	ProjectID       string    `db:"project_id"`
 	ProviderID      string    `db:"provider_id"`
-	ProviderName    string    `db:"provider_name"`   // joined from providers
-	ExposureMode    string    `db:"exposure_mode"`   // joined from providers
+	ProviderName    string    `db:"provider_name"`    // joined from providers
+	ExposureMode    string    `db:"exposure_mode"`    // joined from providers
 	AllowedPrefixes []string  `db:"allowed_prefixes"` // empty = allow all
 	DeniedPrefixes  []string  `db:"denied_prefixes"`  // empty = deny none
 	Enabled         bool      `db:"enabled"`
@@ -106,7 +106,7 @@ func (r *projectProviderAccessRow) toAccess() ProjectProviderAccess {
 		ProviderName: r.ProviderName, ExposureMode: r.ExposureMode,
 		AllowedPrefixes: []string(r.AllowedPrefixes),
 		DeniedPrefixes:  []string(r.DeniedPrefixes),
-		Enabled: r.Enabled, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		Enabled:         r.Enabled, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 }
 

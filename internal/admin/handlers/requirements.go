@@ -31,17 +31,17 @@ func NewRequirementsHandler(db *sqlx.DB) *RequirementsHandler {
 func (h *RequirementsHandler) UpsertRequirements(c *gin.Context) {
 	modelID := c.Param("id")
 	var input struct {
-		ExecutionType     string `json:"execution_type"`   // GPU | CPU | ANY
-		RequiredVRAMMB    int64  `json:"required_vram_mb"`
-		GPUCount          int    `json:"gpu_count"`
-		RequiredCPU       int    `json:"required_cpu"`
-		RequiredMemoryMB  int64  `json:"required_memory_mb"`
-		RequiresDocker    bool   `json:"requires_docker"`
-		RequiresGPU       bool   `json:"requires_gpu"`
-		RequiresVLLM      bool   `json:"requires_vllm"`
-		RequiresTTS       bool   `json:"requires_tts"`
-		RequiresWhisper   bool   `json:"requires_whisper"`
-		Priority          string `json:"priority"`
+		ExecutionType    string `json:"execution_type"` // GPU | CPU | ANY
+		RequiredVRAMMB   int64  `json:"required_vram_mb"`
+		GPUCount         int    `json:"gpu_count"`
+		RequiredCPU      int    `json:"required_cpu"`
+		RequiredMemoryMB int64  `json:"required_memory_mb"`
+		RequiresDocker   bool   `json:"requires_docker"`
+		RequiresGPU      bool   `json:"requires_gpu"`
+		RequiresVLLM     bool   `json:"requires_vllm"`
+		RequiresTTS      bool   `json:"requires_tts"`
+		RequiresWhisper  bool   `json:"requires_whisper"`
+		Priority         string `json:"priority"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

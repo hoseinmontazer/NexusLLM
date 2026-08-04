@@ -21,12 +21,12 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
 	"github.com/nexusllm/nexusllm/internal/middleware"
 	"github.com/nexusllm/nexusllm/internal/models"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
-	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/runtimemgr"
 	"github.com/nexusllm/nexusllm/internal/thinking"
@@ -709,7 +709,18 @@ func (h *Handler) Models(c *gin.Context) {
 	// Models — filtered to those currently routable in the registry.
 	seen := make(map[string]bool)
 	var data []models.ModelObject
-	for _, modelName := range claims.Permissions {
+	allowedModels := claims.Permissions
+	if len(allowedModels) == 0 && (claims.OrgID != "" || claims.TeamID != "") && h.db != nil {
+		_ = h.db.SelectContext(c.Request.Context(), &allowedModels, `
+			SELECT DISTINCT m.name
+			FROM models m
+			LEFT JOIN team_model_permissions tmp ON tmp.model_id = m.id
+			LEFT JOIN teams t ON t.id = tmp.team_id
+			WHERE m.enabled = TRUE
+			  AND (t.org_id = $1 OR tmp.team_id = $2 OR $1 = '')`,
+			claims.OrgID, claims.TeamID)
+	}
+	for _, modelName := range allowedModels {
 		created, ok := modelCreatedAt[modelName]
 		if !ok {
 			if !registered[modelName] {
@@ -737,29 +748,29 @@ func (h *Handler) Models(c *gin.Context) {
 		// pricing, architecture and supported_parameters — the same fields
 		// OpenRouter returns on its /api/v1/models endpoint.
 		type metaRow struct {
-			ProviderID          string   `db:"provider_id"`
-			ProviderModelID     string   `db:"provider_model_id"`
-			DisplayName         string   `db:"display_name"`
-			Description         string   `db:"description"`
-			ContextLength       *int     `db:"context_length"`
-			MaxOutputTokens     *int     `db:"max_output_tokens"`
-			InputCostPer1M      *float64 `db:"input_cost_per_1m"`
-			OutputCostPer1M     *float64 `db:"output_cost_per_1m"`
-			ProviderInputCost   *float64 `db:"provider_input_cost"`
-			ProviderOutputCost  *float64 `db:"provider_output_cost"`
-			SupportsStreaming    bool     `db:"supports_streaming"`
-			SupportsTools       bool     `db:"supports_tools"`
-			SupportsVision      bool     `db:"supports_vision"`
-			SupportsAudio       bool     `db:"supports_audio"`
-			SupportsEmbedding   bool     `db:"supports_embeddings"`
-			SupportsReasoning   bool     `db:"supports_reasoning"`
-			SupportsJsonMode    bool     `db:"supports_json_mode"`
-			ServiceType         string   `db:"service_type"`
+			ProviderID         string   `db:"provider_id"`
+			ProviderModelID    string   `db:"provider_model_id"`
+			DisplayName        string   `db:"display_name"`
+			Description        string   `db:"description"`
+			ContextLength      *int     `db:"context_length"`
+			MaxOutputTokens    *int     `db:"max_output_tokens"`
+			InputCostPer1M     *float64 `db:"input_cost_per_1m"`
+			OutputCostPer1M    *float64 `db:"output_cost_per_1m"`
+			ProviderInputCost  *float64 `db:"provider_input_cost"`
+			ProviderOutputCost *float64 `db:"provider_output_cost"`
+			SupportsStreaming  bool     `db:"supports_streaming"`
+			SupportsTools      bool     `db:"supports_tools"`
+			SupportsVision     bool     `db:"supports_vision"`
+			SupportsAudio      bool     `db:"supports_audio"`
+			SupportsEmbedding  bool     `db:"supports_embeddings"`
+			SupportsReasoning  bool     `db:"supports_reasoning"`
+			SupportsJsonMode   bool     `db:"supports_json_mode"`
+			ServiceType        string   `db:"service_type"`
 			// metadata JSONB stores the raw provider response fields including
 			// supported_parameters, canonical_slug, owned_by, and created epoch.
-			MetadataRaw         string   `db:"metadata_raw"`
+			MetadataRaw string `db:"metadata_raw"`
 			// created_at from last_seen_at used as stable created timestamp
-			LastSeenAt          time.Time `db:"last_seen_at"`
+			LastSeenAt time.Time `db:"last_seen_at"`
 		}
 		var metaRows []metaRow
 		if h.db != nil && len(entries) > 0 {
@@ -1283,8 +1294,8 @@ func (h *Handler) streamChat(
 				streamCreated = chunk.Created
 			}
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
-				promptTokens += chunk.Usage.PromptTokens
-				completionTokens += chunk.Usage.CompletionTokens
+				promptTokens = chunk.Usage.PromptTokens
+				completionTokens = chunk.Usage.CompletionTokens
 			}
 			// Detect if upstream already sent a usage chunk (choices=[]).
 			if len(chunk.Choices) == 0 && chunk.Usage.TotalTokens > 0 {

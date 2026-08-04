@@ -41,16 +41,16 @@ type RegistryEndpoint struct {
 	// Per-endpoint provider transport configuration (migration 046).
 	// NULL / zero = use production defaults (see DefaultProviderTransportConfig).
 	// Only populated for provider backends; zero for local backends.
-	ProviderProxyURL                 string `db:"provider_proxy_url"`
-	ProviderTLSInsecureSkipVerify    bool   `db:"provider_tls_insecure_skip_verify"`
-	ProviderTLSRootCAPEM             string `db:"provider_tls_root_ca_pem"`
-	ProviderConnectTimeoutSeconds    int    `db:"provider_connect_timeout_seconds"`
-	ProviderReadTimeoutSeconds       int    `db:"provider_read_timeout_seconds"`
-	ProviderIdleConnTimeoutSeconds   int    `db:"provider_idle_conn_timeout_seconds"`
-	ProviderResponseHeaderTimeout    int    `db:"provider_response_header_timeout_seconds"`
-	ProviderMaxIdleConnsPerHost      int    `db:"provider_max_idle_conns_per_host"`
-	ProviderMaxConnsPerHost          int    `db:"provider_max_conns_per_host"`
-	ProviderDisableHTTP2             bool   `db:"provider_disable_http2"`
+	ProviderProxyURL               string `db:"provider_proxy_url"`
+	ProviderTLSInsecureSkipVerify  bool   `db:"provider_tls_insecure_skip_verify"`
+	ProviderTLSRootCAPEM           string `db:"provider_tls_root_ca_pem"`
+	ProviderConnectTimeoutSeconds  int    `db:"provider_connect_timeout_seconds"`
+	ProviderReadTimeoutSeconds     int    `db:"provider_read_timeout_seconds"`
+	ProviderIdleConnTimeoutSeconds int    `db:"provider_idle_conn_timeout_seconds"`
+	ProviderResponseHeaderTimeout  int    `db:"provider_response_header_timeout_seconds"`
+	ProviderMaxIdleConnsPerHost    int    `db:"provider_max_idle_conns_per_host"`
+	ProviderMaxConnsPerHost        int    `db:"provider_max_conns_per_host"`
+	ProviderDisableHTTP2           bool   `db:"provider_disable_http2"`
 }
 
 // transportConfig builds a ProviderTransportConfig from the DB-loaded fields.
@@ -95,8 +95,8 @@ type Registry struct {
 	log     *zap.Logger
 
 	mu        sync.RWMutex
-	pools     map[string]*Pool   // model name → pool
-	bends     map[string]Backend // backend type → backend instance (shared HTTP client)
+	pools     map[string]*Pool        // model name → pool
+	bends     map[string]Backend      // backend type → backend instance (shared HTTP client)
 	epClients map[string]*http.Client // endpoint ID → dedicated per-endpoint HTTP client
 	// epClients is only populated for provider backends (IsProviderBackend).
 	// Each client is built once from the endpoint's ProviderTransportConfig
@@ -143,8 +143,8 @@ func (r *Registry) Reload(ctx context.Context) error {
 		return err
 	}
 
-	newPools     := make(map[string]*Pool, len(rows))
-	newBends     := make(map[string]Backend)
+	newPools := make(map[string]*Pool, len(rows))
+	newBends := make(map[string]Backend)
 	newEpClients := make(map[string]*http.Client, len(rows))
 
 	// Carry over existing backends — avoids rebuilding shared HTTP clients
@@ -220,8 +220,8 @@ func (r *Registry) Reload(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
-	r.pools     = newPools
-	r.bends     = newBends
+	r.pools = newPools
+	r.bends = newBends
 	r.epClients = newEpClients
 	r.mu.Unlock()
 

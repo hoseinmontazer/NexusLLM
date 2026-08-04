@@ -36,10 +36,10 @@ type Activator interface {
 
 // sentinel error values
 var (
-	ErrModelNotFound        = errStr("model not registered in runtime manager")
-	ErrColdStartTimeout     = errStr("model did not become healthy within timeout")
+	ErrModelNotFound         = errStr("model not registered in runtime manager")
+	ErrColdStartTimeout      = errStr("model did not become healthy within timeout")
 	ErrInsufficientResources = errStr("node has insufficient resources to load model")
-	ErrDownloadFailed       = errStr("model download/conversion failed")
+	ErrDownloadFailed        = errStr("model download/conversion failed")
 )
 
 type errStr string

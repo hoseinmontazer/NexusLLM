@@ -344,17 +344,19 @@ func translateAnthropicResponse(raw []byte, nexusModelName string) ([]byte, erro
 // format so the gateway's existing streaming pipeline works unchanged.
 //
 // Anthropic SSE events relevant to translation:
-//   event: content_block_delta
-//   data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}
 //
-//   event: message_delta
-//   data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":N}}
+//	event: content_block_delta
+//	data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}
 //
-//   event: message_stop
-//   data: {"type":"message_stop"}
+//	event: message_delta
+//	data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":N}}
+//
+//	event: message_stop
+//	data: {"type":"message_stop"}
 //
 // OpenAI SSE format emitted:
-//   data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"..."},...}]}
+//
+//	data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"..."},...}]}
 type anthropicSSEStream struct {
 	reader    *bufio.Reader
 	closer    io.Closer
@@ -505,20 +507,16 @@ func (b *geminiProviderBackend) Models(ctx context.Context, url string, client *
 
 // Chat routes through Gemini's OpenAI-compat endpoint.
 // The base URL stored in the endpoint row must be:
-//   https://generativelanguage.googleapis.com
+//
+//	https://generativelanguage.googleapis.com
+//
 // Gemini's compat path is /v1beta/openai/chat/completions.
 func (b *geminiProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	// Rewrite the endpoint URL to use Gemini's compat path prefix.
-	r2 := r
-	r2.EndpointURL = r.EndpointURL + "/v1beta/openai"
-	// Delegate to the shared OpenAI-compat chat helper (appends /chat/completions).
-	return openAICompatChatWithBase(ctx, r.Client, r2, "/chat/completions")
+	return openAICompatChatWithBase(ctx, r.Client, r, "/v1beta/openai/chat/completions")
 }
 
 func (b *geminiProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	r2 := r
-	r2.EndpointURL = r.EndpointURL + "/v1beta/openai"
-	return openAICompatEmbeddings(ctx, r.Client, r2)
+	return openAICompatEmbeddingsWithBase(ctx, r.Client, r, "/v1beta/openai/embeddings")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -651,12 +649,176 @@ func (b *openRouterProviderBackend) Models(ctx context.Context, url string, clie
 	return openAICompatModels(ctx, client, url+"/api/v1", "")
 }
 func (b *openRouterProviderBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
-	r2 := r
-	r2.EndpointURL = strings.TrimSuffix(r.EndpointURL, "/v1")
-	return openAICompatChatWithBase(ctx, r.Client, r2, "/api/v1/chat/completions")
+	return openAICompatChatWithBase(ctx, r.Client, r, "/api/v1/chat/completions")
 }
 func (b *openRouterProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	return openAICompatEmbeddings(ctx, r.Client, r)
+	return openAICompatEmbeddingsWithBase(ctx, r.Client, r, "/api/v1/embeddings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NormalizeProviderEndpointURL — prevents path duplication
+// ─────────────────────────────────────────────────────────────────────────────
+
+// NormalizeProviderEndpointURL joins baseURL and targetPath safely, preventing path duplication.
+// Strips trailing slashes and known version/compat path suffixes (/v1, /api/v1, /v1beta/openai, /openai/v1)
+// from baseURL before appending targetPath.
+func NormalizeProviderEndpointURL(baseURL, targetPath string) string {
+	base := strings.TrimRight(baseURL, "/")
+	suffixes := []string{
+		"/v1beta/openai",
+		"/openai/v1",
+		"/api/v1",
+		"/v1",
+	}
+	for _, suf := range suffixes {
+		if strings.HasPrefix(targetPath, suf) {
+			base = strings.TrimSuffix(base, suf)
+			break
+		}
+	}
+	if !strings.HasPrefix(targetPath, "/") {
+		targetPath = "/" + targetPath
+	}
+	return base + targetPath
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared provider helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// providerHealthCheck performs a GET request to url+path and returns an
+// EndpointHealth. Treats 200/401 as healthy (401 = reachable but no key),
+// 4xx as degraded, 5xx as down.
+func providerHealthCheck(
+	ctx context.Context,
+	client *http.Client,
+	url, path, apiKey string,
+	backend BackendType,
+) EndpointHealth {
+	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
+	start := time.Now()
+	fullURL := NormalizeProviderEndpointURL(url, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		h.Error = err.Error()
+		return h
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	h.LatencyMs = int(time.Since(start).Milliseconds())
+	if err != nil {
+		h.Error = err.Error()
+		return h
+	}
+	resp.Body.Close()
+	switch {
+	case resp.StatusCode == 200 || resp.StatusCode == 401:
+		h.Status = StatusHealthy
+	case resp.StatusCode < 500:
+		h.Status = StatusDegraded
+		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	default:
+		h.Status = StatusDown
+		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	return h
+}
+
+// openAICompatChat sends a chat completions request to baseURL+"/v1/chat/completions".
+func openAICompatChat(ctx context.Context, client *http.Client, r ChatRequest) (*BackendResponse, error) {
+	return openAICompatChatWithBase(ctx, client, r, "/v1/chat/completions")
+}
+
+// openAICompatChatWithBase sends to baseURL+path (allows Gemini /v1beta/openai/chat/completions etc.)
+func openAICompatChatWithBase(ctx context.Context, client *http.Client, r ChatRequest, path string) (*BackendResponse, error) {
+	body, err := json.Marshal(r.Req)
+	if err != nil {
+		return nil, err
+	}
+	fullURL := NormalizeProviderEndpointURL(r.EndpointURL, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
+	}
+	if r.Req.Stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("provider chat (%s): %w", path, err)
+	}
+	br := &BackendResponse{StatusCode: resp.StatusCode, Headers: map[string]string{}}
+	if r.Req.Stream {
+		br.Stream = &sseStream{reader: bufio.NewReader(resp.Body), closer: resp.Body}
+	} else {
+		br.Body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	return br, err
+}
+
+// openAICompatEmbeddings posts to baseURL+"/v1/embeddings".
+func openAICompatEmbeddings(ctx context.Context, client *http.Client, r EmbedRequest) (*models.EmbeddingResponse, error) {
+	return openAICompatEmbeddingsWithBase(ctx, client, r, "/v1/embeddings")
+}
+
+// openAICompatEmbeddingsWithBase posts to NormalizeProviderEndpointURL(r.EndpointURL, path).
+func openAICompatEmbeddingsWithBase(ctx context.Context, client *http.Client, r EmbedRequest, path string) (*models.EmbeddingResponse, error) {
+	body, err := json.Marshal(r.Req)
+	if err != nil {
+		return nil, err
+	}
+	fullURL := NormalizeProviderEndpointURL(r.EndpointURL, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out models.EmbeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// openAICompatModels fetches /v1/models from a provider.
+func openAICompatModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]BackendModel, error) {
+	fullURL := NormalizeProviderEndpointURL(baseURL, "/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var list models.ModelListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	out := make([]BackendModel, len(list.Data))
+	for i, m := range list.Data {
+		out[i] = BackendModel{ID: m.ID, Object: m.Object, Created: m.Created, OwnedBy: m.OwnedBy}
+	}
+	return out, nil
 }
 
 // groqProviderBackend — Groq (api.groq.com)
@@ -767,136 +929,4 @@ func (b *deepSeekProviderBackend) Chat(ctx context.Context, r ChatRequest) (*Bac
 }
 func (b *deepSeekProviderBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
 	return openAICompatEmbeddings(ctx, r.Client, r)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared provider helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-// providerHealthCheck performs a GET request to url+path and returns an
-// EndpointHealth. Treats 200/401 as healthy (401 = reachable but no key),
-// 4xx as degraded, 5xx as down.
-func providerHealthCheck(
-	ctx context.Context,
-	client *http.Client,
-	url, path, apiKey string,
-	backend BackendType,
-) EndpointHealth {
-	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
-	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+path, nil)
-	if err != nil {
-		h.Error = err.Error()
-		return h
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	resp, err := client.Do(req)
-	h.LatencyMs = int(time.Since(start).Milliseconds())
-	if err != nil {
-		h.Error = err.Error()
-		return h
-	}
-	resp.Body.Close()
-	switch {
-	case resp.StatusCode == 200 || resp.StatusCode == 401:
-		// 401 = API reachable but key invalid / absent — treated as healthy
-		// because key correctness is validated per-request, not during health probes.
-		h.Status = StatusHealthy
-	case resp.StatusCode < 500:
-		h.Status = StatusDegraded
-		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	default:
-		h.Status = StatusDown
-		h.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	}
-	return h
-}
-
-// openAICompatChat sends a chat completions request to baseURL+"/v1/chat/completions".
-func openAICompatChat(ctx context.Context, client *http.Client, r ChatRequest) (*BackendResponse, error) {
-	return openAICompatChatWithBase(ctx, client, r, "/v1/chat/completions")
-}
-
-// openAICompatChatWithBase sends to baseURL+path (allows Gemini /v1beta/openai/chat/completions etc.)
-func openAICompatChatWithBase(ctx context.Context, client *http.Client, r ChatRequest, path string) (*BackendResponse, error) {
-	body, err := json.Marshal(r.Req)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.EndpointURL+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if r.UpstreamAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
-	}
-	if r.Req.Stream {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("provider chat (%s): %w", path, err)
-	}
-	br := &BackendResponse{StatusCode: resp.StatusCode, Headers: map[string]string{}}
-	if r.Req.Stream {
-		br.Stream = &sseStream{reader: bufio.NewReader(resp.Body), closer: resp.Body}
-	} else {
-		br.Body, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-	}
-	return br, err
-}
-
-// openAICompatEmbeddings posts to baseURL+"/v1/embeddings".
-func openAICompatEmbeddings(ctx context.Context, client *http.Client, r EmbedRequest) (*models.EmbeddingResponse, error) {
-	body, err := json.Marshal(r.Req)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.EndpointURL+"/v1/embeddings", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if r.UpstreamAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+r.UpstreamAPIKey)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out models.EmbeddingResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// openAICompatModels fetches /v1/models from a provider.
-func openAICompatModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]BackendModel, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var list models.ModelListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, err
-	}
-	out := make([]BackendModel, len(list.Data))
-	for i, m := range list.Data {
-		out[i] = BackendModel{ID: m.ID, Object: m.Object, Created: m.Created, OwnedBy: m.OwnedBy}
-	}
-	return out, nil
 }

@@ -731,12 +731,12 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 	var input struct {
 		// Model identity
-		Name        string   `json:"name"         binding:"required"`
-		DisplayName string   `json:"display_name" binding:"required"`
-		ServiceType string   `json:"service_type"`
-		MaxContext  int      `json:"max_context"`
-		MaxOutput   int      `json:"max_output"`
-		Tags        []string `json:"tags"`
+		Name         string   `json:"name"         binding:"required"`
+		DisplayName  string   `json:"display_name" binding:"required"`
+		ServiceType  string   `json:"service_type"`
+		MaxContext   int      `json:"max_context"`
+		MaxOutput    int      `json:"max_output"`
+		Tags         []string `json:"tags"`
 		Capabilities []string `json:"capabilities"`
 
 		// Provider — must match a BackendType constant with IsProviderBackend()==true.
@@ -1005,7 +1005,7 @@ func (h *RuntimeHandler) ListProviderDefaults(c *gin.Context) {
 		DefaultBaseURL    string `db:"default_base_url"    json:"default_base_url"`
 		HealthPath        string `db:"health_path"         json:"health_path"`
 		DocsURL           string `db:"docs_url"            json:"docs_url"`
-		SupportsStreaming  bool   `db:"supports_streaming"  json:"supports_streaming"`
+		SupportsStreaming bool   `db:"supports_streaming"  json:"supports_streaming"`
 		SupportsFunctions bool   `db:"supports_functions"  json:"supports_functions"`
 		SupportsVision    bool   `db:"supports_vision"     json:"supports_vision"`
 		SupportsEmbedding bool   `db:"supports_embedding"  json:"supports_embedding"`
@@ -1028,16 +1028,16 @@ func (h *RuntimeHandler) ListProviderDefaults(c *gin.Context) {
 // provider_defaults table has not been created yet (pre-migration-044 installs).
 func builtinProviderDefaults() []map[string]interface{} {
 	return []map[string]interface{}{
-		{"provider_name": "openai_provider",       "display_name": "OpenAI",          "default_base_url": "https://api.openai.com"},
-		{"provider_name": "anthropic_provider",    "display_name": "Anthropic",        "default_base_url": "https://api.anthropic.com"},
-		{"provider_name": "google_provider",       "display_name": "Google Gemini",    "default_base_url": "https://generativelanguage.googleapis.com"},
-		{"provider_name": "azure_openai_provider", "display_name": "Azure OpenAI",     "default_base_url": ""},
-		{"provider_name": "openrouter_provider",   "display_name": "OpenRouter",       "default_base_url": "https://openrouter.ai"},
-		{"provider_name": "groq_provider",         "display_name": "Groq",             "default_base_url": "https://api.groq.com"},
-		{"provider_name": "together_provider",     "display_name": "Together AI",      "default_base_url": "https://api.together.xyz"},
-		{"provider_name": "mistral_provider",      "display_name": "Mistral AI",       "default_base_url": "https://api.mistral.ai"},
-		{"provider_name": "cohere_provider",       "display_name": "Cohere",           "default_base_url": "https://api.cohere.com"},
-		{"provider_name": "deepseek_provider",     "display_name": "DeepSeek",         "default_base_url": "https://api.deepseek.com"},
+		{"provider_name": "openai_provider", "display_name": "OpenAI", "default_base_url": "https://api.openai.com"},
+		{"provider_name": "anthropic_provider", "display_name": "Anthropic", "default_base_url": "https://api.anthropic.com"},
+		{"provider_name": "google_provider", "display_name": "Google Gemini", "default_base_url": "https://generativelanguage.googleapis.com"},
+		{"provider_name": "azure_openai_provider", "display_name": "Azure OpenAI", "default_base_url": ""},
+		{"provider_name": "openrouter_provider", "display_name": "OpenRouter", "default_base_url": "https://openrouter.ai"},
+		{"provider_name": "groq_provider", "display_name": "Groq", "default_base_url": "https://api.groq.com"},
+		{"provider_name": "together_provider", "display_name": "Together AI", "default_base_url": "https://api.together.xyz"},
+		{"provider_name": "mistral_provider", "display_name": "Mistral AI", "default_base_url": "https://api.mistral.ai"},
+		{"provider_name": "cohere_provider", "display_name": "Cohere", "default_base_url": "https://api.cohere.com"},
+		{"provider_name": "deepseek_provider", "display_name": "DeepSeek", "default_base_url": "https://api.deepseek.com"},
 	}
 }
 
@@ -1409,10 +1409,10 @@ func (h *RuntimeHandler) GetProviderTransport(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"model_id":   modelID,
-		"endpoints":  rows,
-		"count":      len(rows),
-		"note":       "zero values mean BuildProviderClient() defaults apply (connect=10s idle=90s response_header=30s pool=32)",
+		"model_id":  modelID,
+		"endpoints": rows,
+		"count":     len(rows),
+		"note":      "zero values mean BuildProviderClient() defaults apply (connect=10s idle=90s response_header=30s pool=32)",
 	})
 }
 
@@ -1472,10 +1472,10 @@ func (h *RuntimeHandler) UpdateUpstream(c *gin.Context) {
 
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{
-		"message":         "upstream config updated",
-		"model_id":        modelID,
-		"proxy_set":       input.Proxy != nil && *input.Proxy != "",
-		"model_name_set":  input.ModelName != nil && *input.ModelName != "",
+		"message":        "upstream config updated",
+		"model_id":       modelID,
+		"proxy_set":      input.Proxy != nil && *input.Proxy != "",
+		"model_name_set": input.ModelName != nil && *input.ModelName != "",
 	})
 }
 
@@ -1541,7 +1541,7 @@ func (h *RuntimeHandler) GetModelHealth(c *gin.Context) {
 		UpstreamBaseURL     string     `db:"upstream_base_url"    json:"upstream_base_url"`
 		UpstreamProxy       string     `db:"upstream_proxy"       json:"upstream_proxy"`
 		// upstream_api_key is never returned — only its presence is indicated.
-		UpstreamAPIKeySet   bool       `db:"upstream_api_key_set" json:"upstream_api_key_set"`
+		UpstreamAPIKeySet bool `db:"upstream_api_key_set" json:"upstream_api_key_set"`
 	}
 	rows := make([]epRow, 0)
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `
@@ -1569,21 +1569,21 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 	}
 
 	type mRow struct {
-		ID                 string `db:"id"                  json:"id"`
-		Name               string `db:"name"                json:"name"`
-		DisplayName        string `db:"display_name"        json:"display_name"`
-		Provider           string `db:"provider"            json:"provider"`
-		BackendType        string `db:"backend_type"        json:"backend_type"`
-		ServiceType        string `db:"service_type"        json:"service_type"`
-		MaxContext         int    `db:"max_context"         json:"max_context"`
-		MaxOutput          int    `db:"max_output"          json:"max_output"`
-		Enabled            bool   `db:"enabled"             json:"enabled"`
-		Lifecycle          string `db:"lifecycle"           json:"lifecycle"`
-		EndpointCnt        int    `db:"endpoint_cnt"        json:"endpoint_count"`
-		HealthyCnt         int    `db:"healthy_cnt"         json:"healthy_count"`
-		SupportsThinking   bool   `db:"supports_thinking"   json:"supports_thinking"`
-		ThinkingEnabled    bool   `db:"thinking_enabled"    json:"thinking_enabled"`
-		MinThinkingTokens  int    `db:"min_thinking_tokens" json:"min_thinking_tokens"`
+		ID                string `db:"id"                  json:"id"`
+		Name              string `db:"name"                json:"name"`
+		DisplayName       string `db:"display_name"        json:"display_name"`
+		Provider          string `db:"provider"            json:"provider"`
+		BackendType       string `db:"backend_type"        json:"backend_type"`
+		ServiceType       string `db:"service_type"        json:"service_type"`
+		MaxContext        int    `db:"max_context"         json:"max_context"`
+		MaxOutput         int    `db:"max_output"          json:"max_output"`
+		Enabled           bool   `db:"enabled"             json:"enabled"`
+		Lifecycle         string `db:"lifecycle"           json:"lifecycle"`
+		EndpointCnt       int    `db:"endpoint_cnt"        json:"endpoint_count"`
+		HealthyCnt        int    `db:"healthy_cnt"         json:"healthy_count"`
+		SupportsThinking  bool   `db:"supports_thinking"   json:"supports_thinking"`
+		ThinkingEnabled   bool   `db:"thinking_enabled"    json:"thinking_enabled"`
+		MinThinkingTokens int    `db:"min_thinking_tokens" json:"min_thinking_tokens"`
 		// Provider columns (migration 044) — zero/false for local models.
 		ProviderIsExternal bool   `db:"provider_is_external" json:"provider_is_external"`
 		ProviderName       string `db:"provider_name"        json:"provider_name,omitempty"`

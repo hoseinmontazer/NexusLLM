@@ -21,17 +21,17 @@ func NewPromptPolicyHandler(engine *promptpolicy.Engine) *PromptPolicyHandler {
 // CreatePolicy handles POST /admin/v1/prompt-policies
 func (h *PromptPolicyHandler) CreatePolicy(c *gin.Context) {
 	var input struct {
-		Scope              string   `json:"scope"               binding:"required"`
-		ScopeID            string   `json:"scope_id"            binding:"required"`
-		Name               string   `json:"name"                binding:"required"`
-		Priority           int      `json:"priority"`
-		SystemPrompt       string   `json:"system_prompt"`
-		SystemPromptMode   string   `json:"system_prompt_mode"`
-		MaxTemperature     *float64 `json:"max_temperature"`
-		MaxTokensOverride  *int     `json:"max_tokens_override"`
-		EnablePII          bool     `json:"enable_pii_detection"`
-		EnableModeration   bool     `json:"enable_moderation"`
-		InputDenyList      []string `json:"input_deny_list"`
+		Scope             string   `json:"scope"               binding:"required"`
+		ScopeID           string   `json:"scope_id"            binding:"required"`
+		Name              string   `json:"name"                binding:"required"`
+		Priority          int      `json:"priority"`
+		SystemPrompt      string   `json:"system_prompt"`
+		SystemPromptMode  string   `json:"system_prompt_mode"`
+		MaxTemperature    *float64 `json:"max_temperature"`
+		MaxTokensOverride *int     `json:"max_tokens_override"`
+		EnablePII         bool     `json:"enable_pii_detection"`
+		EnableModeration  bool     `json:"enable_moderation"`
+		InputDenyList     []string `json:"input_deny_list"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

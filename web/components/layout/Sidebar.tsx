@@ -28,6 +28,11 @@ const nav: NavItem[] = [
   { href: '/projects',  label: 'Projects',       icon: FolderKanban },
   { href: '/api-keys',  label: 'API Keys',       icon: KeyRound },
 
+  { section: 'header',  label: 'DEVELOPER PORTAL' },
+  { href: '/portal',            label: 'Portal Overview',   icon: FolderKanban },
+  { href: '/portal/requests',   label: 'Access Requests',   icon: Zap },
+  { href: '/portal/admin-queue',label: 'Admin Review Queue',icon: Shield },
+
   { section: 'header',  label: 'GOVERNANCE' },
   { href: '/orgs',      label: 'Organizations',  icon: Building2 },
   { href: '/teams',     label: 'Teams',          icon: Users },

@@ -329,8 +329,7 @@ func (h *AgentHandler) CompleteTask(c *gin.Context) {
 				UPDATE agent_runtimes
 				SET bind_port  = $1,
 				    updated_at = NOW()
-				WHERE id = $2
-				  AND (bind_port = 0 OR updated_at < NOW() - INTERVAL '2 seconds')`,
+				WHERE id = $2`,
 				int(actualPort), runtimeID)
 			// Best-effort: write actual_port if migration 047 has been applied.
 			_, _ = h.db.ExecContext(c.Request.Context(),
@@ -657,8 +656,7 @@ func (h *AgentHandler) UpdateRuntime(c *gin.Context) {
 			    actual_port = $1,
 			    updated_at  = NOW()
 			WHERE id       = $2
-			  AND node_id  = $3
-			  AND (bind_port = 0 OR updated_at < NOW() - INTERVAL '2 seconds')`,
+			  AND node_id  = $3`,
 			input.BindPort, runtimeID, claims.NodeID)
 
 		// Primary sync via endpoint_id (works for activator-spawned runtimes).

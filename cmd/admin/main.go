@@ -18,6 +18,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/admin/handlers"
 	"github.com/nexusllm/nexusllm/internal/agentauth"
 	"github.com/nexusllm/nexusllm/internal/alias"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/gpu"
@@ -29,7 +30,6 @@ import (
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
-	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
@@ -194,6 +194,12 @@ func main() {
 	projectH := handlers.NewProjectHandler(db)
 	haH := handlers.NewHAHandler(db)
 	ppH2 := handlers.NewProjectPolicyHandler(db, rdb, policyEngine, usageTracker)
+	factory2 := runtime.NewFactory(&http.Client{Timeout: 10 * time.Second})
+	catalogResolver := catalog.NewVirtualModelResolver(db, log)
+	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
+	go catalogScheduler.Start(usageCtx)
+	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
+	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -250,11 +256,6 @@ func main() {
 	// DELETE /admin/v1/providers/:id/rules/:rid — delete rule
 	// POST   /admin/v1/providers/:id/rules/preview — dry-run rule evaluation
 	// POST   /admin/v1/models/catalog-alias   — create Mode-A public model alias
-	factory2 := runtime.NewFactory(&http.Client{Timeout: 10 * time.Second})
-	catalogResolver := catalog.NewVirtualModelResolver(db, log)
-	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
-	go catalogScheduler.Start(usageCtx)
-	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
 
 	a.POST("/providers", catalogH.CreateProvider)
 	a.GET("/providers", catalogH.ListProviders)
@@ -269,6 +270,7 @@ func main() {
 	a.POST("/providers/:id/expose-models", catalogH.BulkExposeModels)
 	a.POST("/providers/:id/hide-models", catalogH.BulkHideModels)
 	a.POST("/providers/:id/register-models", catalogH.BulkRegisterFromCatalog) // promote to Public Models
+	a.GET("/providers/:id/live-models", catalogH.LiveModels)                   // raw provider /models passthrough
 	a.GET("/providers/:id/rules", catalogH.ListRules)
 	a.POST("/providers/:id/rules", catalogH.CreateRule)
 	a.DELETE("/providers/:id/rules/:rid", catalogH.DeleteRule)
@@ -417,6 +419,36 @@ func main() {
 	a.PUT("/projects/:id/provider-access/:provider_id", catalogH.UpdateProjectProviderAccess)
 	a.DELETE("/projects/:id/provider-access/:provider_id", catalogH.RevokeProjectProviderAccess)
 
+	// ── Admin Authentication & Review Queue ─────────────────────────────────
+	a.POST("/auth/login", portalH.AdminLogin)
+	a.GET("/portal/requests/pending", portalH.ListPendingPortalRequests)
+	a.POST("/portal/requests/:id/review", portalH.ReviewPortalAccessRequest)
+
+	// ── Developer Self-Service Portal (/portal/v1) ───────────────────────────
+	pGroup := r.Group("/portal/v1")
+	{
+		pGroup.POST("/auth/register", portalH.RegisterUser)
+		pGroup.POST("/auth/login", portalH.LoginUser)
+
+		pGroup.POST("/projects", portalH.CreatePortalProject)
+		pGroup.GET("/projects", portalH.ListPortalProjects)
+		pGroup.GET("/projects/:id", portalH.GetPortalProject)
+
+		pGroup.POST("/requests", portalH.CreateAccessRequest)
+		pGroup.GET("/requests", portalH.ListAccessRequests)
+		pGroup.GET("/requests/:id", portalH.GetAccessRequest)
+		pGroup.POST("/requests/:id/cancel", portalH.CancelAccessRequest)
+
+		pGroup.POST("/projects/:id/api-keys", portalH.CreatePortalAPIKey)
+		pGroup.POST("/api-keys/:key_id/rotate", portalH.RotatePortalAPIKey)
+		pGroup.DELETE("/api-keys/:key_id", portalH.DeletePortalAPIKey)
+
+		pGroup.GET("/models", portalH.GetPortalModels)
+		pGroup.GET("/usage", portalH.GetPortalUsage)
+		pGroup.GET("/notifications", portalH.GetPortalNotifications)
+		pGroup.POST("/notifications/:id/read", portalH.MarkNotificationRead)
+	}
+
 	// ── Agent API (called by node agents, not human operators) ────────────────
 	// Registration does NOT require auth (bootstrapping)
 	r.POST("/agent/v1/register", agentH.Register)
@@ -550,7 +582,7 @@ func runStuckRuntimeSweeper(ctx context.Context, db *sqlx.DB, taskMgr *taskmanag
 	//   - GPU memory loading for large models
 	//   - Container image pulls on first deploy
 	const stuckThreshold = 20 * time.Minute
-	const sweepInterval  = 60 * time.Second
+	const sweepInterval = 60 * time.Second
 
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()

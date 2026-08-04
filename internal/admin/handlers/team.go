@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -335,6 +336,7 @@ func (h *TeamHandler) AddModelPermission(c *gin.Context) {
 	}
 
 	_ = h.engine.SetModelAllowed(c.Request.Context(), teamID, input.ModelName)
+	h.syncPermissionChanges(c.Request.Context(), teamID, input.ModelName, true)
 	c.JSON(http.StatusOK, gin.H{"message": "model permission granted"})
 }
 
@@ -353,5 +355,33 @@ func (h *TeamHandler) RemoveModelPermission(c *gin.Context) {
 	_, _ = h.db.ExecContext(c.Request.Context(),
 		`DELETE FROM team_model_permissions WHERE team_id = $1 AND model_id = $2`, teamID, modelID)
 	_ = h.engine.RemoveModelAllowed(c.Request.Context(), teamID, modelName)
+	h.syncPermissionChanges(c.Request.Context(), teamID, modelName, false)
 	c.JSON(http.StatusOK, gin.H{"message": "model permission removed"})
+}
+
+func (h *TeamHandler) syncPermissionChanges(ctx context.Context, teamID, modelName string, isAdd bool) {
+	var orgID string
+	_ = h.db.GetContext(ctx, &orgID, `SELECT org_id FROM teams WHERE id = $1`, teamID)
+	if orgID != "" {
+		if isAdd {
+			_ = h.engine.SetOrgModelAllowed(ctx, orgID, modelName)
+		} else {
+			var count int
+			_ = h.db.GetContext(ctx, &count, `
+				SELECT COUNT(*)
+				FROM team_model_permissions tmp
+				JOIN teams t ON t.id = tmp.team_id
+				JOIN models m ON m.id = tmp.model_id
+				WHERE t.org_id = $1 AND m.name = $2`, orgID, modelName)
+			if count == 0 {
+				_ = h.engine.RemoveOrgModelAllowed(ctx, orgID, modelName)
+			}
+		}
+	}
+
+	var hashes []string
+	_ = h.db.SelectContext(ctx, &hashes, `SELECT key_hash FROM api_keys WHERE team_id = $1 AND active = TRUE`, teamID)
+	for _, hash := range hashes {
+		_ = h.rdb.Del(ctx, "nexus:apikey:"+hash).Err()
+	}
 }

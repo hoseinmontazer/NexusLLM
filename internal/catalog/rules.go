@@ -17,7 +17,7 @@ type ExposureRule struct {
 	Pattern    string `db:"pattern"     json:"pattern"`
 	ModelID    string `db:"model_id"    json:"model_id"`
 
-	RequireStreaming  *bool `db:"require_streaming"  json:"require_streaming"`
+	RequireStreaming *bool `db:"require_streaming"  json:"require_streaming"`
 	RequireTools     *bool `db:"require_tools"      json:"require_tools"`
 	RequireVision    *bool `db:"require_vision"     json:"require_vision"`
 	RequireAudio     *bool `db:"require_audio"      json:"require_audio"`
@@ -48,7 +48,7 @@ func (r *ExposureRule) DenyTags() []string {
 type CatalogEntry struct {
 	ProviderModelID   string
 	Tags              []string
-	SupportsStreaming  bool
+	SupportsStreaming bool
 	SupportsTools     bool
 	SupportsVision    bool
 	SupportsAudio     bool
@@ -211,7 +211,7 @@ func (s *RuleStore) PreviewExposure(ctx context.Context, providerID string) (exp
 	type row struct {
 		ModelID           string `db:"provider_model_id"`
 		Tags              string `db:"tags_raw"`
-		SupportsStreaming  bool   `db:"supports_streaming"`
+		SupportsStreaming bool   `db:"supports_streaming"`
 		SupportsTools     bool   `db:"supports_tools"`
 		SupportsVision    bool   `db:"supports_vision"`
 		SupportsAudio     bool   `db:"supports_audio"`
@@ -239,7 +239,7 @@ func (s *RuleStore) PreviewExposure(ctx context.Context, providerID string) (exp
 		entry := CatalogEntry{
 			ProviderModelID:   c.ModelID,
 			Tags:              splitTags(c.Tags),
-			SupportsStreaming:  c.SupportsStreaming,
+			SupportsStreaming: c.SupportsStreaming,
 			SupportsTools:     c.SupportsTools,
 			SupportsVision:    c.SupportsVision,
 			SupportsAudio:     c.SupportsAudio,

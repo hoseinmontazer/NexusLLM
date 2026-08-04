@@ -20,13 +20,13 @@ func NewGPUHandler(inv *gpu.Inventory) *GPUHandler {
 // RegisterNode handles POST /admin/v1/gpu/nodes
 func (h *GPUHandler) RegisterNode(c *gin.Context) {
 	var input struct {
-		Name          string  `json:"name"           binding:"required"`
-		Host          string  `json:"host"           binding:"required"`
-		DriverType    string  `json:"driver_type"`
-		TotalVRAMMB   int     `json:"total_vram_mb"`
+		Name        string `json:"name"           binding:"required"`
+		Host        string `json:"host"           binding:"required"`
+		DriverType  string `json:"driver_type"`
+		TotalVRAMMB int    `json:"total_vram_mb"`
 		// ClusterNodeID links this GPU node to the cluster node (from /admin/v1/nodes)
 		// Set by the standalone node agent on auto-registration.
-		ClusterNodeID string  `json:"node_id"`
+		ClusterNodeID string `json:"node_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -122,11 +122,12 @@ func (h *GPUHandler) DeleteGPUDevice(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "GPU device deleted", "id": deviceID})
 }
+
 // Simulates GPU packing for a set of models and returns the placement plan.
 func (h *GPUHandler) PackModels(c *gin.Context) {
 	var input struct {
-		NodeID   string                       `json:"node_id"`
-		Requests []gpu.ModelPlacementRequest  `json:"models" binding:"required"`
+		NodeID   string                      `json:"node_id"`
+		Requests []gpu.ModelPlacementRequest `json:"models" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -139,8 +140,8 @@ func (h *GPUHandler) PackModels(c *gin.Context) {
 	}
 	result := gpu.PackModels(devices, input.Requests)
 	c.JSON(http.StatusOK, gin.H{
-		"assignments":  result.Assignments,
-		"unscheduled":  result.Unscheduled,
-		"explanation":  gpu.ExplainPacking(result),
+		"assignments": result.Assignments,
+		"unscheduled": result.Unscheduled,
+		"explanation": gpu.ExplainPacking(result),
 	})
 }

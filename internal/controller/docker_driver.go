@@ -67,12 +67,20 @@ func (d *dockerDriver) discoverPortForBackend(ctx context.Context, containerName
 
 		switch backend {
 		case "ollama":
-			// Ollama binds to OLLAMA_HOST — never honours --port.
-			port, method = d.portFromEnvVar(ctx, containerName, []string{"OLLAMA_HOST"})
+			if p := d.portFromPortBindings(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings"
+			} else {
+				port, method = d.portFromEnvVar(ctx, containerName, []string{"OLLAMA_HOST"})
+			}
 
 		case "cpu_native":
-			// cpu_native images read PORT/HTTP_PORT/UVICORN_PORT; no --port arg.
-			port, method = d.portFromEnvVar(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
+			if p := d.portFromPortBindings(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings"
+			} else {
+				port, method = d.portFromEnvVar(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
+			}
 
 		case "vllm", "tgi", "llamacpp":
 			// These pass port via --port CMD arg.

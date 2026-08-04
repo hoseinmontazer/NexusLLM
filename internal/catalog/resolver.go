@@ -12,21 +12,21 @@ import (
 
 // exposedRow is the DB row returned by the exposed-catalog query.
 type exposedRow struct {
-	RemoteModelID     string `db:"remote_model_id"`
-	ProviderID        string `db:"provider_id"`
-	ProviderModelID   string `db:"provider_model_id"`
-	DisplayName       string `db:"display_name"`
-	ContextLength     *int   `db:"context_length"`
-	SupportsStreaming  bool   `db:"supports_streaming"`
-	SupportsTools     bool   `db:"supports_tools"`
-	SupportsVision    bool   `db:"supports_vision"`
-	SupportsEmbedding bool   `db:"supports_embeddings"`
-	SupportsReasoning bool   `db:"supports_reasoning"`
-	ProviderName      string `db:"provider_name"`
-	BackendType       string `db:"backend_type"`
-	BaseURL           string `db:"base_url"`
-	APIKey            string `db:"api_key"`
-	ProxyURL          string `db:"proxy_url"`
+	RemoteModelID                string `db:"remote_model_id"`
+	ProviderID                   string `db:"provider_id"`
+	ProviderModelID              string `db:"provider_model_id"`
+	DisplayName                  string `db:"display_name"`
+	ContextLength                *int   `db:"context_length"`
+	SupportsStreaming            bool   `db:"supports_streaming"`
+	SupportsTools                bool   `db:"supports_tools"`
+	SupportsVision               bool   `db:"supports_vision"`
+	SupportsEmbedding            bool   `db:"supports_embeddings"`
+	SupportsReasoning            bool   `db:"supports_reasoning"`
+	ProviderName                 string `db:"provider_name"`
+	BackendType                  string `db:"backend_type"`
+	BaseURL                      string `db:"base_url"`
+	APIKey                       string `db:"api_key"`
+	ProxyURL                     string `db:"proxy_url"`
 	TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
 	TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
 	ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
@@ -36,14 +36,14 @@ type exposedRow struct {
 	MaxIdleConnsPerHost          int    `db:"max_idle_conns_per_host"`
 	MaxConnsPerHost              int    `db:"max_conns_per_host"`
 	DisableHTTP2                 bool   `db:"disable_http2"`
-	VirtualModelName  string `db:"virtual_model_name"`
-	TagsRaw           string `db:"tags_raw"`
+	VirtualModelName             string `db:"virtual_model_name"`
+	TagsRaw                      string `db:"tags_raw"`
 }
 
 // virtualCache is the in-memory resolved catalog used by hot-path resolution.
 type virtualCache struct {
-	byName map[string]*VirtualEndpoint // virtual_model_name → endpoint
-	list   []string                    // ordered list of virtual model names
+	byName  map[string]*VirtualEndpoint // virtual_model_name → endpoint
+	list    []string                    // ordered list of virtual model names
 	builtAt time.Time
 }
 
@@ -249,14 +249,14 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 	// We query on exposure_mode first; COALESCE keeps the fallback safe on
 	// pre-050 installations where the column does not exist yet.
 	type provRow struct {
-		ID                   string `db:"id"`
-		Name                 string `db:"name"`
-		BackendType          string `db:"backend_type"`
-		BaseURL              string `db:"base_url"`
-		APIKey               string `db:"api_key"`
-		ExposureMode         string `db:"exposure_mode"`
-		CatalogExposePrefix  string `db:"catalog_expose_prefix"`
-		ProxyURL             string `db:"proxy_url"`
+		ID                           string `db:"id"`
+		Name                         string `db:"name"`
+		BackendType                  string `db:"backend_type"`
+		BaseURL                      string `db:"base_url"`
+		APIKey                       string `db:"api_key"`
+		ExposureMode                 string `db:"exposure_mode"`
+		CatalogExposePrefix          string `db:"catalog_expose_prefix"`
+		ProxyURL                     string `db:"proxy_url"`
 		TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
 		TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
 		ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
@@ -316,7 +316,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 		type catalogRow struct {
 			ProviderModelID   string `db:"provider_model_id"`
 			TagsRaw           string `db:"tags_raw"`
-			SupportsStreaming  bool   `db:"supports_streaming"`
+			SupportsStreaming bool   `db:"supports_streaming"`
 			SupportsTools     bool   `db:"supports_tools"`
 			SupportsVision    bool   `db:"supports_vision"`
 			SupportsAudio     bool   `db:"supports_audio"`
@@ -345,7 +345,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 			entry := CatalogEntry{
 				ProviderModelID:   e.ProviderModelID,
 				Tags:              splitTags(e.TagsRaw),
-				SupportsStreaming:  e.SupportsStreaming,
+				SupportsStreaming: e.SupportsStreaming,
 				SupportsTools:     e.SupportsTools,
 				SupportsVision:    e.SupportsVision,
 				SupportsAudio:     e.SupportsAudio,
@@ -369,7 +369,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				ExposureMode:      ExposureMode(prov.ExposureMode),
 				// Capability flags come directly from provider_remote_models.
 				// Never inferred from the model name string.
-				SupportsStreaming:  e.SupportsStreaming,
+				SupportsStreaming: e.SupportsStreaming,
 				SupportsTools:     e.SupportsTools,
 				SupportsVision:    e.SupportsVision,
 				SupportsAudio:     e.SupportsAudio,
@@ -395,11 +395,12 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 // operators via PUT /admin/v1/providers/:id/models/:model_id.
 //
 // Mapping:
-//   SupportsEmbedding=true  → [embedding]           (not a chat model)
-//   SupportsAudio=true      → [transcription]        (STT; not a chat model)
-//   default (chat model)    → [chat, completion]
-//   SupportsVision=true     → append vision to chat caps
-//   SupportsReasoning=true  → append reasoning to chat caps
+//
+//	SupportsEmbedding=true  → [embedding]           (not a chat model)
+//	SupportsAudio=true      → [transcription]        (STT; not a chat model)
+//	default (chat model)    → [chat, completion]
+//	SupportsVision=true     → append vision to chat caps
+//	SupportsReasoning=true  → append reasoning to chat caps
 func capabilitiesFromVirtualEndpoint(vep *VirtualEndpoint) []runtime.Capability {
 	// Non-chat modalities take exclusive priority — these models do not also
 	// serve chat requests through the same endpoint.

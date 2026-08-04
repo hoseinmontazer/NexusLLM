@@ -51,9 +51,9 @@ type AllocationRequest struct {
 
 // AllocationResult is the result of a successful GPU allocation.
 type AllocationResult struct {
-	Devices       []Device
-	TotalVRAMMB   int
-	NodeID        string
+	Devices     []Device
+	TotalVRAMMB int
+	NodeID      string
 }
 
 // AllocationStrategy controls which GPU selection algorithm is used.

@@ -698,9 +698,6 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 					host = nodeIP
 				}
 				port := rt.BindPort
-				if port == 0 {
-					port = cfg.BindPort
-				}
 
 				// Port is still 0 — agent hasn't reported the allocated port yet.
 				// This is normal for the first few ticks after bind_port=0 was sent.
@@ -1051,8 +1048,8 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    m.id                                          AS model_id,
 		    COALESCE(me.node_id::text, ar.node_id::text,
 		             '')                                  AS node_id,
-		    COALESCE(me.host,  '')                        AS bind_host,
-		    COALESCE(me.port,  8080)                      AS bind_port,
+		    COALESCE(NULLIF(ar.bind_host, ''), me.host, '')       AS bind_host,
+		    COALESCE(NULLIF(ar.bind_port, 0), me.port, 0)         AS bind_port,
 		    COALESCE(m.backend_type, 'openai_compat')     AS backend,
 		    COALESCE(mrc.gguf_path,  '')                  AS gguf_path,
 		    COALESCE(mrc.hf_repo,    '')                  AS hf_repo,

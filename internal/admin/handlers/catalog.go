@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -121,27 +122,27 @@ func (h *CatalogHandler) GetProvider(c *gin.Context) {
 		em = "managed"
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"id":                    p.ID,
-		"name":                  p.Name,
-		"display_name":          p.DisplayName,
-		"backend_type":          p.BackendType,
-		"base_url":              p.BaseURL,
-		"api_key_set":           p.APIKey != "",
-		"exposure_mode":         em,
-		"catalog_sync_enabled":  p.CatalogSyncEnabled,
-		"catalog_sync_interval": p.CatalogSyncInterval,
-		"catalog_direct_expose": p.CatalogDirectExpose,
-		"catalog_expose_prefix": p.CatalogExposePrefix,
+		"id":                     p.ID,
+		"name":                   p.Name,
+		"display_name":           p.DisplayName,
+		"backend_type":           p.BackendType,
+		"base_url":               p.BaseURL,
+		"api_key_set":            p.APIKey != "",
+		"exposure_mode":          em,
+		"catalog_sync_enabled":   p.CatalogSyncEnabled,
+		"catalog_sync_interval":  p.CatalogSyncInterval,
+		"catalog_direct_expose":  p.CatalogDirectExpose,
+		"catalog_expose_prefix":  p.CatalogExposePrefix,
 		"catalog_last_synced_at": p.CatalogLastSyncedAt,
-		"catalog_model_count":   p.CatalogModelCount,
-		"catalog_sync_status":   p.CatalogSyncStatus,
-		"catalog_sync_error":    p.CatalogSyncError,
-		"proxy_url":             p.ProxyURL,
-		"enabled":               p.Enabled,
-		"health":                p.Health,
-		"last_health_check":     p.LastHealthCheck,
-		"created_at":            p.CreatedAt,
-		"updated_at":            p.UpdatedAt,
+		"catalog_model_count":    p.CatalogModelCount,
+		"catalog_sync_status":    p.CatalogSyncStatus,
+		"catalog_sync_error":     p.CatalogSyncError,
+		"proxy_url":              p.ProxyURL,
+		"enabled":                p.Enabled,
+		"health":                 p.Health,
+		"last_health_check":      p.LastHealthCheck,
+		"created_at":             p.CreatedAt,
+		"updated_at":             p.UpdatedAt,
 	})
 }
 
@@ -435,22 +436,22 @@ func (h *CatalogHandler) ListCatalog(c *gin.Context) {
 	exposed := c.Query("exposed")
 
 	type row struct {
-		ID               string   `db:"id"               json:"id"`
-		ProviderModelID  string   `db:"provider_model_id" json:"provider_model_id"`
-		DisplayName      string   `db:"display_name"     json:"display_name"`
-		ContextLength    *int     `db:"context_length"   json:"context_length"`
-		InputCost        *float64 `db:"input_cost_per_1m" json:"input_cost_per_1m"`
-		OutputCost       *float64 `db:"output_cost_per_1m" json:"output_cost_per_1m"`
-		SupportsStreaming bool     `db:"supports_streaming" json:"supports_streaming"`
-		SupportsTools    bool     `db:"supports_tools"   json:"supports_tools"`
-		SupportsVision   bool     `db:"supports_vision"  json:"supports_vision"`
-		SupportsAudio    bool     `db:"supports_audio"   json:"supports_audio"`
-		SupportsEmbed    bool     `db:"supports_embeddings" json:"supports_embeddings"`
-		SupportsReason   bool     `db:"supports_reasoning" json:"supports_reasoning"`
-		TagsRaw          string   `db:"tags_raw"         json:"-"`
-		Tags             []string `db:"-"                json:"tags"`
-		Enabled          bool     `db:"enabled"          json:"enabled"`
-		LastSeenAt       time.Time `db:"last_seen_at"    json:"last_seen_at"`
+		ID                string    `db:"id"               json:"id"`
+		ProviderModelID   string    `db:"provider_model_id" json:"provider_model_id"`
+		DisplayName       string    `db:"display_name"     json:"display_name"`
+		ContextLength     *int      `db:"context_length"   json:"context_length"`
+		InputCost         *float64  `db:"input_cost_per_1m" json:"input_cost_per_1m"`
+		OutputCost        *float64  `db:"output_cost_per_1m" json:"output_cost_per_1m"`
+		SupportsStreaming bool      `db:"supports_streaming" json:"supports_streaming"`
+		SupportsTools     bool      `db:"supports_tools"   json:"supports_tools"`
+		SupportsVision    bool      `db:"supports_vision"  json:"supports_vision"`
+		SupportsAudio     bool      `db:"supports_audio"   json:"supports_audio"`
+		SupportsEmbed     bool      `db:"supports_embeddings" json:"supports_embeddings"`
+		SupportsReason    bool      `db:"supports_reasoning" json:"supports_reasoning"`
+		TagsRaw           string    `db:"tags_raw"         json:"-"`
+		Tags              []string  `db:"-"                json:"tags"`
+		Enabled           bool      `db:"enabled"          json:"enabled"`
+		LastSeenAt        time.Time `db:"last_seen_at"    json:"last_seen_at"`
 	}
 
 	base := `FROM provider_remote_models
@@ -698,9 +699,9 @@ func (h *CatalogHandler) BulkExposeModels(c *gin.Context) {
 		h.resolver.Invalidate()
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"created":    created,
+		"created":     created,
 		"provider_id": id,
-		"note":       "catalog_direct_expose enabled — selected models are now routable as virtual endpoints",
+		"note":        "catalog_direct_expose enabled — selected models are now routable as virtual endpoints",
 	})
 }
 
@@ -744,7 +745,7 @@ func (h *CatalogHandler) CreateRule(c *gin.Context) {
 		RuleType          string   `json:"rule_type" binding:"required"`
 		Pattern           string   `json:"pattern"`
 		ModelID           string   `json:"model_id"`
-		RequireStreaming   *bool    `json:"require_streaming"`
+		RequireStreaming  *bool    `json:"require_streaming"`
 		RequireTools      *bool    `json:"require_tools"`
 		RequireVision     *bool    `json:"require_vision"`
 		RequireAudio      *bool    `json:"require_audio"`
@@ -1112,8 +1113,8 @@ func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
 			projectID, providerID, *in.Enabled)
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"message":    "provider access updated",
-		"project_id": projectID,
+		"message":     "provider access updated",
+		"project_id":  projectID,
 		"provider_id": providerID,
 	})
 }
@@ -1127,8 +1128,92 @@ func (h *CatalogHandler) RevokeProjectProviderAccess(c *gin.Context) {
 		 WHERE project_id::text=$1 AND provider_id::text=$2`,
 		projectID, providerID)
 	c.JSON(http.StatusOK, gin.H{
-		"message":    "provider access revoked",
-		"project_id": projectID,
+		"message":     "provider access revoked",
+		"project_id":  projectID,
 		"provider_id": providerID,
 	})
+}
+
+// ── Live Models passthrough ───────────────────────────────────────────────────
+
+// LiveModels handles GET /admin/v1/providers/:id/live-models
+//
+// Proxies the provider's own /models endpoint using the stored API key and
+// transport config (proxy, TLS, timeouts). Returns the raw provider JSON
+// unchanged so the UI can display every provider-specific field.
+//
+// This is the correct architecture: the admin server holds the credentials
+// and transport config; the browser never touches the API key directly.
+// No client-side key or localStorage is needed.
+func (h *CatalogHandler) LiveModels(c *gin.Context) {
+	id := c.Param("id")
+	p, err := h.store.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + id})
+		return
+	}
+
+	// Build the upstream /models URL using the same path logic as the
+	// catalog syncer so the behaviour is identical.
+	path := "/v1/models"
+	switch runtime.BackendType(p.BackendType) {
+	case runtime.BackendOpenRouter:
+		path = "/api/v1/models"
+	case runtime.BackendGroq:
+		path = "/openai/v1/models"
+	case runtime.BackendGemini:
+		path = "/v1beta/openai/models"
+	}
+	modelsURL := runtime.NormalizeProviderEndpointURL(p.BaseURL, path)
+
+	// Forward any query string the caller passed (e.g. ?supported_parameters=tools).
+	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
+		modelsURL += "?" + rawQuery
+	}
+
+	// Build an isolated HTTP client from the provider's full transport config —
+	// same client used for catalog sync and chat completions. This ensures the
+	// outbound proxy and TLS settings are applied identically.
+	client, clientErr := runtime.BuildProviderClient(p.Transport())
+	if clientErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build transport: " + clientErr.Error()})
+		return
+	}
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, modelsURL, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Inject the stored API key using the provider's configured header.
+	if p.APIKey != "" {
+		header := p.APIKeyHeader
+		if header == "" || header == "Authorization" {
+			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		} else {
+			req.Header.Set(header, p.APIKey)
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream error: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read upstream response: " + readErr.Error()})
+		return
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/json"
+	}
+	c.Header("X-Nexus-Provider", p.Name)
+	c.Header("X-Nexus-Provider-URL", modelsURL)
+	c.Data(resp.StatusCode, ct, body)
 }

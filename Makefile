@@ -198,7 +198,9 @@ MIGRATIONS := \
 	047_provider_catalog.sql \
 	048_actual_port_columns.sql \
 	049_unified_model_permissions.sql \
-	050_provider_exposure_modes.sql
+	050_provider_exposure_modes.sql \
+	051_self_service_developer_portal.sql \
+	052_user_auth_and_credentials.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

@@ -28,7 +28,7 @@ type VirtualEndpoint struct {
 	// columns at cache-build time. These are the sole source of truth for
 	// capability validation of virtual (Mode-B) models. They are NEVER inferred
 	// from the model name string.
-	SupportsStreaming  bool
+	SupportsStreaming bool
 	SupportsTools     bool
 	SupportsVision    bool
 	SupportsAudio     bool

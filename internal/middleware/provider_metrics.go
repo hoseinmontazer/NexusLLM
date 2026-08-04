@@ -12,9 +12,10 @@ import (
 // behaviour independently of project or team dimensions.
 //
 // Label conventions:
-//   provider  — BackendType string (e.g. "openai_provider", "anthropic_provider")
-//   model     — NexusLLM model name (stable identifier, NOT display name)
-//   status    — "success" | "error" | "timeout" | "rate_limited"
+//
+//	provider  — BackendType string (e.g. "openai_provider", "anthropic_provider")
+//	model     — NexusLLM model name (stable identifier, NOT display name)
+//	status    — "success" | "error" | "timeout" | "rate_limited"
 var (
 	// ProviderRequestsTotal counts every request forwarded to a provider.
 	ProviderRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

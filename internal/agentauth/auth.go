@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	tokenTTL        = 365 * 24 * time.Hour // 1 year — rotated on re-registration
-	claimNodeID     = "node_id"
-	claimNodeHost   = "node_host"
-	issuer          = "nexus-control-plane"
+	tokenTTL      = 365 * 24 * time.Hour // 1 year — rotated on re-registration
+	claimNodeID   = "node_id"
+	claimNodeHost = "node_host"
+	issuer        = "nexus-control-plane"
 )
 
 // NodeClaims are the JWT claims embedded in an agent token.

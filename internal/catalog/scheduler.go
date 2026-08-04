@@ -15,9 +15,9 @@ import (
 // It starts one goroutine per provider that has catalog_sync_enabled=TRUE,
 // and supports on-demand manual sync via TriggerSync.
 type SyncScheduler struct {
-	syncer  *CatalogSyncer
-	store   *ProviderStore
-	log     *zap.Logger
+	syncer *CatalogSyncer
+	store  *ProviderStore
+	log    *zap.Logger
 
 	mu       sync.Mutex
 	triggers map[string]chan struct{} // provider_id → trigger channel

@@ -44,7 +44,9 @@ func (b *tgiBackend) PrepareStartupArgs(caps ModelStartupCaps, extraArgs []strin
 
 func (b *tgiBackend) Health(ctx context.Context, url string, client *http.Client) EndpointHealth {
 	c := b.client
-	if client != nil { c = client }
+	if client != nil {
+		c = client
+	}
 	h := EndpointHealth{URL: url, Status: StatusDown, CheckedAt: time.Now()}
 	start := time.Now()
 
@@ -77,7 +79,9 @@ func (b *tgiBackend) Health(ctx context.Context, url string, client *http.Client
 
 func (b *tgiBackend) Models(ctx context.Context, url string, client *http.Client) ([]BackendModel, error) {
 	c := b.client
-	if client != nil { c = client }
+	if client != nil {
+		c = client
+	}
 	// TGI serves a single model; /v1/models returns it.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
@@ -102,7 +106,9 @@ func (b *tgiBackend) Models(ctx context.Context, url string, client *http.Client
 
 func (b *tgiBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse, error) {
 	c := b.client
-	if r.Client != nil { c = r.Client }
+	if r.Client != nil {
+		c = r.Client
+	}
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err
@@ -134,7 +140,9 @@ func (b *tgiBackend) Chat(ctx context.Context, r ChatRequest) (*BackendResponse,
 
 func (b *tgiBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.EmbeddingResponse, error) {
 	c := b.client
-	if r.Client != nil { c = r.Client }
+	if r.Client != nil {
+		c = r.Client
+	}
 	body, err := json.Marshal(r.Req)
 	if err != nil {
 		return nil, err

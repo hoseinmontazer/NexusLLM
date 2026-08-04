@@ -17,16 +17,16 @@ type AgentMetrics struct {
 	AgentUp *prometheus.GaugeVec // agent_up{node_id, hostname}
 
 	// Task execution
-	TasksTotal    *prometheus.CounterVec // agent_tasks_total{node_id, task_type, status}
-	TaskDuration  *prometheus.HistogramVec // agent_task_duration_seconds{node_id, task_type}
+	TasksTotal   *prometheus.CounterVec   // agent_tasks_total{node_id, task_type, status}
+	TaskDuration *prometheus.HistogramVec // agent_task_duration_seconds{node_id, task_type}
 
 	// Runtime tracking
-	RuntimeCount  *prometheus.GaugeVec // agent_runtime_count{node_id, backend, state}
+	RuntimeCount *prometheus.GaugeVec // agent_runtime_count{node_id, backend, state}
 
 	// Hardware metrics (updated from telemetry collection)
-	CPUUsage     *prometheus.GaugeVec // agent_cpu_usage{node_id} — utilization %
-	MemoryUsage  *prometheus.GaugeVec // agent_memory_usage{node_id} — used MB
-	MemoryTotal  *prometheus.GaugeVec // agent_memory_total{node_id} — total MB
+	CPUUsage    *prometheus.GaugeVec // agent_cpu_usage{node_id} — utilization %
+	MemoryUsage *prometheus.GaugeVec // agent_memory_usage{node_id} — used MB
+	MemoryTotal *prometheus.GaugeVec // agent_memory_total{node_id} — total MB
 
 	// GPU metrics (per device)
 	GPUMemoryUsed  *prometheus.GaugeVec // agent_gpu_memory_used{node_id, device_index}

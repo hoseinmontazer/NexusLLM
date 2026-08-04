@@ -337,17 +337,28 @@ func (e *Executor) discoverPortForBackend(ctx context.Context, containerName, ba
 
 		switch backend {
 		case "ollama":
-			// Ollama binds to OLLAMA_HOST — never honours --port.
-			port = e.inspectEnvPort(ctx, containerName, []string{"OLLAMA_HOST"})
-			if port > 0 {
-				method = "env_var:OLLAMA_HOST"
+			// Ollama: try PortBindings first (bridge mode), then inspect OLLAMA_HOST env var.
+			if p := e.runningContainerPort(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings_or_arg"
+			} else {
+				port = e.inspectEnvPort(ctx, containerName, []string{"OLLAMA_HOST"})
+				if port > 0 {
+					method = "env_var:OLLAMA_HOST"
+				}
 			}
 
 		case "cpu_native":
-			// cpu_native images read PORT/HTTP_PORT/UVICORN_PORT; no --port arg.
-			port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
-			if port > 0 {
-				method = "env_var:PORT/HTTP_PORT/UVICORN_PORT"
+			// cpu_native (Whisper, STT, Kokoro TTS, Infinity, EasyOCR):
+			// Try PortBindings first (bridge mode), then inspect PORT/HTTP_PORT/UVICORN_PORT env vars (host mode).
+			if p := e.runningContainerPort(ctx, containerName); p > 0 {
+				port = p
+				method = "port_bindings_or_arg"
+			} else {
+				port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
+				if port > 0 {
+					method = "env_var:PORT/HTTP_PORT/UVICORN_PORT"
+				}
 			}
 
 		case "vllm", "tgi", "llamacpp":
@@ -1014,8 +1025,8 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 			// inspect.  The control plane must persist this value into
 			// agent_runtimes.bind_port and model_endpoints.port immediately.
 			// Never use the stale requested port for routing.
-			"bind_port":    p.BindPort,
-			"actual_port":  p.BindPort, // explicit alias for clarity at the receiver
+			"bind_port":   p.BindPort,
+			"actual_port": p.BindPort, // explicit alias for clarity at the receiver
 			// Report the resolved gguf_path so the control plane can persist it
 			// in model_runtime_configs — avoids re-download on next container start.
 			"gguf_path": p.GGUFPath,

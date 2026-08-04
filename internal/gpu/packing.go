@@ -14,8 +14,8 @@ import (
 // ModelPlacementRequest describes one model that needs GPU assignment.
 type ModelPlacementRequest struct {
 	ModelName      string
-	RequiredVRAMMB int  // VRAM needed per GPU
-	GPUCount       int  // number of GPUs (= tensor-parallel size)
+	RequiredVRAMMB int // VRAM needed per GPU
+	GPUCount       int // number of GPUs (= tensor-parallel size)
 }
 
 // PlacementResult maps model names to assigned GPU device indices.

@@ -28,11 +28,11 @@ type EndpointRecord struct {
 	MaxModelLen    int     `db:"max_model_len"`
 	Dtype          string  `db:"dtype"`
 	Quantization   string  `db:"quantization"`
-	RuntimeImage  string `db:"runtime_image"`
-	ExecutionMode string `db:"execution_mode"` // cpu | gpu | auto (from mrc)
-	CPUThreads    int    `db:"cpu_threads"`
-	NUMANode      int    `db:"numa_node"`
-	MemoryLimit   string `db:"memory_limit"`
+	RuntimeImage   string  `db:"runtime_image"`
+	ExecutionMode  string  `db:"execution_mode"` // cpu | gpu | auto (from mrc)
+	CPUThreads     int     `db:"cpu_threads"`
+	NUMANode       int     `db:"numa_node"`
+	MemoryLimit    string  `db:"memory_limit"`
 }
 
 // ModelController manages runtime lifecycle operations.

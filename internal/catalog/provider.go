@@ -47,40 +47,40 @@ func (m ExposureMode) IsVirtual() bool {
 // a cloud provider: credentials, transport, sync config, and health state.
 // One provider → many catalog entries. One provider → one *http.Client.
 type Provider struct {
-	ID          string `db:"id"`
-	Name        string `db:"name"`
-	DisplayName string `db:"display_name"`
-	BackendType string `db:"backend_type"`
-	BaseURL     string `db:"base_url"`
-	APIKey      string `db:"api_key"`
+	ID           string `db:"id"`
+	Name         string `db:"name"`
+	DisplayName  string `db:"display_name"`
+	BackendType  string `db:"backend_type"`
+	BaseURL      string `db:"base_url"`
+	APIKey       string `db:"api_key"`
 	APIKeyHeader string `db:"api_key_header"`
 
 	// ExposureMode controls how this provider's models are surfaced.
 	// Migration 050 adds this column; existing rows default to "managed".
 	// catalog_direct_expose is kept in sync by a DB trigger and must NOT be
 	// written directly — always update ExposureMode instead.
-	ExposureMode        ExposureMode `db:"exposure_mode"`
+	ExposureMode ExposureMode `db:"exposure_mode"`
 
-	CatalogSyncEnabled  bool      `db:"catalog_sync_enabled"`
-	CatalogSyncInterval int       `db:"catalog_sync_interval"` // seconds
-	CatalogDirectExpose bool      `db:"catalog_direct_expose"`
-	CatalogExposePrefix string    `db:"catalog_expose_prefix"`
+	CatalogSyncEnabled  bool       `db:"catalog_sync_enabled"`
+	CatalogSyncInterval int        `db:"catalog_sync_interval"` // seconds
+	CatalogDirectExpose bool       `db:"catalog_direct_expose"`
+	CatalogExposePrefix string     `db:"catalog_expose_prefix"`
 	CatalogLastSyncedAt *time.Time `db:"catalog_last_synced_at"`
-	CatalogModelCount   int       `db:"catalog_model_count"`
-	CatalogSyncStatus   string    `db:"catalog_sync_status"`
-	CatalogSyncError    string    `db:"catalog_sync_error"`
+	CatalogModelCount   int        `db:"catalog_model_count"`
+	CatalogSyncStatus   string     `db:"catalog_sync_status"`
+	CatalogSyncError    string     `db:"catalog_sync_error"`
 
 	// Transport mirrors migration 046/047 columns.
-	ProxyURL                       string `db:"proxy_url"`
-	TLSInsecureSkipVerify          bool   `db:"tls_insecure_skip_verify"`
-	TLSRootCAPEM                   string `db:"tls_root_ca_pem"`
-	ConnectTimeoutSeconds          int    `db:"connect_timeout_seconds"`
-	ReadTimeoutSeconds             int    `db:"read_timeout_seconds"`
-	IdleConnTimeoutSeconds         int    `db:"idle_conn_timeout_seconds"`
-	ResponseHeaderTimeoutSeconds   int    `db:"response_header_timeout_seconds"`
-	MaxIdleConnsPerHost            int    `db:"max_idle_conns_per_host"`
-	MaxConnsPerHost                int    `db:"max_conns_per_host"`
-	DisableHTTP2                   bool   `db:"disable_http2"`
+	ProxyURL                     string `db:"proxy_url"`
+	TLSInsecureSkipVerify        bool   `db:"tls_insecure_skip_verify"`
+	TLSRootCAPEM                 string `db:"tls_root_ca_pem"`
+	ConnectTimeoutSeconds        int    `db:"connect_timeout_seconds"`
+	ReadTimeoutSeconds           int    `db:"read_timeout_seconds"`
+	IdleConnTimeoutSeconds       int    `db:"idle_conn_timeout_seconds"`
+	ResponseHeaderTimeoutSeconds int    `db:"response_header_timeout_seconds"`
+	MaxIdleConnsPerHost          int    `db:"max_idle_conns_per_host"`
+	MaxConnsPerHost              int    `db:"max_conns_per_host"`
+	DisableHTTP2                 bool   `db:"disable_http2"`
 
 	RequestTimeoutSeconds int `db:"request_timeout_seconds"`
 	MaxRetries            int `db:"max_retries"`
@@ -190,7 +190,6 @@ func (s *ProviderStore) UpdateExposureMode(ctx context.Context, id string, mode 
 		id, string(mode))
 	return err
 }
-
 
 func (s *ProviderStore) UpdateHealth(ctx context.Context, id, health string) error {
 	_, err := s.db.ExecContext(ctx,

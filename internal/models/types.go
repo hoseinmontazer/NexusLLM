@@ -331,8 +331,8 @@ type ModelObject struct {
 
 	// Extended fields — populated for provider catalog models.
 	// nil/zero → omitted from JSON (omitempty).
-	Name        string               `json:"name,omitempty"`
-	Description string               `json:"description,omitempty"`
+	Name          string             `json:"name,omitempty"`
+	Description   string             `json:"description,omitempty"`
 	ContextLength *int               `json:"context_length,omitempty"`
 	Architecture  *ModelArchitecture `json:"architecture,omitempty"`
 	Pricing       *ModelPricing      `json:"pricing,omitempty"`
@@ -355,18 +355,18 @@ type ModelArchitecture struct {
 // Values are strings in scientific notation (e.g. "0.000001") to match
 // OpenRouter's response format exactly.
 type ModelPricing struct {
-	Prompt           string `json:"prompt,omitempty"`
-	Completion       string `json:"completion,omitempty"`
-	InputCacheRead   string `json:"input_cache_read,omitempty"`
-	InputCacheWrite  string `json:"input_cache_write,omitempty"`
-	Image            string `json:"image,omitempty"`
+	Prompt          string `json:"prompt,omitempty"`
+	Completion      string `json:"completion,omitempty"`
+	InputCacheRead  string `json:"input_cache_read,omitempty"`
+	InputCacheWrite string `json:"input_cache_write,omitempty"`
+	Image           string `json:"image,omitempty"`
 }
 
 // ModelTopProvider holds provider-level limits reported alongside the model.
 type ModelTopProvider struct {
-	ContextLength       *int  `json:"context_length,omitempty"`
-	MaxCompletionTokens *int  `json:"max_completion_tokens,omitempty"`
-	IsModerated         bool  `json:"is_moderated"`
+	ContextLength       *int `json:"context_length,omitempty"`
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
+	IsModerated         bool `json:"is_moderated"`
 }
 
 // ErrorResponse is the standard OpenAI-compatible error envelope.

@@ -1,5 +1,4 @@
 'use client'
-'use client'
 
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
@@ -815,295 +814,218 @@ function OverviewTab({ providerId }: { providerId: string }) {
   )
 }
 
+
 // ── Project Access tab (shown on provider detail page) ────────────────────────
-// Lists every project that has been granted access to this provider's virtual
-// catalog models, with inline revoke and prefix-edit capabilities.
+// Read-only summary of which projects have been granted access to this provider.
+// Grant management lives in Projects → Provider Access (single source of truth).
 
 function ProjectAccessTab({ providerId, providerName }: { providerId: string; providerName: string }) {
   const qc = useQueryClient()
 
-  // We load all projects so the grant form can pick one from a dropdown.
-  const { data: projectsData } = useQuery({
+  // Load all projects so we can map IDs to names and check grants per-project.
+  const { data: projectsData, isLoading: projectsLoading } = useQuery({
     queryKey: ['projects'],
     queryFn: () => api.projects.list(),
     staleTime: 60_000,
   })
   const allProjects = projectsData?.data ?? []
 
-  // Load all grants for this provider by querying each project's access list.
-  // The admin API doesn't expose a "list by provider" endpoint, so we use the
-  // project list then filter client-side. For large deployments this is fine
-  // because the project count is typically small (tens, not thousands).
-  // A simpler approach: just let the user paste a project ID.
-  const [grantProjectId, setGrantProjectId] = useState('')
-  const [allowedPrefixes, setAllowedPrefixes] = useState('')
-  const [deniedPrefixes, setDeniedPrefixes] = useState('')
-  const [showGrantForm, setShowGrantForm] = useState(false)
+  // For each project, check whether it has a grant for this provider.
+  // We load per-project data lazily only when a project is selected.
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
 
-  // Per-project grant list — only fetch for a selected project for preview.
-  const [previewProjectId, setPreviewProjectId] = useState<string | null>(null)
-  const { data: previewData } = useQuery({
-    queryKey: ['project-provider-access', previewProjectId],
-    queryFn: () => api.providerAccess.list(previewProjectId!),
-    enabled: !!previewProjectId,
+  const { data: grantData, isLoading: grantLoading } = useQuery({
+    queryKey: ['project-provider-access', selectedProjectId],
+    queryFn: () => api.providerAccess.list(selectedProjectId!),
+    enabled: !!selectedProjectId,
+    staleTime: 30_000,
   })
 
-  // Grant mutation
-  const grantMut = useMutation({
-    mutationFn: () =>
-      api.providerAccess.grant(grantProjectId, {
-        provider_id: providerId,
-        allowed_prefixes: allowedPrefixes
-          ? allowedPrefixes.split('\n').map(s => s.trim()).filter(Boolean)
-          : [],
-        denied_prefixes: deniedPrefixes
-          ? deniedPrefixes.split('\n').map(s => s.trim()).filter(Boolean)
-          : [],
-      }),
-    onSuccess: (r) => {
-      toast({ title: `Access granted to project ${r.provider_name ?? ''}` })
-      setShowGrantForm(false)
-      setGrantProjectId('')
-      setAllowedPrefixes('')
-      setDeniedPrefixes('')
-      // Refresh the preview if we just granted the same project
-      if (previewProjectId === grantProjectId) {
-        qc.invalidateQueries({ queryKey: ['project-provider-access', previewProjectId] })
-      }
-    },
-    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
-  })
+  const grantsForThisProvider = (grantData?.data ?? []).filter(
+    g => g.provider_id === providerId,
+  )
 
-  // Revoke mutation
   const revokeMut = useMutation({
-    mutationFn: ({ projectId, pId }: { projectId: string; pId: string }) =>
-      api.providerAccess.revoke(projectId, pId),
-    onSuccess: (_, { projectId }) => {
+    mutationFn: (pid: string) =>
+      api.providerAccess.revoke(selectedProjectId!, pid),
+    onSuccess: () => {
       toast({ title: 'Access revoked' })
-      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', selectedProjectId] })
     },
     onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
   })
-
-  // Filter grants belonging to this provider from the preview
-  const grantsForThisProvider = (previewData?.data ?? []).filter(
-    (g) => g.provider_id === providerId,
-  )
 
   return (
     <div className="space-y-5 max-w-2xl">
       {/* Explainer */}
       <div className="rounded-md bg-violet-50 border border-violet-200 px-4 py-3 text-xs text-violet-800 space-y-1">
-        <p className="font-semibold">Project-level authorization for Catalog / Hybrid mode</p>
+        <p className="font-semibold flex items-center gap-1.5">
+          <Users className="w-3.5 h-3.5" />Project-level Authorization
+        </p>
         <p>
-          In <strong>Catalog</strong> or <strong>Hybrid</strong> mode, projects must be explicitly granted
-          access to this provider before their API keys can call virtual models. Rate limits, quota, and
-          usage accounting continue to apply — only model discovery changes.
+          This view shows which projects have been granted access to virtual models from this provider.
+          To grant or edit access, open the project and go to its{' '}
+          <strong>Provider Access</strong> tab — that is the single place to manage grants.
         </p>
       </div>
 
-      {/* Grant access form */}
+      {/* Project selector */}
       <div className="rounded-lg border bg-white p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold">Grant Project Access</p>
-          <Button size="sm" variant={showGrantForm ? 'outline' : 'default'}
-            onClick={() => setShowGrantForm(v => !v)}>
-            {showGrantForm ? 'Cancel' : '+ Grant Access'}
-          </Button>
-        </div>
-
-        {showGrantForm && (
-          <div className="space-y-3 pt-1">
-            <div>
-              <Label className="text-xs">Project</Label>
-              <select
-                className="w-full border rounded-md h-9 px-3 text-sm mt-1"
-                value={grantProjectId}
-                onChange={e => setGrantProjectId(e.target.value)}
-              >
-                <option value="">— select project —</option>
-                {allProjects.map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label className="text-xs">
-                  Allowed prefixes{' '}
-                  <span className="text-muted-foreground font-normal">(one glob per line, empty = allow all)</span>
-                </Label>
-                <textarea
-                  rows={3}
-                  value={allowedPrefixes}
-                  onChange={e => setAllowedPrefixes(e.target.value)}
-                  className="w-full border rounded-md px-3 py-2 text-xs font-mono mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
-                  placeholder={`${providerName}/openai/*\n${providerName}/anthropic/*`}
-                />
-              </div>
-              <div>
-                <Label className="text-xs">
-                  Denied prefixes{' '}
-                  <span className="text-muted-foreground font-normal">(one glob per line, empty = deny none)</span>
-                </Label>
-                <textarea
-                  rows={3}
-                  value={deniedPrefixes}
-                  onChange={e => setDeniedPrefixes(e.target.value)}
-                  className="w-full border rounded-md px-3 py-2 text-xs font-mono mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
-                  placeholder={`${providerName}/openai/gpt-4-*`}
-                />
-              </div>
-            </div>
-
-            <div className="rounded-md bg-gray-50 border px-3 py-2 text-[11px] text-muted-foreground space-y-0.5">
-              <p>• Leave both lists empty to allow the project to call <strong>all</strong> virtual models from this provider.</p>
-              <p>• Glob patterns use <code className="bg-white px-0.5 rounded">*</code> for single-segment wildcard. Example: <code className="bg-white px-0.5 rounded">{providerName}/openai/*</code></p>
-              <p>• Denied prefixes are checked first — deny wins over allow.</p>
-            </div>
-
-            <Button
-              size="sm"
-              onClick={() => grantMut.mutate()}
-              disabled={grantMut.isPending || !grantProjectId}
-            >
-              {grantMut.isPending ? (
-                <><Loader2 className="w-3 h-3 animate-spin mr-1" />Granting…</>
-              ) : (
-                <><Users className="w-3 h-3 mr-1" />Grant Access</>
-              )}
-            </Button>
-          </div>
-        )}
-      </div>
-
-      {/* Look up existing grants for a project */}
-      <div className="rounded-lg border bg-white p-4 space-y-3">
-        <p className="text-xs font-semibold">Check Project Access</p>
+        <p className="text-xs font-semibold">Check a project's access</p>
         <div className="flex gap-2 items-center">
           <select
             className="flex-1 border rounded-md h-9 px-3 text-sm"
-            value={previewProjectId ?? ''}
-            onChange={e => setPreviewProjectId(e.target.value || null)}
+            value={selectedProjectId ?? ''}
+            onChange={e => setSelectedProjectId(e.target.value || null)}
           >
-            <option value="">— select project to view its grants —</option>
+            <option value="">— select a project —</option>
             {allProjects.map(p => (
               <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
         </div>
 
-        {previewProjectId && (
-          <div>
-            {grantsForThisProvider.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-2">
-                This project has no access grant for this provider.
-              </p>
-            ) : (
-              <div className="space-y-2 mt-2">
-                {grantsForThisProvider.map(g => (
-                  <div key={g.id}
-                    className="rounded-md border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
-                            g.enabled
-                              ? 'bg-green-50 text-green-700 border-green-200'
-                              : 'bg-gray-100 text-gray-500 border-gray-200'
-                          }`}>
-                            {g.enabled ? 'active' : 'revoked'}
-                          </span>
-                          <span className="text-muted-foreground">granted {new Date(g.created_at).toLocaleDateString()}</span>
-                        </div>
-                        {g.allowed_prefixes?.length > 0 && (
-                          <div>
-                            <span className="text-muted-foreground">Allow: </span>
-                            {g.allowed_prefixes.map(p => (
-                              <code key={p} className="bg-white border border-violet-200 px-1 py-0.5 rounded mr-1">{p}</code>
-                            ))}
-                          </div>
-                        )}
-                        {g.denied_prefixes?.length > 0 && (
-                          <div>
-                            <span className="text-muted-foreground">Deny: </span>
-                            {g.denied_prefixes.map(p => (
-                              <code key={p} className="bg-white border border-red-200 px-1 py-0.5 rounded mr-1 text-red-700">{p}</code>
-                            ))}
-                          </div>
-                        )}
-                        {(!g.allowed_prefixes?.length && !g.denied_prefixes?.length) && (
-                          <span className="text-green-700">All virtual models allowed (no prefix restrictions)</span>
-                        )}
-                      </div>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 px-2 text-xs text-red-600 border-red-300 hover:bg-red-50 shrink-0"
-                        disabled={revokeMut.isPending || !g.enabled}
-                        onClick={() => revokeMut.mutate({ projectId: previewProjectId, pId: g.provider_id })}
-                      >
-                        Revoke
-                      </Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+        {selectedProjectId && grantLoading && (
+          <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />Loading…
+          </p>
+        )}
+
+        {selectedProjectId && !grantLoading && grantsForThisProvider.length === 0 && (
+          <div className="rounded-md bg-gray-50 border px-3 py-3 text-xs text-muted-foreground space-y-2">
+            <p>This project has no access grant for <strong>{providerName}</strong>.</p>
+            <p>
+              To grant access, open the project in{' '}
+              <a
+                href={`/projects/${selectedProjectId}`}
+                className="text-blue-600 underline hover:no-underline"
+              >
+                Projects → {allProjects.find(p => p.id === selectedProjectId)?.name ?? selectedProjectId}
+              </a>{' '}
+              and go to its <strong>Provider Access</strong> tab.
+            </p>
           </div>
         )}
 
-        {!previewProjectId && (
+        {grantsForThisProvider.length > 0 && (
+          <div className="space-y-2">
+            {grantsForThisProvider.map(g => (
+              <div key={g.id} className={`rounded-lg border px-3 py-2.5 text-xs space-y-1.5 ${
+                g.enabled ? 'border-violet-200 bg-violet-50/40' : 'border-gray-200 bg-gray-50 opacity-60'
+              }`}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                        g.enabled
+                          ? 'bg-green-100 text-green-700 border-green-200'
+                          : 'bg-gray-100 text-gray-500 border-gray-200'
+                      }`}>
+                        {g.enabled ? 'active' : 'revoked'}
+                      </span>
+                      <span className="text-muted-foreground">
+                        granted {new Date(g.created_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                    {g.allowed_prefixes?.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1">
+                        <span className="text-muted-foreground">Allow:</span>
+                        {g.allowed_prefixes.map(p => (
+                          <code key={p} className="bg-white border border-violet-200 px-1.5 py-0.5 rounded text-violet-700">{p}</code>
+                        ))}
+                      </div>
+                    )}
+                    {g.denied_prefixes?.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1">
+                        <span className="text-muted-foreground">Deny:</span>
+                        {g.denied_prefixes.map(p => (
+                          <code key={p} className="bg-white border border-red-200 px-1.5 py-0.5 rounded text-red-700">{p}</code>
+                        ))}
+                      </div>
+                    )}
+                    {!g.allowed_prefixes?.length && !g.denied_prefixes?.length && (
+                      <span className="text-green-700 flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" />All virtual models allowed
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-1 shrink-0">
+                    <a
+                      href={`/projects/${selectedProjectId}`}
+                      className="text-[10px] px-2 py-1 rounded border border-blue-200 text-blue-700 hover:bg-blue-50 transition-colors"
+                    >
+                      Edit in project →
+                    </a>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-red-600 hover:bg-red-50"
+                      disabled={revokeMut.isPending || !g.enabled}
+                      onClick={() => revokeMut.mutate(g.provider_id)}
+                    >
+                      Revoke
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!selectedProjectId && (
           <p className="text-xs text-muted-foreground">
-            Select a project to inspect its current access grants for this provider.
+            Select a project above to see its current access grant for this provider.
           </p>
         )}
+      </div>
+
+      {/* Quick navigation hint */}
+      <div className="rounded-md border bg-white px-4 py-3 text-xs text-muted-foreground">
+        <p className="font-medium text-foreground mb-1">Where to manage grants</p>
+        <p>
+          Go to <strong>Projects</strong>, open any project, and select the{' '}
+          <strong>Provider Access</strong> tab to grant, edit prefix rules, or revoke access.
+          Changes take effect in the gateway within 60 seconds.
+        </p>
       </div>
     </div>
   )
 }
 
 // ── Live Models tab ────────────────────────────────────────────────────────────
-// Calls GET /v1/providers/:name/models on the gateway and renders the raw
-// provider response — exactly what you'd get calling the provider directly.
+// Calls GET /admin/v1/providers/:id/live-models on the admin server, which
+// proxies the request to the provider using stored credentials and transport
+// config (including proxy). No client-side API key or localStorage needed.
 
-function LiveModelsTab({ providerName }: { providerName: string }) {
-  const [apiKey, setApiKey] = useState<string>(() =>
-    typeof window !== 'undefined' ? localStorage.getItem('nexus_api_key') ?? '' : ''
-  )
+function LiveModelsTab({ providerId, providerDisplayName }: { providerId: string; providerDisplayName: string }) {
   const [q, setQ] = useState('')
 
-  const saveKey = (k: string) => {
-    setApiKey(k)
-    if (typeof window !== 'undefined') localStorage.setItem('nexus_api_key', k)
-  }
-
   const { data, isLoading, error, refetch, isFetching } = useQuery({
-    queryKey: ['provider-live-models', providerName, apiKey],
-    queryFn: () => api.gateway.providerModels(providerName, apiKey || undefined),
-    enabled: !!apiKey,
-    staleTime: 5 * 60 * 1000, // cache 5 min — provider catalog doesn't change often
+    queryKey: ['provider-live-models', providerId],
+    queryFn: () => api.providers.liveModels(providerId),
+    staleTime: 5 * 60 * 1000,
     retry: false,
   })
 
-  const models = (data?.data ?? []).filter(m =>
+  const allModels = data?.data ?? []
+  const models = allModels.filter(m =>
     !q || m.id.toLowerCase().includes(q.toLowerCase()) ||
     (m.name ?? '').toLowerCase().includes(q.toLowerCase())
   )
 
-  const fmtCtx = (n?: number) => n ? (n >= 1_000_000 ? (n/1_000_000).toFixed(1)+'M' : (n/1_000).toFixed(0)+'K') : '—'
+  const fmtCtx = (n?: number) => {
+    if (!n) return '—'
+    return n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M' : (n / 1_000).toFixed(0) + 'K'
+  }
   const fmtPrice = (s?: string) => {
     if (!s || s === '0') return '—'
     const v = parseFloat(s)
     if (isNaN(v)) return s
-    // Convert per-token → per-1M for readability
     const perM = v * 1_000_000
     return '$' + (perM < 0.01 ? perM.toExponential(2) : perM.toFixed(perM < 1 ? 3 : 2))
   }
-
   const modalityIcon = (mod?: string) => {
-    if (!mod) return null
+    if (!mod) return '💬'
     if (mod.includes('image')) return '🖼'
     if (mod.includes('audio') || mod.includes('video')) return '🎤'
     return '💬'
@@ -1111,70 +1033,48 @@ function LiveModelsTab({ providerName }: { providerName: string }) {
 
   return (
     <div className="space-y-4">
-      {/* API key input — needed because this calls the gateway, not the admin API */}
-      <div className="rounded-lg border bg-amber-50 border-amber-200 p-3 space-y-2">
-        <p className="text-xs font-semibold text-amber-900 flex items-center gap-1.5">
-          <Zap className="w-3.5 h-3.5" />Gateway API Key Required
-        </p>
-        <p className="text-xs text-amber-800">
-          This tab calls <code className="bg-amber-100 px-1 rounded">GET /v1/providers/{providerName}/models</code> on the
-          gateway server with your NexusLLM API key, which proxies the request through to the provider using the
-          configured proxy. Enter any active API key below.
-        </p>
-        <div className="flex gap-2">
-          <Input
-            type="password"
-            value={apiKey}
-            onChange={e => saveKey(e.target.value)}
-            placeholder="nxs_…"
-            className="font-mono text-xs h-8 flex-1"
+      {/* Search + refresh */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1.5 border rounded-md px-2.5 h-8 bg-white text-xs flex-1 min-w-48">
+          <Search className="w-3 h-3 text-muted-foreground shrink-0" />
+          <input
+            className="outline-none bg-transparent w-full"
+            placeholder="filter models…"
+            value={q}
+            onChange={e => setQ(e.target.value)}
           />
-          <Button size="sm" variant="outline" className="h-8 shrink-0"
-            disabled={!apiKey || isFetching}
-            onClick={() => refetch()}>
-            <RefreshCw className={`w-3 h-3 mr-1 ${isFetching ? 'animate-spin' : ''}`} />
-            {isFetching ? 'Loading…' : 'Fetch'}
-          </Button>
         </div>
-      </div>
-
-      {/* Search */}
-      {data && (
-        <div className="flex items-center gap-2 flex-wrap">
-          <div className="flex items-center gap-1.5 border rounded-md px-2.5 h-8 bg-white text-xs flex-1 min-w-48">
-            <Search className="w-3 h-3 text-muted-foreground shrink-0" />
-            <input className="outline-none bg-transparent w-full" placeholder="filter models…"
-              value={q} onChange={e => setQ(e.target.value)} />
-          </div>
+        <Button size="sm" variant="outline" className="h-8 shrink-0"
+          disabled={isFetching} onClick={() => refetch()}>
+          <RefreshCw className={`w-3 h-3 mr-1 ${isFetching ? 'animate-spin' : ''}`} />
+          {isFetching ? 'Loading…' : 'Refresh'}
+        </Button>
+        {data && (
           <span className="text-xs text-muted-foreground">
-            {models.length} / {data.data.length} models
+            {models.length} / {allModels.length} models
           </span>
-          <span className="text-xs text-green-700 font-medium">
-            ✓ Live from {providerName}
+        )}
+        {data && (
+          <span className="text-xs text-green-700 font-medium flex items-center gap-1">
+            <CheckCircle2 className="w-3 h-3" />Live from {providerDisplayName}
           </span>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Error */}
       {error && (
         <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-xs text-red-800">
           <strong>Error:</strong> {(error as Error).message}
-          <p className="mt-1 opacity-70">Make sure the API key is valid and the gateway is reachable.</p>
+          <p className="mt-1 opacity-70">
+            Check that the provider's API key and proxy are configured correctly in the Overview tab.
+          </p>
         </div>
       )}
 
-      {/* Loading skeleton */}
+      {/* Loading */}
       {isLoading && (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground py-8 justify-center">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground py-12 justify-center">
           <Loader2 className="w-4 h-4 animate-spin" />Fetching from provider…
-        </div>
-      )}
-
-      {/* No key yet */}
-      {!apiKey && !isLoading && (
-        <div className="rounded-lg border bg-white p-10 text-center text-muted-foreground">
-          <Zap className="w-8 h-8 mx-auto mb-2 opacity-20" />
-          <p className="text-sm font-medium">Enter your NexusLLM API key above to load live models</p>
         </div>
       )}
 
@@ -1187,9 +1087,9 @@ function LiveModelsTab({ providerName }: { providerName: string }) {
                 <th className="text-left px-3 py-2 font-medium">Model ID</th>
                 <th className="text-left px-3 py-2 font-medium">Name</th>
                 <th className="text-left px-3 py-2 font-medium">Modality</th>
-                <th className="text-left px-3 py-2 font-medium">Context</th>
-                <th className="text-left px-3 py-2 font-medium">$/1M in</th>
-                <th className="text-left px-3 py-2 font-medium">$/1M out</th>
+                <th className="text-right px-3 py-2 font-medium">Context</th>
+                <th className="text-right px-3 py-2 font-medium">$/1M in</th>
+                <th className="text-right px-3 py-2 font-medium">$/1M out</th>
                 <th className="text-left px-3 py-2 font-medium">Parameters</th>
                 <th className="text-left px-3 py-2 font-medium">Reasoning</th>
               </tr>
@@ -1203,30 +1103,36 @@ function LiveModelsTab({ providerName }: { providerName: string }) {
                   <td className="px-3 py-2 max-w-[160px]">
                     <p className="font-medium truncate" title={m.name}>{m.name || m.id}</p>
                     {m.description && (
-                      <p className="text-[10px] text-muted-foreground truncate max-w-[150px]" title={m.description}>
+                      <p className="text-[10px] text-muted-foreground line-clamp-2 max-w-[150px]" title={m.description}>
                         {m.description}
                       </p>
                     )}
                   </td>
-                  <td className="px-3 py-2 text-lg" title={m.architecture?.modality}>
-                    {modalityIcon(m.architecture?.modality)}
-                    <span className="text-[9px] text-muted-foreground ml-0.5">{m.architecture?.modality}</span>
+                  <td className="px-3 py-2" title={m.architecture?.modality}>
+                    <span className="text-base">{modalityIcon(m.architecture?.modality)}</span>
+                    <span className="text-[9px] text-muted-foreground ml-0.5 hidden sm:inline">
+                      {m.architecture?.modality}
+                    </span>
                   </td>
-                  <td className="px-3 py-2 tabular-nums whitespace-nowrap">
+                  <td className="px-3 py-2 tabular-nums text-right whitespace-nowrap">
                     {fmtCtx(m.context_length)}
                     {m.top_provider?.max_completion_tokens && (
-                      <div className="text-[9px] text-muted-foreground">out: {fmtCtx(m.top_provider.max_completion_tokens)}</div>
+                      <div className="text-[9px] text-muted-foreground">
+                        out: {fmtCtx(m.top_provider.max_completion_tokens)}
+                      </div>
                     )}
                   </td>
-                  <td className="px-3 py-2 tabular-nums font-mono">{fmtPrice(m.pricing?.prompt)}</td>
-                  <td className="px-3 py-2 tabular-nums font-mono">{fmtPrice(m.pricing?.completion)}</td>
+                  <td className="px-3 py-2 tabular-nums font-mono text-right">{fmtPrice(m.pricing?.prompt)}</td>
+                  <td className="px-3 py-2 tabular-nums font-mono text-right">{fmtPrice(m.pricing?.completion)}</td>
                   <td className="px-3 py-2 max-w-[180px]">
                     <div className="flex flex-wrap gap-0.5">
                       {(m.supported_parameters ?? []).slice(0, 6).map(p => (
                         <span key={p} className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-600 whitespace-nowrap">{p}</span>
                       ))}
                       {(m.supported_parameters?.length ?? 0) > 6 && (
-                        <span className="text-[9px] text-muted-foreground">+{(m.supported_parameters?.length ?? 0) - 6}</span>
+                        <span className="text-[9px] text-muted-foreground">
+                          +{(m.supported_parameters?.length ?? 0) - 6}
+                        </span>
                       )}
                     </div>
                   </td>
@@ -1241,9 +1147,7 @@ function LiveModelsTab({ providerName }: { providerName: string }) {
                           {m.reasoning.mandatory ? 'required' : 'optional'}
                         </span>
                         {m.reasoning.default_effort && (
-                          <div className="text-[9px] text-muted-foreground">
-                            default: {m.reasoning.default_effort}
-                          </div>
+                          <div className="text-[9px] text-muted-foreground">default: {m.reasoning.default_effort}</div>
                         )}
                         {(m.reasoning.supported_efforts ?? []).length > 0 && (
                           <div className="flex flex-wrap gap-0.5 mt-0.5">
@@ -1264,17 +1168,25 @@ function LiveModelsTab({ providerName }: { providerName: string }) {
         </div>
       )}
 
-      {/* Empty filter result */}
+      {/* Empty filter */}
       {data && models.length === 0 && q && (
         <p className="text-sm text-muted-foreground text-center py-6">
           No models match <strong>{q}</strong>
         </p>
       )}
+
+      {/* Empty — no data loaded yet */}
+      {!data && !isLoading && !error && (
+        <div className="rounded-lg border bg-white p-12 text-center text-muted-foreground">
+          <Globe className="w-8 h-8 mx-auto mb-2 opacity-20" />
+          <p className="text-sm font-medium">Click Refresh to load live models from the provider</p>
+        </div>
+      )}
     </div>
   )
 }
 
-// ── Main provider detail page ──────────────────────────────────────────────────
+// ---- Main provider detail page
 
 type Tab = 'overview' | 'catalog' | 'rules' | 'access' | 'live'
 
@@ -1371,7 +1283,7 @@ export default function ProviderDetailPage() {
           />
         )}
         {tab === 'live' && (
-          <LiveModelsTab providerName={p?.name ?? id} />
+          <LiveModelsTab providerId={id} providerDisplayName={p?.display_name ?? p?.name ?? id} />
         )}
       </div>
     </div>

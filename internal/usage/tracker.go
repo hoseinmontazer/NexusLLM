@@ -550,21 +550,22 @@ func (t *Tracker) GetTeamRealtimeUsage(ctx context.Context, teamID, from, to str
 // to the Tracker's default per-1M-token rates.
 //
 // Token priority for cost:
-//   cachedTokens   → cached_input_cost_per_1m  (lower rate, provider discount)
-//   reasoningTokens → reasoning_cost_per_1m     (may differ from output rate)
-//   promptTokens   → input_cost_per_1m          (remaining input tokens)
-//   completionTokens → output_cost_per_1m
+//
+//	cachedTokens   → cached_input_cost_per_1m  (lower rate, provider discount)
+//	reasoningTokens → reasoning_cost_per_1m     (may differ from output rate)
+//	promptTokens   → input_cost_per_1m          (remaining input tokens)
+//	completionTokens → output_cost_per_1m
 func (t *Tracker) computeCostForModel(ctx context.Context, modelID string, prompt, completion, cached, reasoning int) float64 {
 	if modelID == "" {
 		return t.computeCostDefault(prompt, completion)
 	}
 
 	type costRow struct {
-		InputPer1M    float64 `db:"input_cost_per_1m"`
-		OutputPer1M   float64 `db:"output_cost_per_1m"`
-		CachedPer1M   float64 `db:"cached_input_cost_per_1m"`
-		ReasonPer1M   float64 `db:"reasoning_cost_per_1m"`
-		PerRequest    float64 `db:"per_request_cost_usd"`
+		InputPer1M  float64 `db:"input_cost_per_1m"`
+		OutputPer1M float64 `db:"output_cost_per_1m"`
+		CachedPer1M float64 `db:"cached_input_cost_per_1m"`
+		ReasonPer1M float64 `db:"reasoning_cost_per_1m"`
+		PerRequest  float64 `db:"per_request_cost_usd"`
 	}
 	var row costRow
 	err := t.db.GetContext(ctx, &row, `
