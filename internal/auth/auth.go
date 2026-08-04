@@ -41,9 +41,12 @@ const (
 // Display-only:    TeamName, ProjectName  (never used in runtime decisions)
 type RequestClaims struct {
 	// Stable identifiers — the only fields that may drive runtime logic.
+	UserID    string `json:"user_id,omitempty"`
 	OrgID     string `json:"org_id"`
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Email     string `json:"email,omitempty"`
 
 	// RBAC/membership — used only for model ACL and prompt-policy lookups.
 	// Must never be used for rate limiting, scheduling, or quota evaluation.

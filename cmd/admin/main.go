@@ -18,6 +18,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/admin/handlers"
 	"github.com/nexusllm/nexusllm/internal/agentauth"
 	"github.com/nexusllm/nexusllm/internal/alias"
+	internalauth "github.com/nexusllm/nexusllm/internal/auth"
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/controller"
@@ -198,8 +199,9 @@ func main() {
 	catalogResolver := catalog.NewVirtualModelResolver(db, log)
 	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
 	go catalogScheduler.Start(usageCtx)
+	authSvc := internalauth.NewService(rdb, db, cfg.Auth.JWTSecret, 24*time.Hour)
 	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
-	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver)
+	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver, authSvc)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)

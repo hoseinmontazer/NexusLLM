@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // PortalHandler manages self-service developer portal APIs and provisioning.
@@ -28,6 +30,7 @@ type PortalHandler struct {
 	engine          *policy.Engine
 	registry        *runtime.Registry
 	virtualResolver *catalog.VirtualModelResolver
+	authSvc         *internalauth.Service
 }
 
 // NewPortalHandler constructs a PortalHandler.
@@ -37,6 +40,7 @@ func NewPortalHandler(
 	engine *policy.Engine,
 	registry *runtime.Registry,
 	virtualResolver *catalog.VirtualModelResolver,
+	authSvc *internalauth.Service,
 ) *PortalHandler {
 	return &PortalHandler{
 		db:              db,
@@ -44,6 +48,7 @@ func NewPortalHandler(
 		engine:          engine,
 		registry:        registry,
 		virtualResolver: virtualResolver,
+		authSvc:         authSvc,
 	}
 }
 
@@ -841,8 +846,20 @@ func (h *PortalHandler) notifyDeveloper(ctx context.Context, projID, title, msg,
 }
 
 func hashPassword(password string) string {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		sum := sha256.Sum256([]byte("nexus_salt_" + password))
+		return hex.EncodeToString(sum[:])
+	}
+	return string(bytes)
+}
+
+func checkPassword(password, storedHash string) bool {
+	if strings.HasPrefix(storedHash, "$2a$") || strings.HasPrefix(storedHash, "$2b$") {
+		return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+	}
 	sum := sha256.Sum256([]byte("nexus_salt_" + password))
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]) == storedHash
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -891,13 +908,26 @@ func (h *PortalHandler) RegisterUser(c *gin.Context) {
 		return
 	}
 
+	tokenStr := "dev-jwt-token-" + userID
+	if h.authSvc != nil {
+		t, tErr := h.authSvc.IssueJWT(&internalauth.RequestClaims{
+			UserID: userID,
+			OrgID:  orgID,
+			Role:   "member",
+			Email:  in.Email,
+		}, 24*time.Hour)
+		if tErr == nil {
+			tokenStr = t
+		}
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "registration successful",
 		"user_id": userID,
 		"org_id":  orgID,
 		"email":   in.Email,
-		"role":    "developer",
-		"token":   "dev-jwt-token-" + userID,
+		"role":    "member",
+		"token":   tokenStr,
 	})
 }
 
@@ -930,9 +960,22 @@ func (h *PortalHandler) LoginUser(c *gin.Context) {
 		return
 	}
 
-	if user.PasswordHash != "" && user.PasswordHash != hashPassword(in.Password) {
+	if user.PasswordHash != "" && !checkPassword(in.Password, user.PasswordHash) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
+	}
+
+	tokenStr := "dev-jwt-token-" + user.ID
+	if h.authSvc != nil {
+		t, tErr := h.authSvc.IssueJWT(&internalauth.RequestClaims{
+			UserID: user.ID,
+			OrgID:  user.OrgID,
+			Role:   user.Role,
+			Email:  user.Email,
+		}, 24*time.Hour)
+		if tErr == nil {
+			tokenStr = t
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -941,7 +984,7 @@ func (h *PortalHandler) LoginUser(c *gin.Context) {
 		"org_id":  user.OrgID,
 		"email":   user.Email,
 		"role":    user.Role,
-		"token":   "dev-jwt-token-" + user.ID,
+		"token":   tokenStr,
 	})
 }
 
@@ -969,9 +1012,22 @@ func (h *PortalHandler) AdminLogin(c *gin.Context) {
 		return
 	}
 
-	if user.PasswordHash != "" && user.PasswordHash != hashPassword(in.Password) {
+	if user.PasswordHash != "" && !checkPassword(in.Password, user.PasswordHash) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid admin credentials"})
 		return
+	}
+
+	tokenStr := "admin-jwt-token-" + user.ID
+	if h.authSvc != nil {
+		t, tErr := h.authSvc.IssueJWT(&internalauth.RequestClaims{
+			UserID: user.ID,
+			OrgID:  user.OrgID,
+			Role:   "admin",
+			Email:  user.Email,
+		}, 24*time.Hour)
+		if tErr == nil {
+			tokenStr = t
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -980,6 +1036,6 @@ func (h *PortalHandler) AdminLogin(c *gin.Context) {
 		"org_id":  user.OrgID,
 		"email":   user.Email,
 		"role":    "admin",
-		"token":   "admin-jwt-token-" + user.ID,
+		"token":   tokenStr,
 	})
 }

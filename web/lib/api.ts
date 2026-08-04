@@ -4,9 +4,17 @@
 const BASE = '/api/admin'
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('nexus_token') : null
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
     cache: 'no-store',
   })
@@ -18,6 +26,41 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   const text = await res.text()
   if (!text) return undefined as T
   return JSON.parse(text) as T
+}
+
+export interface AuthUser {
+  user_id: string
+  org_id: string
+  email: string
+  role: 'admin' | 'member' | 'developer' | string
+  token: string
+}
+
+export async function loginUser(email: string, password: string, isAdmin = false): Promise<AuthUser> {
+  const endpoint = isAdmin ? '/auth/login' : '/portal/v1/auth/login'
+  const res = await fetch(`${BASE}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Login failed' }))
+    throw new Error(err.error || 'Authentication failed')
+  }
+  return res.json()
+}
+
+export async function registerUser(email: string, password: string, name?: string, orgName?: string): Promise<AuthUser> {
+  const res = await fetch(`${BASE}/portal/v1/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, name, org_name: orgName }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Registration failed' }))
+    throw new Error(err.error || 'Registration failed')
+  }
+  return res.json()
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────

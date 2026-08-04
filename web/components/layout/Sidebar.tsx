@@ -1,13 +1,14 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import {
   LayoutDashboard, Building2, Users, KeyRound,
   Cpu, Gauge, BarChart3, Settings, Zap,
-  Network, Box, FolderKanban, Shield, Activity, Globe,
+  Network, Shield, Activity, Globe, FolderKanban, LogOut, Bell, FileText
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/lib/auth-context'
 
 import type { LucideIcon } from 'lucide-react'
 
@@ -15,7 +16,7 @@ type NavItem =
   | { section: 'header'; label: string }
   | { section?: undefined; href: string; label: string; icon: LucideIcon }
 
-const nav: NavItem[] = [
+const adminNav: NavItem[] = [
   { href: '/',          label: 'Dashboard',     icon: LayoutDashboard },
 
   { section: 'header',  label: 'INFERENCE' },
@@ -46,10 +47,37 @@ const nav: NavItem[] = [
   { href: '/settings',  label: 'Settings',       icon: Settings },
 ]
 
+const developerNav: NavItem[] = [
+  { section: 'header',  label: 'DEVELOPER PORTAL' },
+  { href: '/portal',            label: 'Portal Overview',   icon: LayoutDashboard },
+  { href: '/portal/requests',   label: 'Access Requests',   icon: Zap },
+  { href: '/portal/projects',   label: 'My Projects',       icon: FolderKanban },
+  { href: '/portal/api-keys',   label: 'My API Keys',       icon: KeyRound },
+  { href: '/portal/models',     label: 'Granted Models',    icon: Cpu },
+  { href: '/portal/usage',      label: 'Usage Analytics',   icon: BarChart3 },
+  { href: '/portal/notifications', label: 'Notifications',  icon: Bell },
+]
+
 export function Sidebar() {
   const path = usePathname()
+  const router = useRouter()
+  const { user, logout } = useAuth()
+
+  const isAdmin = user?.role === 'admin'
+  const navItems = isAdmin ? adminNav : developerNav
+
+  const handleLogout = () => {
+    logout()
+    router.push('/login')
+  }
+
+  // Hide sidebar on login/register pages
+  if (['/login', '/register'].includes(path)) {
+    return null
+  }
+
   return (
-    <aside className="w-56 bg-gray-900 text-white flex flex-col shrink-0">
+    <aside className="w-56 bg-gray-900 text-white flex flex-col shrink-0 border-r border-gray-800">
       {/* Logo */}
       <div className="flex items-center gap-2 px-5 py-4 border-b border-gray-700/60">
         <div className="w-7 h-7 rounded-md bg-blue-600 flex items-center justify-center shrink-0">
@@ -57,13 +85,15 @@ export function Sidebar() {
         </div>
         <div className="flex flex-col leading-none">
           <span className="font-bold text-base tracking-tight">NexusLLM</span>
-          <span className="text-[10px] text-gray-500">AI Infrastructure</span>
+          <span className="text-[10px] text-gray-400">
+            {isAdmin ? 'Platform Admin' : 'Developer Portal'}
+          </span>
         </div>
       </div>
 
       {/* Navigation */}
       <nav className="flex-1 px-2 py-3 overflow-y-auto">
-        {nav.map((item, i) => {
+        {navItems.map((item, i) => {
           if (item.section === 'header') {
             return (
               <p key={i} className="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-widest text-gray-500 uppercase">
@@ -92,19 +122,41 @@ export function Sidebar() {
         })}
       </nav>
 
-      {/* Footer */}
-      <div className="px-3 py-3 border-t border-gray-700/60 space-y-1">
-        <a
-          href="http://localhost:9100"
-          target="_blank"
-          rel="noreferrer"
-          className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors"
-        >
-          <Gauge className="w-3.5 h-3.5" />
-          Prometheus
-          <span className="ml-auto text-gray-600">→</span>
-        </a>
-        <p className="px-2 pt-1 text-[10px] text-gray-600">v0.1.0 · admin panel</p>
+      {/* User Footer Profile & Logout */}
+      <div className="px-3 py-3 border-t border-gray-700/60 space-y-2">
+        {user && (
+          <div className="flex items-center justify-between px-2 py-1 bg-gray-950/60 border border-gray-800 rounded-lg">
+            <div className="flex flex-col min-w-0 pr-1">
+              <span className="text-xs font-semibold text-gray-200 truncate">{user.email}</span>
+              <span className={cn(
+                "text-[10px] font-semibold uppercase tracking-wider",
+                isAdmin ? "text-amber-400" : "text-emerald-400"
+              )}>
+                {user.role || 'Member'}
+              </span>
+            </div>
+            <button
+              onClick={handleLogout}
+              title="Sign Out"
+              className="p-1.5 rounded-md text-gray-400 hover:text-red-400 hover:bg-gray-800 transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {isAdmin && (
+          <a
+            href="http://localhost:9100"
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors"
+          >
+            <Gauge className="w-3.5 h-3.5" />
+            Prometheus Metrics
+            <span className="ml-auto text-gray-600">→</span>
+          </a>
+        )}
       </div>
     </aside>
   )
