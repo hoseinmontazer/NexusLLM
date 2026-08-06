@@ -2,22 +2,78 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useAuth } from '@/lib/auth-context';
 
 export default function DeveloperPortalDashboard() {
+  const { user } = useAuth();
   const [projectsCount, setProjectsCount] = useState(0);
   const [pendingRequestsCount, setPendingRequestsCount] = useState(0);
   const [grantedModelsCount, setGrantedModelsCount] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Simulated fetch or API call to portal endpoints
-    setTimeout(() => {
-      setProjectsCount(3);
-      setPendingRequestsCount(1);
-      setGrantedModelsCount(8);
-      setLoading(false);
-    }, 400);
-  }, []);
+    async function fetchOverviewStats() {
+      setLoading(true);
+      try {
+        const token = typeof window !== 'undefined' ? localStorage.getItem('nexus_token') : null;
+        const headers: Record<string, string> = {};
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+
+        const orgParam = user?.org_id ? `?org_id=${user.org_id}` : '';
+
+        const [projRes, reqRes] = await Promise.all([
+          fetch(`/portal/v1/projects${orgParam}`, { headers }),
+          fetch(`/portal/v1/requests${orgParam}`, { headers }),
+        ]);
+
+        let projectList: any[] = [];
+        if (projRes.ok) {
+          const projData = await projRes.json();
+          projectList = projData.data || [];
+          setProjectsCount(projectList.length);
+        } else {
+          setProjectsCount(0);
+        }
+
+        if (reqRes.ok) {
+          const reqData = await reqRes.json();
+          const reqList = reqData.data || [];
+          const pending = reqList.filter(
+            (r: any) => r.status === 'pending' || r.status === 'submitted' || r.status === 'pending_review'
+          );
+          setPendingRequestsCount(pending.length);
+        } else {
+          setPendingRequestsCount(0);
+        }
+
+        if (projectList.length > 0) {
+          const modelPromises = projectList.map((p: any) =>
+            fetch(`/portal/v1/models?project_id=${p.id}`, { headers })
+              .then((res) => (res.ok ? res.json() : { data: [] }))
+              .catch(() => ({ data: [] }))
+          );
+          const modelResults = await Promise.all(modelPromises);
+          const uniqueModels = new Set<string>();
+          modelResults.forEach((res: any) => {
+            (res.data || []).forEach((m: any) => {
+              if (m.name) uniqueModels.add(m.name);
+            });
+          });
+          setGrantedModelsCount(uniqueModels.size);
+        } else {
+          setGrantedModelsCount(0);
+        }
+      } catch (e) {
+        console.error('Failed to fetch portal overview metrics:', e);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchOverviewStats();
+  }, [user]);
 
   return (
     <div style={{ minHeight: '100vh', background: '#0b0f19', color: '#f8fafc', fontFamily: 'Inter, sans-serif', padding: '32px 48px' }}>
