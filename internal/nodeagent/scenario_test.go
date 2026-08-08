@@ -156,9 +156,9 @@ func TestScenario1_BridgeHostPortWins(t *testing.T) {
 			dockerEnv := envFromDockerArgs(args)
 			assertPortEnvVars(t, dockerEnv, hostPort)
 
-			// (e) NO --port flag for env-driven backends (would collide with env).
-			if portFlagFromDockerArgs(args) != 0 {
-				t.Errorf("backend %q: unexpected --port flag in docker args (should be env-only)", backend)
+			// (e) Dual-path injection: both env vars and --port flag are provided.
+			if portFlagFromDockerArgs(args) != hostPort {
+				t.Errorf("backend %q: expected --port %d flag in docker args (dual-path injection)", backend, hostPort)
 			}
 		})
 	}
@@ -426,8 +426,8 @@ func TestScenario6_BackendMatrix_PortMechanismExclusive(t *testing.T) {
 		wantPortFlag     bool   // expects --port N in CMD args
 		extraForLlamacpp bool
 	}{
-		{"cpu_native", true, false, false},
-		{"openai_compat", true, false, false},
+		{"cpu_native", true, true, false},
+		{"openai_compat", true, true, false},
 		{"vllm", false, true, false},
 		{"tgi", false, true, false},
 		{"llamacpp", false, true, true},
@@ -471,9 +471,6 @@ func TestScenario6_BackendMatrix_PortMechanismExclusive(t *testing.T) {
 
 			if tc.wantEnvPortVars {
 				assertPortEnvVars(t, dockerEnv, port)
-				if portFlag != 0 {
-					t.Errorf("backend %q: got --port %d; want no --port flag", tc.backend, portFlag)
-				}
 			}
 
 			if tc.wantPortFlag {

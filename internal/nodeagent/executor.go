@@ -1372,9 +1372,32 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		// Generic OpenAI-compatible service (faster-whisper, kokoro, surya,
 		// bge-m3, jina, vllm, tgi, custom HTTP servers, etc.)
 		// host networking — the container binds directly to the node's network.
-		// No CMD args are injected here: the image's own ENTRYPOINT/CMD handles
-		// startup. Operators pass backend-specific flags via ExtraArgs.
+		//
+		// Port injection strategy (dual-path):
+		//   1. Env vars: PORT, HTTP_PORT, UVICORN_PORT are injected above for
+		//      servers that read them (uvicorn-based: faster-whisper-server, Kokoro).
+		//   2. --port CMD arg: injected here for CLI-driven servers that ignore env
+		//      vars and only accept --port as a flag (Infinity, TEI-cpu, EasyOCR).
+		//      Only injected when BindPort > 0 and the operator has not already
+		//      supplied --port in ExtraArgs (to avoid duplicates).
 		args = append(args, "--network", "host")
+		if p.BindPort > 0 {
+			hasPortFlag := false
+			for i, a := range p.ExtraArgs {
+				if a == "--port" || a == "-p" {
+					hasPortFlag = true
+					break
+				}
+				if strings.HasPrefix(a, "--port=") {
+					hasPortFlag = true
+					break
+				}
+				_ = i
+			}
+			if !hasPortFlag {
+				args = append(args, "--port", strconv.Itoa(p.BindPort))
+			}
+		}
 	}
 
 	// ── GPU assignment — controlled exclusively by ExecutionMode ─────────────
