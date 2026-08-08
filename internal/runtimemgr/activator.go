@@ -475,7 +475,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		   state, gpu_ids, bind_host, bind_port,
 		   cpu_affinity, numa_node, requested_mode, effective_mode, workload_policy)
 		SELECT $1, $2, me.id, $3, $4, $8, 'pending',
-		       $7::jsonb, me.host, me.port,
+		       $7::jsonb, me.host, $12,
 		       $5, $6, $9, $10, $11
 		FROM model_endpoints me
 		WHERE me.model_id = $3
@@ -489,6 +489,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		requestedMode,
 		effectiveMode,
 		workloadPolicy,
+		cfg.BindPort,
 	)
 	if err != nil {
 		return fmt.Errorf("insert agent_runtime: %w", err)
@@ -543,6 +544,12 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 			// Port environment variables must always reflect the actual allocated BindPort
 			payloadEnv[k] = v
 		}
+	} else {
+		// GAP-1: Strip stale port keys when BindPort == 0.
+		// The agent's executor will dynamically allocate a port and inject these itself.
+		delete(payloadEnv, "PORT")
+		delete(payloadEnv, "HTTP_PORT")
+		delete(payloadEnv, "UVICORN_PORT")
 	}
 
 	payload := taskmanager.StartModelPayload{

@@ -480,6 +480,7 @@ func main() {
 		agent.POST("/tasks/:id/complete", agentH.CompleteTask)
 		agent.POST("/tasks/:id/fail", agentH.FailTask)
 		agent.POST("/inventory", agentH.PushInventory)
+		agent.POST("/recover", agentH.Recover)
 		agent.POST("/telemetry", agentH.PushTelemetry)
 		agent.POST("/model-cache", agentH.PushModelCache)
 		agent.PUT("/runtimes/:id", agentH.UpdateRuntime)

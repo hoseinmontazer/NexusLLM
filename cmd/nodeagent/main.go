@@ -145,7 +145,10 @@ func main() {
 	go nodeagent.StartMetricsServer(metricsAddr)
 	log.Info("agent metrics listening", zap.String("addr", metricsAddr))
 
-	// ── 2. Initial inventory push ─────────────────────────────────────────────
+	// ── 2. Initial inventory and container recovery ───────────────────────────
+	if err := agent.recoverContainers(ctx); err != nil {
+		log.Warn("container recovery push failed (non-fatal)", zap.Error(err))
+	}
 	if err := agent.pushInventory(ctx); err != nil {
 		log.Warn("initial inventory push failed (non-fatal)", zap.Error(err))
 	}
@@ -428,6 +431,24 @@ func (a *Agent) pushInventory(ctx context.Context) error {
 	}
 
 	return a.post(ctx, "/agent/v1/inventory", snapshot, nil)
+}
+
+func (a *Agent) recoverContainers(ctx context.Context) error {
+	recovered := a.executor.RecoverContainers(ctx)
+	if len(recovered) == 0 {
+		return nil
+	}
+
+	payload := make([]map[string]interface{}, 0, len(recovered))
+	for name, port := range recovered {
+		payload = append(payload, map[string]interface{}{
+			"container_name": name,
+			"port":           port,
+		})
+	}
+
+	a.log.Info("reporting recovered containers to control plane", zap.Int("count", len(payload)))
+	return a.post(ctx, "/agent/v1/recover", payload, nil)
 }
 
 // ─── Task poll loop ───────────────────────────────────────────────────────────

@@ -53,3 +53,29 @@ func TestBackendPortEnvVars(t *testing.T) {
 		}
 	}
 }
+
+func TestSTTLazyRestartPortEnvOverride(t *testing.T) {
+	// Simulate payload with stale operator hint UVICORN_PORT=8000
+	payloadEnv := map[string]string{
+		"WHISPER__MODEL": "Systran/faster-whisper-large-v3",
+		"UVICORN_PORT":   "8000",
+	}
+	bindPort := 32781
+
+	// Apply nodeagent backendPortEnvVars overwrite logic (executor.go:906-910)
+	if bindPort > 0 {
+		for k, v := range backendPortEnvVars("openai_compat", bindPort) {
+			payloadEnv[k] = v
+		}
+	}
+
+	if payloadEnv["UVICORN_PORT"] != "32781" {
+		t.Errorf("expected UVICORN_PORT to be overwritten to 32781, got %s", payloadEnv["UVICORN_PORT"])
+	}
+	if payloadEnv["PORT"] != "32781" {
+		t.Errorf("expected PORT to be 32781, got %s", payloadEnv["PORT"])
+	}
+	if payloadEnv["WHISPER__MODEL"] != "Systran/faster-whisper-large-v3" {
+		t.Errorf("expected WHISPER__MODEL to be preserved, got %s", payloadEnv["WHISPER__MODEL"])
+	}
+}

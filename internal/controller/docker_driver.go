@@ -437,10 +437,8 @@ func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) 
 	if d.registry != nil && spec.BindPort > 0 {
 		backend := d.registry.BackendForType(spec.BackendType)
 		for k, v := range backend.ContainerPortEnvVars(spec.BindPort) {
-			// Only inject if not already set by the caller (user overrides win).
-			if _, alreadySet := spec.Env[k]; !alreadySet {
-				spec.Env[k] = v
-			}
+			// Unconditionally inject the correct backend port (system port wins).
+			spec.Env[k] = v
 		}
 	}
 

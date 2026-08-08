@@ -470,6 +470,56 @@ func (h *AgentHandler) PushInventory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"acknowledged": true})
 }
 
+// Recover handles POST /agent/v1/recover
+// Called by a node agent on startup to report any currently running containers
+// and their actual ports. This prevents the gateway from killing containers
+// that were restarted by Docker with new dynamic ports.
+func (h *AgentHandler) Recover(c *gin.Context) {
+	claims := h.getAgentClaims(c)
+	if claims == nil {
+		return
+	}
+
+	var payload []struct {
+		ContainerName string `json:"container_name"`
+		Port          int    `json:"port"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	for _, item := range payload {
+		// Only update if the row belongs to this node and the name matches.
+		// We set state to 'ready' because if it's running and has a port,
+		// it survived the restart.
+		_, err := h.db.ExecContext(c.Request.Context(), `
+			UPDATE agent_runtimes
+			SET actual_port = $1,
+			    bind_port = $1,
+			    state = 'ready',
+			    updated_at = NOW()
+			WHERE node_id = $2
+			  AND runtime_name = $3
+			  AND state NOT IN ('stopped', 'archived', 'deleted', 'failed', 'unloaded')
+		`, item.Port, claims.NodeID, item.ContainerName)
+		if err != nil {
+			h.log.Error("failed to recover container port",
+				zap.Error(err),
+				zap.String("container", item.ContainerName),
+				zap.Int("port", item.Port),
+			)
+		} else {
+			h.log.Info("recovered container port on agent startup",
+				zap.String("container", item.ContainerName),
+				zap.Int("port", item.Port),
+			)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"recovered": len(payload)})
+}
+
 // PushModelCache handles POST /agent/v1/model-cache
 // Stores which models are cached on this node.
 func (h *AgentHandler) PushModelCache(c *gin.Context) {

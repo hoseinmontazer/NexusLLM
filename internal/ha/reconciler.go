@@ -402,28 +402,33 @@ func (r *Reconciler) nodeIP(ctx context.Context, nodeID string) string {
 	return ip
 }
 
-// execute carries out a single start_replica action.
+func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action ReconcileAction) error {
+	_, err := r.executeReturningID(ctx, status, action)
+	return err
+}
+
+// executeReturningID carries out a single start_replica action.
 // It mimics what the admin DeployModel handler does: pre-creates the runtime
 // row with all required fields, allocates a port, then dispatches the task.
-func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action ReconcileAction) error {
+func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatus, action ReconcileAction) (string, error) {
 	logID := uuid.New().String()
 
 	// ── 1. Load full model config ─────────────────────────────────────────────
 	cfg, err := r.loadRuntimeConfig(ctx, action.ModelID)
 	if err != nil {
 		r.recordLog(ctx, logID, action, "", "failed", "loadRuntimeConfig: "+err.Error())
-		return err
+		return "", err
 	}
 	if cfg.Image == "" {
 		r.recordLog(ctx, logID, action, "", "failed", "model has no runtime_image configured")
-		return fmt.Errorf("model %s has no runtime_image", action.ModelName)
+		return "", fmt.Errorf("model %s has no runtime_image", action.ModelName)
 	}
 
 	// ── 2. Allocate unique port on the target node ────────────────────────────
 	port, err := r.allocatePort(ctx, action.TargetNode, action.ModelID)
 	if err != nil {
 		r.recordLog(ctx, logID, action, "", "failed", err.Error())
-		return err
+		return "", err
 	}
 	bindHost := r.nodeIP(ctx, action.TargetNode)
 
@@ -451,7 +456,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 	if txErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, "", "failed", "begin tx: "+txErr.Error())
-		return fmt.Errorf("begin transaction: %w", txErr)
+		return "", fmt.Errorf("begin transaction: %w", txErr)
 	}
 	// Always rollback on error paths; committed tx ignores this.
 	committed := false
@@ -471,7 +476,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 	if slotErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, "", "skipped", "claim_replica_slot error: "+slotErr.Error())
-		return fmt.Errorf("claim_replica_slot: %w", slotErr)
+		return "", fmt.Errorf("claim_replica_slot: %w", slotErr)
 	}
 	if !slotAvailable {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
@@ -481,7 +486,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 			zap.String("model", action.ModelName),
 			zap.Int("desired", status.DesiredReplicas),
 		)
-		return nil // not an error — another process already handled it
+		return "", nil // not an error — another process already handled it
 	}
 
 	res, dbErr := tx.ExecContext(ctx, `
@@ -501,11 +506,11 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 	if dbErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "insert agent_runtime: "+dbErr.Error())
-		return fmt.Errorf("insert runtime row: %w", dbErr)
+		return "", fmt.Errorf("insert runtime row: %w", dbErr)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return fmt.Errorf("insert runtime row: 0 rows affected")
+		return "", fmt.Errorf("insert runtime row: 0 rows affected")
 	}
 
 	// Commit while the advisory lock is still held — the lock releases on commit,
@@ -513,7 +518,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 	if commitErr := tx.Commit(); commitErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "commit tx: "+commitErr.Error())
-		return fmt.Errorf("commit runtime row: %w", commitErr)
+		return "", fmt.Errorf("commit runtime row: %w", commitErr)
 	}
 	committed = true
 
@@ -586,7 +591,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		_, _ = r.db.ExecContext(ctx, `UPDATE agent_runtimes SET state='failed' WHERE id=$1`, runtimeID)
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "enqueue: "+taskErr.Error())
-		return fmt.Errorf("enqueue START_MODEL: %w", taskErr)
+		return "", fmt.Errorf("enqueue START_MODEL: %w", taskErr)
 	}
 
 	r.recordLog(ctx, logID, action, runtimeID, "success", action.Reason)
@@ -600,7 +605,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		zap.Int("port", port),
 		zap.Int("replica", action.ReplicaIdx),
 	)
-	return nil
+	return runtimeID, nil
 }
 
 // resolveExecutionMode determines whether to use GPU or CPU on the target node.
@@ -1130,170 +1135,6 @@ func (r *Reconciler) loadPlacementPolicy(ctx context.Context, modelID string) st
 		return "spread"
 	}
 	return policy
-}
-
-// executeReturningID is like execute() but returns the new runtime's UUID.
-// Used by rolling replacement to link old→new runtime via replaced_by.
-func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatus, action ReconcileAction) (string, error) {
-	logID := uuid.New().String()
-
-	cfg, err := r.loadRuntimeConfig(ctx, action.ModelID)
-	if err != nil {
-		r.recordLog(ctx, logID, action, "", "failed", "loadRuntimeConfig: "+err.Error())
-		return "", err
-	}
-	if cfg.Image == "" {
-		r.recordLog(ctx, logID, action, "", "failed", "model has no runtime_image configured")
-		return "", fmt.Errorf("model %s has no runtime_image", action.ModelName)
-	}
-
-	port, err := r.allocatePort(ctx, action.TargetNode, action.ModelID)
-	if err != nil {
-		r.recordLog(ctx, logID, action, "", "failed", err.Error())
-		return "", err
-	}
-	bindHost := r.nodeIP(ctx, action.TargetNode)
-
-	runtimeID := uuid.New().String()
-	suffix := strings.Replace(runtimeID, "-", "", -1)[:6]
-	containerName := fmt.Sprintf("nexus-%s-r%d-%s", sanitize(cfg.ModelName), action.ReplicaIdx, suffix)
-
-	effectiveMode := r.resolveExecutionMode(ctx, action.TargetNode, cfg)
-	gpuDevicesJSON := "[]"
-	nGPULayers := cfg.NGPULayers
-	if effectiveMode == "cpu" {
-		nGPULayers = 0
-	}
-
-	tx, txErr := r.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if txErr != nil {
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("begin transaction: %w", txErr)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	maxSurge := status.MaxSurge
-	if maxSurge < 1 {
-		maxSurge = 1
-	}
-	slotAvailable, slotErr := replicaguard.ClaimSlot(ctx, tx, action.ModelID, status.DesiredReplicas, maxSurge)
-	if slotErr != nil {
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("claim_replica_slot: %w", slotErr)
-	}
-	if !slotAvailable {
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		r.log.Info("rolling replacement: slot not available (surge limit reached)",
-			zap.String("model", action.ModelName),
-		)
-		return "", fmt.Errorf("surge limit reached for model %s", action.ModelName)
-	}
-
-	_, dbErr := tx.ExecContext(ctx, `
-		INSERT INTO agent_runtimes
-		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
-		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
-		   requested_mode, effective_mode, workload_policy,
-		   replica_index, recovery_attempt)
-		VALUES ($1,$2,NULL,$3,$4,$5,'pending',
-		        $6::jsonb,$7,$8,'',-1,
-		        $9,$10,$11,$12,1)`,
-		runtimeID, action.TargetNode, action.ModelID, containerName, cfg.Backend,
-		gpuDevicesJSON, bindHost, port,
-		cfg.ExecutionMode, effectiveMode, cfg.WorkloadPolicy,
-		action.ReplicaIdx,
-	)
-	if dbErr != nil {
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("insert runtime row: %w", dbErr)
-	}
-
-	if commitErr := tx.Commit(); commitErr != nil {
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("commit runtime row: %w", commitErr)
-	}
-	committed = true
-
-	_, _ = r.db.ExecContext(ctx, `
-		UPDATE node_port_leases SET runtime_id = $1
-		WHERE node_id = $2 AND port = $3 AND released_at IS NULL`,
-		runtimeID, action.TargetNode, port,
-	)
-
-	modelsVolume := cfg.ModelsVolume
-	if modelsVolume == "" {
-		modelsVolume = "nexus_models"
-	}
-	ctxSize := cfg.CtxSize
-	if ctxSize == 0 {
-		ctxSize = 4096
-	}
-
-	payloadEnv := make(map[string]string, len(cfg.Env))
-	for k, v := range cfg.Env {
-		payloadEnv[k] = v
-	}
-	if cfg.HFToken != "" {
-		payloadEnv["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
-	}
-
-	payload := taskmanager.StartModelPayload{
-		RuntimeID:      runtimeID,
-		ModelID:        cfg.ModelID,
-		RuntimeName:    containerName,
-		Backend:        cfg.Backend,
-		Image:          cfg.Image,
-		ModelName:      cfg.ModelName,
-		ServedAs:       cfg.ModelName,
-		BindHost:       bindHost,
-		BindPort:       port,
-		GPUDevices:     cfg.GPUDevices,
-		MemoryLimit:    cfg.MemoryLimit,
-		CPULimit:       cfg.CPUThreads,
-		GGUFPath:       cfg.GGUFPath,
-		HFRepo:         cfg.HFRepo,
-		HFFile:         cfg.HFFile,
-		HFToken:        cfg.HFToken,
-		ModelsVolume:   modelsVolume,
-		CtxSize:        ctxSize,
-		NGPULayers:     nGPULayers,
-		TensorParallel: cfg.TensorParallel,
-		GPUMemoryUtil:  cfg.GPUMemoryUtil,
-		MaxModelLen:    cfg.MaxModelLen,
-		Dtype:          cfg.Dtype,
-		Quantization:   cfg.Quantization,
-		ExtraArgs:      cfg.ExtraArgs,
-		ExecutionMode:  effectiveMode,
-		WorkloadPolicy: cfg.WorkloadPolicy,
-		Env:            payloadEnv,
-	}
-
-	taskID, taskErr := r.taskMgr.Enqueue(ctx, action.TargetNode,
-		taskmanager.TaskStartModel, payload,
-		taskmanager.WithPriority(85),
-		taskmanager.WithActor("ha-reconciler-rolling"),
-		taskmanager.WithRuntimeID(runtimeID),
-		taskmanager.WithIdempotencyKey(fmt.Sprintf("ha-rolling:%s:%s:%s", action.ModelID, action.TargetNode, runtimeID)),
-	)
-	if taskErr != nil {
-		_, _ = r.db.ExecContext(ctx, `UPDATE agent_runtimes SET state='failed' WHERE id=$1`, runtimeID)
-		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("enqueue START_MODEL: %w", taskErr)
-	}
-
-	r.recordLog(ctx, logID, action, runtimeID, "success", action.Reason)
-	r.log.Info("rolling replacement: new replica started",
-		zap.String("model", action.ModelName),
-		zap.String("runtime_id", runtimeID),
-		zap.String("task_id", taskID),
-		zap.Int("port", port),
-	)
-	return runtimeID, nil
 }
 
 // sweepFailedContainers moves failed agent_runtimes to 'stopped'.

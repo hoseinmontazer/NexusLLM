@@ -254,6 +254,39 @@ func (e *Executor) discoverActualPort(ctx context.Context, containerName string,
 	return fallback
 }
 
+// RecoverContainers scans for running nexus-* containers on node startup and discovers
+// their actual listening ports. This enables near-zero downtime recovery for node restarts.
+func (e *Executor) RecoverContainers(ctx context.Context) map[string]int {
+	recovered := make(map[string]int)
+	out, err := exec.CommandContext(ctx, "docker", "ps", "--filter", "name=nexus-", "--format", "{{.Names}}").Output()
+	if err != nil {
+		e.log.Error("failed to list docker containers for recovery", zap.Error(err))
+		return recovered
+	}
+
+	names := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+
+		port := e.runningContainerPort(ctx, name)
+		if port == 0 {
+			// Fallback: inspect environment variables for common port definitions.
+			port = e.inspectEnvPort(ctx, name, []string{"PORT", "HTTP_PORT", "UVICORN_PORT", "OLLAMA_HOST"})
+		}
+		
+		if port > 0 {
+			recovered[name] = port
+		} else {
+			e.log.Warn("could not discover port for recovered container", zap.String("container", name))
+		}
+	}
+
+	return recovered
+}
+
 // inspectEnvPort reads environment variables from a running container and
 // extracts the port. Handles "HOST:PORT" (Ollama OLLAMA_HOST) and plain "PORT".
 func (e *Executor) inspectEnvPort(ctx context.Context, containerName string, vars []string) int {
@@ -370,14 +403,14 @@ func (e *Executor) discoverPortForBackend(ctx context.Context, containerName, ba
 			}
 
 		case "openai_compat":
-			// Generic: PortBindings → --port arg → PORT/HTTP_PORT env var.
+			// Generic: PortBindings → --port arg → PORT/HTTP_PORT/UVICORN_PORT env var.
 			if p := e.runningContainerPort(ctx, containerName); p > 0 {
 				port = p
 				method = "port_bindings_or_arg"
 			} else {
-				port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT"})
+				port = e.inspectEnvPort(ctx, containerName, []string{"PORT", "HTTP_PORT", "UVICORN_PORT"})
 				if port > 0 {
-					method = "env_var:PORT/HTTP_PORT"
+					method = "env_var:PORT/HTTP_PORT/UVICORN_PORT"
 				}
 			}
 

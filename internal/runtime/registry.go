@@ -421,7 +421,7 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		      NOT EXISTS (
 		          SELECT 1 FROM agent_runtimes ar
 		          WHERE ar.endpoint_id = me.id
-		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
+		            AND ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready','starting','validating','downloading','loading')
 		            AND ar.bind_port > 0
 		      )
 		  )
@@ -468,7 +468,7 @@ func (r *Registry) loadEndpoints(ctx context.Context) ([]RegistryEndpoint, error
 		    FALSE AS provider_disable_http2
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
-		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready')
+		WHERE ar.state IN ('ready','active','warm','idle','loading_model','waiting_ready','starting','validating','downloading','loading')
 		  AND ar.bind_host != ''
 		  AND ar.bind_port > 0
 		  AND m.enabled = TRUE
