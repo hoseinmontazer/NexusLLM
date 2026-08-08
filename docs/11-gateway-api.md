@@ -229,6 +229,71 @@ Response:
 
 ---
 
+## Provider header shorthand
+
+When your API key has access to a cloud provider (e.g. OpenRouter), the gateway
+exposes those models as virtual names prefixed by the provider:
+
+```
+openrouter/openai/gpt-4o
+openrouter/anthropic/claude-opus-4
+```
+
+If you don't want to hard-code the prefix in every request, send the bare model
+ID together with `X-Nexus-Provider`:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer nxs_..." \
+  -H "Content-Type: application/json" \
+  -H "X-Nexus-Provider: openrouter" \
+  -d '{
+    "model":    "openai/gpt-4o",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+The gateway prefixes the model name automatically before routing:
+`openai/gpt-4o` → `openrouter/openai/gpt-4o`.
+
+The header is **idempotent** — if the model already starts with
+`openrouter/`, it is forwarded unchanged, so clients can set the header
+unconditionally without duplicating the prefix.
+
+`X-Nexus-Provider` is accepted on all inference endpoints:
+
+| Endpoint | Effect |
+|---|---|
+| `POST /v1/chat/completions` | Prefixes `model` field |
+| `POST /v1/completions` | Prefixes `model` field |
+| `POST /v1/embeddings` | Prefixes `model` field |
+| `POST /v1/rerank` | Prefixes `model` field |
+| `POST /v1/audio/transcriptions` | Prefixes `model` field |
+| `POST /v1/audio/speech` | Prefixes `model` field |
+| `POST /v1/ocr` | Prefixes `model` field |
+| `GET /v1/models/:model_id` | Prefixes the URL path parameter |
+
+**Python SDK example:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="nxs_...",
+    default_headers={"X-Nexus-Provider": "openrouter"},
+)
+
+# No prefix needed — the header handles it
+response = client.chat.completions.create(
+    model="openai/gpt-4o",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+---
+
 ## List available models
 
 `GET /v1/models`
