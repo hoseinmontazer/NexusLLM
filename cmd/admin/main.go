@@ -202,6 +202,7 @@ func main() {
 	authSvc := internalauth.NewService(rdb, db, cfg.Auth.JWTSecret, 24*time.Hour)
 	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
 	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver, authSvc)
+	userH := handlers.NewUserHandler(db, authSvc)
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	gin.SetMode(cfg.Server.Mode)
@@ -421,6 +422,15 @@ func main() {
 	a.PUT("/projects/:id/provider-access/:provider_id", catalogH.UpdateProjectProviderAccess)
 	a.DELETE("/projects/:id/provider-access/:provider_id", catalogH.RevokeProjectProviderAccess)
 
+	// ── Admin User Management (RBAC) ──────────────────────────────────────────
+	a.GET("/users", userH.ListUsers)
+	a.GET("/users/:id", userH.GetUser)
+	a.POST("/users", userH.CreateUser)
+	a.PUT("/users/:id", userH.UpdateUser)
+	a.POST("/users/:id/activate", userH.ActivateUser)
+	a.POST("/users/:id/deactivate", userH.DeactivateUser)
+	a.DELETE("/users/:id", userH.DeleteUser)
+
 	// ── Admin Authentication & Review Queue ─────────────────────────────────
 	a.POST("/auth/login", portalH.AdminLogin)
 	a.GET("/portal/requests/pending", portalH.ListPendingPortalRequests)
@@ -430,6 +440,9 @@ func main() {
 	registerPortalRoutes := func(g *gin.RouterGroup) {
 		g.POST("/auth/register", portalH.RegisterUser)
 		g.POST("/auth/login", portalH.LoginUser)
+
+		g.GET("/profile", userH.GetProfile)
+		g.PUT("/profile", userH.UpdateProfile)
 
 		g.POST("/projects", portalH.CreatePortalProject)
 		g.GET("/projects", portalH.ListPortalProjects)

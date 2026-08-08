@@ -1,66 +1,79 @@
 # API Keys & Authentication
 
 NexusLLM supports two authentication methods:
-- **API Keys** — the primary method for applications (`nxs_...` prefix)
-- **JWT tokens** — for user-facing integrations
+- **API Keys** — the primary method for applications (`nxs_...` prefix) with support for project scoping and zero-downtime key rotation.
+- **JWT tokens** — for developer self-service portal sessions and user authentication.
 
 ---
 
 ## API Keys
 
-### Create an API key
+### Create an API key (Team or Project Scoped)
 
 ```bash
+# Scope key to a Team (Admin API)
 curl -X POST http://localhost:8081/admin/v1/teams/TEAM_ID/api-keys \
   -H "Content-Type: application/json" \
   -d '{"name": "my-production-app"}'
+
+# Scope key to a Project (Developer Portal API)
+curl -X POST http://localhost:8081/portal/v1/projects/PROJECT_ID/api-keys \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "production-key-v1"}'
 ```
 
-Response (key shown **only once**):
+Response (key secret shown **only once**):
 ```json
 {
   "id":         "uuid-...",
   "team_id":    "uuid-...",
   "name":       "my-production-app",
-  "key":        "nxs_a3f9d2b1c8e7...",
+  "api_key_secret": "nxs_a3f9d2b1c8e7...",
   "key_prefix": "nxs_a3f9",
   "active":     true,
   "created_at": "2026-06-21T10:00:00Z"
 }
 ```
 
-> **Save the `key` value immediately.** It is shown only once and never stored in plaintext. NexusLLM stores a SHA-256 hash.
+> **Save the `api_key_secret` value immediately.** It is shown only once and never stored in plaintext. NexusLLM stores a SHA-256 hash.
 
-### Create with expiry
+---
+
+### Zero-Downtime Key Rotation
+
+To rotate an API key without service interruption, use the rotation API. The old key remains active for a **24-hour grace period** while the new key is immediately provisioned:
 
 ```bash
-curl -X POST http://localhost:8081/admin/v1/teams/TEAM_ID/api-keys \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name":       "temp-access",
-    "expires_at": "2026-12-31T23:59:59Z"
-  }'
+curl -X POST http://localhost:8081/portal/v1/api-keys/KEY_ID/rotate \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 ```
 
-### List keys for a team
-
-```bash
-curl http://localhost:8081/admin/v1/teams/TEAM_ID/api-keys
+Response:
+```json
+{
+  "message": "key rotated successfully (old key remains active for 24h grace period)",
+  "old_key_id": "key-uuid-1",
+  "old_key_grace_expires": "2026-08-07T12:00:00Z",
+  "new_key_id": "key-uuid-2",
+  "new_key_prefix": "nxs_b4e8",
+  "new_api_key_secret": "nxs_b4e8c3d2e1f0..."
+}
 ```
 
-Returns all keys with prefix and metadata — never the actual key value.
+---
 
-### Revoke a key
+### Revoke a Key
 
 ```bash
-curl -X DELETE http://localhost:8081/admin/v1/api-keys/KEY_ID
+curl -X DELETE http://localhost:8081/portal/v1/api-keys/KEY_ID
 ```
 
 Revocation takes effect immediately — the Redis cache is purged so the key stops working within milliseconds.
 
 ---
 
-## Using API keys
+## Using API Keys
 
 Pass the key as a Bearer token in the `Authorization` header:
 
@@ -87,18 +100,9 @@ response = client.chat.completions.create(
 )
 ```
 
-```typescript
-import OpenAI from 'openai';
-
-const client = new OpenAI({
-  baseURL: 'http://localhost:8080/v1',
-  apiKey: 'nxs_YOUR_KEY_HERE',
-});
-```
-
 ---
 
-## How authentication works
+## How Authentication Works
 
 ```
 Request arrives with "Authorization: Bearer nxs_abc123..."
@@ -117,39 +121,18 @@ Redis lookup: nexus:apikey:<hash>
         │
         ▼
 Attach TeamClaims to request context:
-  { org_id, team_id, team_name, team_priority, permissions[] }
+  { org_id, team_id, project_id, permissions[] }
 ```
 
 **Performance:** After the first request, all subsequent requests for the same key are served entirely from Redis (~0.2ms). No database query on the hot path.
 
 ---
 
-## JWT tokens
+## Developer JWT Authentication & Registration
 
-JWTs are available for programmatic token generation (e.g., short-lived tokens for specific users).
+The Developer Portal uses JWT tokens issued via self-registration or login:
 
-Issue a JWT (requires implementing a call to `auth.Service.IssueJWT`):
-```go
-// In your custom code:
-token, err := authSvc.IssueJWT(ctx, &auth.TeamClaims{
-    OrgID:    "uuid-...",
-    TeamID:   "uuid-...",
-    TeamName: "platform-eng",
-}, 24*time.Hour)
-```
-
-Use it the same way as an API key:
-```bash
--H "Authorization: Bearer eyJhbGci..."
-```
-
-JWTs are validated with HMAC-SHA256 using the secret in `NEXUS_AUTH_JWTSECRET`.
-
----
-
-## Security notes
-
-- Never commit API keys to source control
-- Set `expires_at` for keys used in CI/CD pipelines
-- The admin API has no authentication by default — restrict it to internal network access (firewall, VPN)
-- Set a strong `NEXUS_AUTH_JWTSECRET` (at least 32 random bytes) in production: `openssl rand -hex 32`
+- **Register**: `POST /portal/v1/auth/register`
+- **Login**: `POST /portal/v1/auth/login`
+- **Admin Login**: `POST /admin/v1/auth/login`
+- **Profile Management**: `GET /portal/v1/profile` & `PUT /portal/v1/profile`

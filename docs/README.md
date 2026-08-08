@@ -33,3 +33,5 @@
 25. [External / Cloud Provider Models](25-external-provider-models.md)
 26. [Provider Catalog Architecture](26-provider-catalog-architecture.md)
 27. [Cloud Model Access — Operational Guide](27-cloud-model-quickstart.md)
+28. [Provider Exposure Modes](28-provider-exposure-modes.md)
+29. [Self-Service Developer Portal & User Management](29-self-service-developer-portal.md)
