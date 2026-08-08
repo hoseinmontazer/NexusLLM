@@ -195,6 +195,31 @@ func (h *Handler) lookupProjectContext(ctx context.Context, modelName string, cl
 
 // ─── public handlers ──────────────────────────────────────────────────────────
 
+// resolveModelWithProvider applies the X-Nexus-Provider header shorthand.
+//
+// When a caller sends X-Nexus-Provider: openrouter together with
+// model: "openai/gpt-chat-latest", the two are combined into the virtual
+// model name "openrouter/openai/gpt-chat-latest" that the gateway's virtual
+// resolver understands.
+//
+// Rules:
+//  1. Header absent or empty → model is returned unchanged.
+//  2. Model already starts with "<provider>/" → model is returned unchanged
+//     (idempotent — prevents double-prefixing when the caller already uses
+//     the full virtual name).
+//  3. Otherwise → "<provider>/<model>" is returned.
+func resolveModelWithProvider(c *gin.Context, model string) string {
+	provider := strings.TrimSpace(c.GetHeader("X-Nexus-Provider"))
+	if provider == "" {
+		return model
+	}
+	prefix := provider + "/"
+	if strings.HasPrefix(model, prefix) {
+		return model // already prefixed — idempotent
+	}
+	return prefix + model
+}
+
 // ChatCompletions handles POST /v1/chat/completions
 func (h *Handler) ChatCompletions(c *gin.Context) {
 	claims := middleware.GetClaims(c)
@@ -225,6 +250,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		abortErr(c, http.StatusBadRequest, "missing_model", "Field 'model' is required")
 		return
 	}
+
+	// Apply X-Nexus-Provider shorthand before alias resolution.
+	// Allows callers to send model: "openai/gpt-4o" + X-Nexus-Provider: openrouter
+	// instead of the full virtual name "openrouter/openai/gpt-4o".
+	req.Model = resolveModelWithProvider(c, req.Model)
 
 	// ── 1. Alias resolution ────────────────────────────────────────────────
 	realModel, err := h.aliasResolver.Resolve(c.Request.Context(), req.Model, claims.TeamID, claims.OrgID)
@@ -604,6 +634,9 @@ func (h *Handler) Embeddings(c *gin.Context) {
 		return
 	}
 
+	// Apply X-Nexus-Provider shorthand before pipeline setup.
+	req.Model = resolveModelWithProvider(c, req.Model)
+
 	// Run the full shared pipeline — identical to ChatCompletions.
 	res, ok := h.pipelineSetup(c, req.Model, 0)
 	if !ok {
@@ -898,7 +931,7 @@ func (h *Handler) LegacyCompletions(c *gin.Context) {
 
 	// Build a chat-completions request with the prompt as a user message.
 	chatReq := models.InferenceRequest{
-		Model:       req.Model,
+		Model:       resolveModelWithProvider(c, req.Model),
 		Messages:    []models.Message{{Role: "user", Content: promptStr}},
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
@@ -927,6 +960,10 @@ func (h *Handler) ModelByID(c *gin.Context) {
 		return
 	}
 	modelID := c.Param("model_id")
+
+	// Apply X-Nexus-Provider shorthand so GET /v1/models/gpt-4o with
+	// X-Nexus-Provider: openrouter resolves to the virtual name "openrouter/gpt-4o".
+	modelID = resolveModelWithProvider(c, modelID)
 
 	// ── Path 1: Public Model ───────────────────────────────────────────────
 	registered := make(map[string]bool)

@@ -67,6 +67,11 @@ type pipelineResult struct {
 // estimatedTokens should reflect the approximate input token count.
 // Use 0 for workloads with no token-based billing (STT, TTS, OCR, Rerank).
 func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens int) (pipelineResult, bool) {
+	// Apply X-Nexus-Provider shorthand before anything else so every stage
+	// (alias resolution, policy ACL, capability check, registry lookup) sees
+	// the fully-qualified virtual model name.
+	rawModel = resolveModelWithProvider(c, rawModel)
+
 	// ── 1. Authentication ─────────────────────────────────────────────────────
 	claims := middleware.GetClaims(c)
 	if claims == nil {
