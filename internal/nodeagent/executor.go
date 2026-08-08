@@ -1395,7 +1395,7 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 				_ = i
 			}
 			if !hasPortFlag {
-				args = append(args, "--port", strconv.Itoa(p.BindPort))
+				p.ExtraArgs = append(p.ExtraArgs, "--port", strconv.Itoa(p.BindPort))
 			}
 		}
 	}
