@@ -1383,16 +1383,11 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		args = append(args, "--network", "host")
 		if p.BindPort > 0 {
 			hasPortFlag := false
-			for i, a := range p.ExtraArgs {
-				if a == "--port" || a == "-p" {
+			for _, a := range p.ExtraArgs {
+				if a == "--port" || a == "-p" || strings.HasPrefix(a, "--port=") {
 					hasPortFlag = true
 					break
 				}
-				if strings.HasPrefix(a, "--port=") {
-					hasPortFlag = true
-					break
-				}
-				_ = i
 			}
 			if !hasPortFlag {
 				p.ExtraArgs = append(p.ExtraArgs, "--port", strconv.Itoa(p.BindPort))

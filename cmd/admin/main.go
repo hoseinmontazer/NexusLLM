@@ -280,6 +280,7 @@ func main() {
 	a.POST("/providers/:id/rules/preview", catalogH.PreviewRules)
 	a.POST("/models/catalog-alias", catalogH.RegisterCatalogAlias)
 	a.POST("/models/external", runtimeH.RegisterExternalModel) // cloud/provider models
+	a.POST("/models/deploy", runtimeH.DeployModel)
 	a.POST("/models", runtimeH.RegisterModel)
 	a.GET("/models", runtimeH.ListModels)
 	a.GET("/provider-defaults", runtimeH.ListProviderDefaults) // legacy provider defaults (used by UI form pre-fill)
