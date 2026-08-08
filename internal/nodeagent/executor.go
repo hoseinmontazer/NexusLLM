@@ -447,7 +447,7 @@ func (e *Executor) discoverPortForBackend(ctx context.Context, containerName, ba
 func backendPortEnvVars(backend string, port int) map[string]string {
 	s := strconv.Itoa(port)
 	switch backend {
-	case "cpu_native":
+	case "cpu_native", "openai_compat":
 		// faster-whisper-server (UVICORN_PORT), Kokoro TTS, Infinity embeddings,
 		// and most Python AI servers built on uvicorn/FastAPI read one or more
 		// of these variables. All are set to the same value so whichever the
@@ -457,24 +457,16 @@ func backendPortEnvVars(backend string, port int) map[string]string {
 			"HTTP_PORT":    s,
 			"UVICORN_PORT": s,
 		}
-	case "openai_compat":
-		// Generic OpenAI-compatible servers — covers PORT and HTTP_PORT.
-		// UVICORN_PORT is intentionally NOT set here; use cpu_native for
-		// uvicorn-based Python backends.
-		return map[string]string{
-			"PORT":      s,
-			"HTTP_PORT": s,
-		}
 	case "vllm", "tgi", "llamacpp":
 		// Port is controlled via --port <n> CMD arg in buildDockerArgs.
 		// No env var injection needed.
 		return nil
 	default:
-		// Unknown backend — apply the safe openai_compat default so at minimum
-		// $PORT is set correctly, which most HTTP frameworks honour.
+		// Unknown backend — apply safe defaults including UVICORN_PORT
 		return map[string]string{
-			"PORT":      s,
-			"HTTP_PORT": s,
+			"PORT":         s,
+			"HTTP_PORT":    s,
+			"UVICORN_PORT": s,
 		}
 	}
 }

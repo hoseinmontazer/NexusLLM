@@ -515,6 +515,10 @@ virtualDispatch:
 	// virtual name (e.g. "openrouter/openai/gpt-oss-20b"). Without this the
 	// provider receives the full virtual name and rejects it as unknown.
 	// The same substitution applies for Mode A aliases and legacy external models.
+	//
+	// FIX C-2: capture the registry name BEFORE mutating req.Model so failover
+	// re-resolution uses the correct pool key, not the upstream provider model ID.
+	registryModelName := req.Model
 	if ep.UpstreamModelName != "" {
 		req.Model = ep.UpstreamModelName
 	}
@@ -556,18 +560,32 @@ virtualDispatch:
 		// and retry with the next healthy endpoint.
 		for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
 			if attempt > 0 {
-				// Previous endpoint failed — re-resolve to get a different one.
-				ep2, b2, rerr := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
+				// FIX C-2/H-1: re-resolve using registryModelName (the NexusLLM pool
+				// key), not req.Model which has already been mutated to the upstream
+				// provider model ID. Also rebuild the correct endpointURL for the new
+				// endpoint — provider endpoints must use UpstreamBaseURL, not ep.URL.
+				ep2, b2, rerr := h.registry.ResolveWithFailover(registryModelName, maxFailoverAttempts)
 				if rerr != nil {
 					break // no more healthy endpoints
 				}
 				ep = ep2
 				backend = b2
-				chatReq.EndpointURL = ep.URL
+				newURL := ep.URL
+				if ep.UpstreamBaseURL != "" {
+					newURL = ep.UpstreamBaseURL
+				}
+				chatReq.EndpointURL = newURL
+				chatReq.UpstreamAPIKey = ep.UpstreamAPIKey
+				chatReq.Client = h.registry.ClientForEndpoint(ep)
+				if ep.UpstreamModelName != "" {
+					req.Model = ep.UpstreamModelName
+				}
 			}
 			if !h.streamChat(c, claims, req, chatReq, backend, ep, start) {
 				// Connection-level error — mark endpoint down and try again.
-				h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, req.Model, runtime.EndpointHealth{
+				// FIX C-2: use registryModelName for pool lookup, not req.Model
+				// which has been mutated to the upstream provider model ID.
+				h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, registryModelName, runtime.EndpointHealth{
 					Status:    runtime.StatusDown,
 					CheckedAt: time.Now(),
 					Error:     "connection refused on inference request",
@@ -582,7 +600,9 @@ virtualDispatch:
 		// Sync path: try up to maxFailoverAttempts endpoints.
 		for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
 			if attempt > 0 {
-				ep2, b2, rerr := h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
+				// FIX C-2/H-1: same fix as streaming — use registryModelName and
+				// rebuild correct provider URL for the replacement endpoint.
+				ep2, b2, rerr := h.registry.ResolveWithFailover(registryModelName, maxFailoverAttempts)
 				if rerr != nil {
 					abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint",
 						"all endpoints unreachable after upstream failures")
@@ -590,7 +610,16 @@ virtualDispatch:
 				}
 				ep = ep2
 				backend = b2
-				chatReq.EndpointURL = ep.URL
+				newURL := ep.URL
+				if ep.UpstreamBaseURL != "" {
+					newURL = ep.UpstreamBaseURL
+				}
+				chatReq.EndpointURL = newURL
+				chatReq.UpstreamAPIKey = ep.UpstreamAPIKey
+				chatReq.Client = h.registry.ClientForEndpoint(ep)
+				if ep.UpstreamModelName != "" {
+					req.Model = ep.UpstreamModelName
+				}
 			}
 			done, emptyContent := h.syncChat(c, claims, req, chatReq, backend, ep, start, thinkingCaps)
 			if done && emptyContent && thinkingOn && h.thinkingRes != nil {
@@ -610,7 +639,8 @@ virtualDispatch:
 				return
 			}
 			// Connection-level failure — mark this endpoint down and try next.
-			h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, req.Model, runtime.EndpointHealth{
+			// FIX C-2: use registryModelName for pool lookup.
+			h.registry.UpdateEndpointHealth(c.Request.Context(), ep.ID, registryModelName, runtime.EndpointHealth{
 				Status:    runtime.StatusDown,
 				CheckedAt: time.Now(),
 				Error:     "connection refused on inference request",
@@ -681,6 +711,11 @@ func (h *Handler) Embeddings(c *gin.Context) {
 		_ = h.policy.RecordTokenUsage(context.Background(), res.teamID, resp.Usage.TotalTokens, 0)
 	}
 	middleware.RecordTokens(res.teamID, res.projectID, res.realModel, resp.Usage.TotalTokens, 0)
+	// FIX C-1: provider metrics for embedding requests.
+	if runtime.IsProviderBackend(ep.BackendType) {
+		middleware.RecordProviderRequest(string(ep.BackendType), res.realModel, "success", float64(latencyMs)/1000.0, 0)
+		middleware.RecordProviderTokens(string(ep.BackendType), res.realModel, resp.Usage.TotalTokens, 0, 0, 0)
+	}
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID, ModelName: res.realModel,
 		EndpointID: ep.ID, PromptTokens: resp.Usage.TotalTokens,
@@ -1136,7 +1171,28 @@ func (h *Handler) syncChat(
 			claims.TeamID, claims.ProjectID, req.Model).Add(float64(visibleTok))
 	}
 
-	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
+	// FIX C-1: record per-provider Prometheus metrics for cloud provider backends.
+	if runtime.IsProviderBackend(ep.BackendType) {
+		latencySec := float64(latencyMs) / 1000.0
+		middleware.RecordProviderRequest(string(ep.BackendType), req.Model, "success", latencySec, 0)
+		middleware.RecordProviderTokens(string(ep.BackendType), req.Model,
+			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, 0, chatResp.Usage.ThinkingTokens)
+	}
+	// FIX L-1: skip redundant DB lookup when project context already in claims.
+	var projID *string
+	var projName *string
+	var projPriority *string
+	var projPriorityWeight *int
+	if claims.ProjectID != "" {
+		pid := claims.ProjectID
+		pname := claims.ProjectName
+		ppw := claims.ProjectPriorityWeight
+		projID = &pid
+		projName = &pname
+		projPriorityWeight = &ppw
+	} else {
+		projID, projName, projPriority, projPriorityWeight = h.lookupProjectContext(context.Background(), req.Model, claims)
+	}
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
@@ -1362,7 +1418,34 @@ func (h *Handler) streamChat(
 		}
 		middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model, promptTokens, completionTokens)
 	}
-	projID, projName, projPriority, projPriorityWeight := h.lookupProjectContext(context.Background(), req.Model, claims)
+	// FIX C-1: provider metrics for streaming cloud requests.
+	if runtime.IsProviderBackend(ep.BackendType) {
+		latencySec := float64(latencyMs) / 1000.0
+		status := "success"
+		if promptTokens+completionTokens == 0 {
+			status = "error"
+		}
+		middleware.RecordProviderRequest(string(ep.BackendType), req.Model, status, latencySec, 0)
+		if promptTokens+completionTokens > 0 {
+			middleware.RecordProviderTokens(string(ep.BackendType), req.Model,
+				promptTokens, completionTokens, 0, 0)
+		}
+	}
+	// FIX L-1: skip redundant DB lookup when project context already in claims.
+	var projID *string
+	var projName *string
+	var projPriority *string
+	var projPriorityWeight *int
+	if claims.ProjectID != "" {
+		pid := claims.ProjectID
+		pname := claims.ProjectName
+		ppw := claims.ProjectPriorityWeight
+		projID = &pid
+		projName = &pname
+		projPriorityWeight = &ppw
+	} else {
+		projID, projName, projPriority, projPriorityWeight = h.lookupProjectContext(context.Background(), req.Model, claims)
+	}
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
 		EndpointID: ep.ID, PromptTokens: promptTokens,
@@ -1744,6 +1827,41 @@ func (h *Handler) ProviderModels(c *gin.Context) {
 		abortErr(c, http.StatusNotFound, "provider_not_found",
 			fmt.Sprintf("provider %q not found or not enabled", providerName))
 		return
+	}
+
+	// FIX C-3: enforce provider access authorization.
+	// A caller may only list a provider's models when their org has at least
+	// one active project_provider_access grant for this provider. This prevents
+	// authenticated users from enumerating providers that belong to other orgs.
+	// Project-scoped callers must have an explicit grant for their own project.
+	// Org-level callers (no ProjectID) are allowed if any project in their org
+	// has been granted access — this covers admin API keys.
+	claims := middleware.GetClaims(c)
+	if claims != nil {
+		var accessCount int
+		if claims.ProjectID != "" {
+			// Project-scoped: require a direct grant for this project+provider.
+			_ = h.db.QueryRowContext(c.Request.Context(), `
+				SELECT COUNT(*) FROM project_provider_access
+				WHERE project_id::text = $1
+				  AND provider_id::text = $2
+				  AND enabled = TRUE`, claims.ProjectID, prov.ID,
+			).Scan(&accessCount)
+		} else {
+			// Org-level key: allow if any active project in this org has access.
+			_ = h.db.QueryRowContext(c.Request.Context(), `
+				SELECT COUNT(*) FROM project_provider_access ppa
+				JOIN projects p ON p.id = ppa.project_id
+				WHERE p.organization_id::text = $1
+				  AND ppa.provider_id::text = $2
+				  AND ppa.enabled = TRUE`, claims.OrgID, prov.ID,
+			).Scan(&accessCount)
+		}
+		if accessCount == 0 {
+			abortErr(c, http.StatusForbidden, "provider_access_denied",
+				fmt.Sprintf("provider %q is not accessible to your organization", providerName))
+			return
+		}
 	}
 
 	// Build the models URL for this provider's backend type.

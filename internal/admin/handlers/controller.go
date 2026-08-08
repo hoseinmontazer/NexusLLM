@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -40,6 +41,7 @@ type runtimeRow struct {
 	BindHost       string  `db:"bind_host"`
 	BindPort       int     `db:"bind_port"`
 	GPUIDsJSON     string  `db:"gpu_ids_json"`
+	GPUDevicesJSON string  `db:"gpu_devices_json"`
 	TensorParallel int     `db:"tensor_parallel"`
 	GPUMemoryUtil  float64 `db:"gpu_memory_util"`
 	MaxModelLen    int     `db:"max_model_len"`
@@ -52,6 +54,9 @@ type runtimeRow struct {
 	CtxSize        int     `db:"ctx_size"`
 	NGPULayers     int     `db:"n_gpu_layers"`
 	MemoryLimit    string  `db:"memory_limit"`
+	ModelsVolume   string  `db:"models_volume"`
+	ExtraArgsJSON  string  `db:"extra_args_json"`
+	EnvJSON        string  `db:"env_json"`
 	EndpointID     string  `db:"endpoint_id"`
 	ModelID        string  `db:"model_id"`
 }
@@ -74,6 +79,7 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 			COALESCE(NULLIF(ar.bind_host, ''), me.host, '')       AS bind_host,
 			COALESCE(NULLIF(ar.bind_port, 0), me.port, 0)         AS bind_port,
 			COALESCE(ar.gpu_ids::text, '[]')                      AS gpu_ids_json,
+			COALESCE(mrc.gpu_devices::text, ar.gpu_ids::text, '[]') AS gpu_devices_json,
 			COALESCE(mrc.tensor_parallel,  1)                     AS tensor_parallel,
 			COALESCE(mrc.gpu_memory_util,  0.9)                   AS gpu_memory_util,
 			COALESCE(mrc.max_model_len,    0)                     AS max_model_len,
@@ -86,6 +92,9 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 			COALESCE(mrc.ctx_size,         4096)                  AS ctx_size,
 			COALESCE(mrc.n_gpu_layers,     0)                     AS n_gpu_layers,
 			COALESCE(mrc.memory_limit,     '')                    AS memory_limit,
+			COALESCE(mrc.models_volume,    '')                    AS models_volume,
+			COALESCE(mrc.extra_args::text, '[]')                  AS extra_args_json,
+			COALESCE(mrc.env::text,        '{}')                  AS env_json,
 			me.id::text                                           AS endpoint_id,
 			m.id::text                                            AS model_id
 		FROM model_endpoints me
@@ -113,6 +122,24 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 
 // buildStartPayload builds a StartModelPayload from a runtimeRow.
 func buildStartPayload(runtimeID string, row *runtimeRow) taskmanager.StartModelPayload {
+	var env map[string]string
+	if row.EnvJSON != "" && row.EnvJSON != "{}" {
+		_ = json.Unmarshal([]byte(row.EnvJSON), &env)
+	}
+	if env == nil {
+		env = map[string]string{}
+	}
+
+	var extraArgs []string
+	if row.ExtraArgsJSON != "" && row.ExtraArgsJSON != "[]" {
+		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
+	}
+
+	var gpuDevices []int
+	if row.GPUDevicesJSON != "" && row.GPUDevicesJSON != "[]" {
+		_ = json.Unmarshal([]byte(row.GPUDevicesJSON), &gpuDevices)
+	}
+
 	return taskmanager.StartModelPayload{
 		RuntimeID:      runtimeID,
 		EndpointID:     row.EndpointID,
@@ -123,6 +150,7 @@ func buildStartPayload(runtimeID string, row *runtimeRow) taskmanager.StartModel
 		ModelName:      row.ModelName,
 		BindHost:       row.BindHost,
 		BindPort:       row.BindPort,
+		GPUDevices:     gpuDevices,
 		TensorParallel: row.TensorParallel,
 		GPUMemoryUtil:  row.GPUMemoryUtil,
 		MaxModelLen:    row.MaxModelLen,
@@ -135,7 +163,9 @@ func buildStartPayload(runtimeID string, row *runtimeRow) taskmanager.StartModel
 		CtxSize:        row.CtxSize,
 		NGPULayers:     row.NGPULayers,
 		MemoryLimit:    row.MemoryLimit,
-		Env:            map[string]string{},
+		ModelsVolume:   row.ModelsVolume,
+		ExtraArgs:      extraArgs,
+		Env:            env,
 	}
 }
 

@@ -50,8 +50,9 @@ func (b *openAICompatBackend) ContainerPort() int { return 0 }
 func (b *openAICompatBackend) ContainerPortEnvVars(port int) map[string]string {
 	s := strconv.Itoa(port)
 	return map[string]string{
-		"PORT":      s,
-		"HTTP_PORT": s,
+		"PORT":         s,
+		"HTTP_PORT":    s,
+		"UVICORN_PORT": s,
 	}
 }
 

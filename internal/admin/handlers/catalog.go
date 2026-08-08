@@ -248,10 +248,19 @@ func (h *CatalogHandler) UpdateProvider(c *gin.Context) {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET display_name=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.DisplayName)
 	}
 	if in.BaseURL != nil {
-		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET base_url=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.BaseURL)
+		// FIX C-4: return error if safety-critical fields fail to persist.
+		if _, err := h.db.ExecContext(ctx, `UPDATE providers SET base_url=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.BaseURL); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update base_url: " + err.Error()})
+			return
+		}
 	}
 	if in.APIKey != nil {
-		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET api_key=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.APIKey)
+		// FIX C-4: return error if API key fails to persist — silent failure here
+		// means the old (possibly invalid) credential continues to be used.
+		if _, err := h.db.ExecContext(ctx, `UPDATE providers SET api_key=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.APIKey); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update api_key: " + err.Error()})
+			return
+		}
 	}
 	if in.ExposureMode != nil {
 		switch *in.ExposureMode {
@@ -291,7 +300,11 @@ func (h *CatalogHandler) UpdateProvider(c *gin.Context) {
 		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET proxy_url=NULLIF($2,''),updated_at=NOW() WHERE id::text=$1`, id, *in.ProxyURL)
 	}
 	if in.Enabled != nil {
-		_, _ = h.db.ExecContext(ctx, `UPDATE providers SET enabled=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.Enabled)
+		// FIX C-4: return error if enable/disable fails to persist.
+		if _, err := h.db.ExecContext(ctx, `UPDATE providers SET enabled=$2,updated_at=NOW() WHERE id::text=$1`, id, *in.Enabled); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update enabled: " + err.Error()})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "provider updated", "id": id})
 }

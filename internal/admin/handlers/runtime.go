@@ -155,11 +155,16 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	}
 
 	// Defaults
-	if input.BackendType == "" {
-		input.BackendType = "vllm"
-	}
 	if input.ServiceType == "" {
 		input.ServiceType = "CHAT"
+	}
+	if input.BackendType == "" {
+		switch input.ServiceType {
+		case "STT", "EMBEDDING", "TTS", "OCR":
+			input.BackendType = "cpu_native"
+		default:
+			input.BackendType = "vllm"
+		}
 	}
 	if input.Provider == "" {
 		input.Provider = "local"

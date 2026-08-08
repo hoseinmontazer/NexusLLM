@@ -233,6 +233,7 @@ type runtimeConfig struct {
 	ModelsVolume     string
 	CtxSize          int
 	NGPULayers       int
+	GPUDevices       []int
 	ExecutionMode    string
 	WorkloadPolicy   string
 	MemoryLimit      string
@@ -243,6 +244,7 @@ type runtimeConfig struct {
 	Dtype            string
 	Quantization     string
 	ExtraArgs        []string
+	Env              map[string]string
 	SupportsThinking bool
 	ThinkingEnabled  bool
 }
@@ -261,6 +263,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		ModelsVolume     string  `db:"models_volume"`
 		CtxSize          int     `db:"ctx_size"`
 		NGPULayers       int     `db:"n_gpu_layers"`
+		GPUDevicesJSON   string  `db:"gpu_devices_json"`
 		ExecutionMode    string  `db:"execution_mode"`
 		WorkloadPolicy   string  `db:"workload_policy"`
 		MemoryLimit      string  `db:"memory_limit"`
@@ -271,6 +274,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		Dtype            string  `db:"dtype"`
 		Quantization     string  `db:"quantization"`
 		ExtraArgsJSON    string  `db:"extra_args_json"`
+		EnvJSON          string  `db:"env_json"`
 		SupportsThinking bool    `db:"supports_thinking"`
 		ThinkingEnabled  bool    `db:"thinking_enabled"`
 	}
@@ -287,6 +291,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		    COALESCE(mrc.models_volume, '')             AS models_volume,
 		    COALESCE(mrc.ctx_size,    4096)             AS ctx_size,
 		    COALESCE(mrc.n_gpu_layers, 0)               AS n_gpu_layers,
+		    COALESCE(mrc.gpu_devices::text, '[]')       AS gpu_devices_json,
 		    COALESCE(mrc.execution_mode, 'auto')        AS execution_mode,
 		    COALESCE(mrc.workload_policy, 'lazy_load')  AS workload_policy,
 		    COALESCE(mrc.memory_limit, '')              AS memory_limit,
@@ -297,6 +302,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		    COALESCE(mrc.dtype, 'auto')                 AS dtype,
 		    COALESCE(mrc.quantization, '')              AS quantization,
 		    COALESCE(mrc.extra_args::text, '[]')        AS extra_args_json,
+		    COALESCE(mrc.env::text, '{}')               AS env_json,
 		    COALESCE(m.supports_thinking, FALSE)        AS supports_thinking,
 		    COALESCE(m.thinking_enabled, FALSE)         AS thinking_enabled
 		FROM models m
@@ -312,6 +318,19 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 	var extraArgs []string
 	if row.ExtraArgsJSON != "" && row.ExtraArgsJSON != "[]" {
 		_ = json.Unmarshal([]byte(row.ExtraArgsJSON), &extraArgs)
+	}
+
+	var gpuDevices []int
+	if row.GPUDevicesJSON != "" && row.GPUDevicesJSON != "[]" {
+		_ = json.Unmarshal([]byte(row.GPUDevicesJSON), &gpuDevices)
+	}
+
+	var env map[string]string
+	if row.EnvJSON != "" && row.EnvJSON != "{}" {
+		_ = json.Unmarshal([]byte(row.EnvJSON), &env)
+	}
+	if env == nil {
+		env = map[string]string{}
 	}
 
 	// Delegate startup arg preparation to the backend adapter.
@@ -337,6 +356,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		ModelsVolume:     row.ModelsVolume,
 		CtxSize:          row.CtxSize,
 		NGPULayers:       row.NGPULayers,
+		GPUDevices:       gpuDevices,
 		ExecutionMode:    row.ExecutionMode,
 		WorkloadPolicy:   row.WorkloadPolicy,
 		MemoryLimit:      row.MemoryLimit,
@@ -347,6 +367,7 @@ func (r *Reconciler) loadRuntimeConfig(ctx context.Context, modelID string) (*ru
 		Dtype:            row.Dtype,
 		Quantization:     row.Quantization,
 		ExtraArgs:        extraArgs,
+		Env:              env,
 		SupportsThinking: row.SupportsThinking,
 		ThinkingEnabled:  row.ThinkingEnabled,
 	}, nil
@@ -513,6 +534,14 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		ctxSize = 4096
 	}
 
+	payloadEnv := make(map[string]string, len(cfg.Env))
+	for k, v := range cfg.Env {
+		payloadEnv[k] = v
+	}
+	if cfg.HFToken != "" {
+		payloadEnv["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
+	}
+
 	payload := taskmanager.StartModelPayload{
 		RuntimeID:      runtimeID,
 		ModelID:        cfg.ModelID,
@@ -523,7 +552,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		ServedAs:       cfg.ModelName,
 		BindHost:       bindHost,
 		BindPort:       port,
-		GPUDevices:     nil, // CPU mode or resolved from node
+		GPUDevices:     cfg.GPUDevices,
 		MemoryLimit:    cfg.MemoryLimit,
 		CPULimit:       cfg.CPUThreads,
 		GGUFPath:       cfg.GGUFPath,
@@ -541,10 +570,7 @@ func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action R
 		ExtraArgs:      cfg.ExtraArgs, // includes --reasoning off when thinking is disabled
 		ExecutionMode:  effectiveMode,
 		WorkloadPolicy: cfg.WorkloadPolicy,
-		Env:            map[string]string{},
-	}
-	if cfg.HFToken != "" {
-		payload.Env["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
+		Env:            payloadEnv,
 	}
 
 	// ── 7. Dispatch START_MODEL task ──────────────────────────────────────────
@@ -1208,6 +1234,14 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		ctxSize = 4096
 	}
 
+	payloadEnv := make(map[string]string, len(cfg.Env))
+	for k, v := range cfg.Env {
+		payloadEnv[k] = v
+	}
+	if cfg.HFToken != "" {
+		payloadEnv["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
+	}
+
 	payload := taskmanager.StartModelPayload{
 		RuntimeID:      runtimeID,
 		ModelID:        cfg.ModelID,
@@ -1218,7 +1252,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		ServedAs:       cfg.ModelName,
 		BindHost:       bindHost,
 		BindPort:       port,
-		GPUDevices:     nil,
+		GPUDevices:     cfg.GPUDevices,
 		MemoryLimit:    cfg.MemoryLimit,
 		CPULimit:       cfg.CPUThreads,
 		GGUFPath:       cfg.GGUFPath,
@@ -1236,10 +1270,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		ExtraArgs:      cfg.ExtraArgs,
 		ExecutionMode:  effectiveMode,
 		WorkloadPolicy: cfg.WorkloadPolicy,
-		Env:            map[string]string{},
-	}
-	if cfg.HFToken != "" {
-		payload.Env["HUGGING_FACE_HUB_TOKEN"] = cfg.HFToken
+		Env:            payloadEnv,
 	}
 
 	taskID, taskErr := r.taskMgr.Enqueue(ctx, action.TargetNode,

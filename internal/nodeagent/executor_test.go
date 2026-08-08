@@ -23,8 +23,9 @@ func TestBackendPortEnvVars(t *testing.T) {
 			backend: "openai_compat",
 			port:    8080,
 			expected: map[string]string{
-				"PORT":      "8080",
-				"HTTP_PORT": "8080",
+				"PORT":         "8080",
+				"HTTP_PORT":    "8080",
+				"UVICORN_PORT": "8080",
 			},
 		},
 		{

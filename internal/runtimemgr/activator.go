@@ -533,7 +533,6 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	// time.  When BindPort == 0 the agent allocates a port at runtime and injects
 	// the equivalent env vars itself (see backendPortEnvVars in executor.go).
 	//
-	// Operator-supplied env vars always win — never overwrite them.
 	payloadEnv := make(map[string]string, len(cfg.Env))
 	for k, v := range cfg.Env {
 		payloadEnv[k] = v
@@ -541,9 +540,8 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	if cfg.BindPort > 0 {
 		backendInstance := a.registry.BackendForType(backend)
 		for k, v := range backendInstance.ContainerPortEnvVars(cfg.BindPort) {
-			if _, alreadySet := payloadEnv[k]; !alreadySet {
-				payloadEnv[k] = v
-			}
+			// Port environment variables must always reflect the actual allocated BindPort
+			payloadEnv[k] = v
 		}
 	}
 
@@ -1065,7 +1063,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    COALESCE(mrc.gpu_memory_util, 0.90)           AS gpu_memory_util,
 		    COALESCE(mrc.dtype, 'auto')                   AS dtype,
 		    COALESCE(mrc.quantization, '')                AS quantization,
-		    COALESCE(ar.gpu_ids::text, '[]')              AS gpu_devices_json,
+		    COALESCE(mrc.gpu_devices::text, ar.gpu_ids::text, '[]') AS gpu_devices_json,
 		    COALESCE(ar.cpu_affinity, '')                 AS cpu_affinity,
 		    COALESCE(ar.numa_node, -1)                    AS numa_node,
 		    mrc.idle_timeout_secs,
