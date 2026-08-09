@@ -128,6 +128,7 @@ func main() {
 	rmCfg.DefaultImage = cfg.RuntimeMgr.DefaultImage
 	guard := runtimemgr.NewResourceGuard(db, log)
 	activator := runtimemgr.NewActivator(db, taskMgr, registry, guard, rmCfg, log)
+	startTracker := runtimemgr.NewStartTracker()
 	idleMgr := runtimemgr.NewIdleManager(db, taskMgr, rmCfg, log).WithActivator(activator)
 	go idleMgr.Start(watchCtx)
 
@@ -164,6 +165,7 @@ func main() {
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
 		registry, usageTracker, teamPolicies, log,
 	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout).
+		WithStartTracker(startTracker).
 		WithCapabilityValidator(capValidator).WithFactory(factory).
 		WithVirtualResolver(catalogResolver)
 

@@ -54,6 +54,11 @@ type Handler struct {
 	db            *sqlx.DB
 	thinkingRes   *thinking.Resolver
 	coldStartDur  time.Duration // 0 = use default (20 min)
+	// startTracker deduplicates background cold-start goroutines across
+	// concurrent HTTP retries. At most one background EnsureRunning goroutine
+	// runs per model at a time; its lifetime is independent of any HTTP request.
+	// Nil-safe: when not set the old probe-then-background path is used.
+	startTracker *runtimemgr.StartTracker
 	// virtualResolver resolves Mode-B catalog model names when the registry
 	// has no matching pool entry. Nil-safe — skipped when not set.
 	virtualResolver *catalog.VirtualModelResolver
@@ -138,6 +143,17 @@ func (h *Handler) WithFactory(f *runtime.Factory) *Handler {
 // EnsureRunning — they are always considered routable.
 func (h *Handler) WithVirtualResolver(r *catalog.VirtualModelResolver) *Handler {
 	h.virtualResolver = r
+	return h
+}
+
+// WithStartTracker attaches a StartTracker that prevents goroutine explosions
+// during cold-start retry storms. Must be the same instance attached to all
+// proxy handler methods (ChatCompletions, multiservice pipelineSetup, etc.).
+// When set, at most one background EnsureRunning goroutine runs per model;
+// HTTP retries during startup skip spawning and return 503 immediately.
+// Call this in main() after constructing the activator.
+func (h *Handler) WithStartTracker(t *runtimemgr.StartTracker) *Handler {
+	h.startTracker = t
 	return h
 }
 
@@ -415,38 +431,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		if h.activator != nil {
-			// Check if the model is already healthy right now by giving EnsureRunning
-			// enough time for at least one full health-poll cycle (HealthPollInterval=3s).
-			// A 3s probe was too tight: the ticker fires at exactly 3s but the context
-			// expires at the same moment, causing a race where ctx.Done() always wins
-			// and the probe always returns an error even when the model is ready.
-			// 8 seconds = 2× HealthPollInterval + 2s slack for DB latency.
-			probeCtx, probeCancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
-			_, probeErr := h.activator.EnsureRunning(probeCtx, req.Model)
-			probeCancel()
-
-			if probeErr != nil {
-				// Model not yet ready — start it in background and tell client to retry.
-				h.log.Info("cold-start triggered — returning 503 Retry-After",
-					zap.String("model", req.Model),
-				)
-				go func() {
-					bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
-					defer bgCancel()
-					if _, startErr := h.activator.EnsureRunning(bgCtx, req.Model); startErr != nil {
-						h.log.Warn("background cold-start failed",
-							zap.String("model", req.Model),
-							zap.Error(startErr),
-						)
-					}
-				}()
-				c.Header("Retry-After", "10")
-				abortErr(c, http.StatusServiceUnavailable, "model_starting",
-					fmt.Sprintf("model %q is starting up, please retry in ~10 seconds", req.Model))
+			// ── Cold-start path ────────────────────────────────────────────────
+			// handleColdStart either writes 503 (startup in progress) or sets
+			// X-Nexus-Warmup-Ms and returns without writing for the rare probe
+			// fast-path (model ready but registry stale).
+			h.handleColdStart(c, req.Model)
+			if c.IsAborted() || c.Writer.Written() {
+				// 503 was written — return to caller.
 				return
 			}
-			// Probe succeeded immediately — re-resolve and continue.
-			c.Header("X-Nexus-Warmup-Ms", "0")
+			// Probe fast-path: re-resolve and continue.
 			ep, backend, err = h.registry.ResolveWithFailover(req.Model, maxFailoverAttempts)
 			if err != nil {
 				abortErr(c, http.StatusServiceUnavailable, "no_healthy_endpoint",
@@ -1545,6 +1539,81 @@ func normalizeToolCallArguments(resp *models.ChatCompletionResponse) {
 			}
 		}
 	}
+}
+
+// handleColdStart is the single cold-start dispatch point for the proxy.
+// It is called by ChatCompletions and pipelineSetup when ResolveWithFailover
+// finds no healthy endpoint for a local (non-remote) model.
+//
+// Behaviour:
+//  1. If StartTracker is wired: ensure exactly one background EnsureRunning
+//     goroutine is running for the model, then return 503 model_starting.
+//  2. If StartTracker is nil (fallback / test paths): original 8-second
+//     probe behaviour is preserved so existing behaviour is unchanged.
+//
+// Always writes a 503 response to c and returns. The caller must return
+// immediately after this call.
+func (h *Handler) handleColdStart(c *gin.Context, modelName string) {
+	if h.startTracker != nil {
+		// Goroutine-dedup path: at most one background EnsureRunning per model.
+		if !h.startTracker.IsStarting(modelName) {
+			if h.startTracker.TryStart(modelName) {
+				// This request wins the slot — launch the startup goroutine.
+				go func() {
+					defer h.startTracker.Done(modelName)
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
+					defer bgCancel()
+					if _, startErr := h.activator.EnsureRunning(bgCtx, modelName); startErr != nil {
+						h.log.Warn("background cold-start failed",
+							zap.String("model", modelName),
+							zap.Error(startErr),
+						)
+					}
+				}()
+				h.log.Info("cold-start goroutine launched",
+					zap.String("model", modelName),
+				)
+			}
+			// Whether this request launched the goroutine or lost a concurrent
+			// TryStart race, a startup goroutine is now running.
+		}
+		// In all cases: tell the client to retry.
+		c.Header("Retry-After", "10")
+		abortErr(c, http.StatusServiceUnavailable, "model_starting",
+			fmt.Sprintf("model %q is starting up, please retry in ~10 seconds", modelName))
+		return
+	}
+
+	// Fallback: original probe behaviour when StartTracker is not wired.
+	// Preserved for backward compatibility with tests and deployments that
+	// do not call WithStartTracker.
+	probeCtx, probeCancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	_, probeErr := h.activator.EnsureRunning(probeCtx, modelName)
+	probeCancel()
+
+	if probeErr != nil {
+		h.log.Info("cold-start triggered (no tracker) — returning 503 Retry-After",
+			zap.String("model", modelName),
+		)
+		go func() {
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
+			defer bgCancel()
+			if _, startErr := h.activator.EnsureRunning(bgCtx, modelName); startErr != nil {
+				h.log.Warn("background cold-start failed",
+					zap.String("model", modelName),
+					zap.Error(startErr),
+				)
+			}
+		}()
+		c.Header("Retry-After", "10")
+		abortErr(c, http.StatusServiceUnavailable, "model_starting",
+			fmt.Sprintf("model %q is starting up, please retry in ~10 seconds", modelName))
+		return
+	}
+	// Probe succeeded immediately — re-resolve.
+	// The caller must handle err after this returns, but since we return after
+	// abortErr above or fall through here, we set a header for observability.
+	c.Header("X-Nexus-Warmup-Ms", "0")
 }
 
 func (h *Handler) coldStartTimeout() time.Duration {

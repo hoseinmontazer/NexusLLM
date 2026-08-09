@@ -172,22 +172,15 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 			// attempting a cold start. Remote models skip EnsureRunning entirely
 			// and are handled in stage 8 via the virtual resolver.
 			if !h.registry.IsRemoteModel(c.Request.Context(), realModel) {
-				// Local model not yet running — probe then cold-start.
-				// Same 8-second probe as ChatCompletions.
-				probeCtx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
-				_, probeErr := h.activator.EnsureRunning(probeCtx, realModel)
-				cancel()
-				if probeErr != nil {
-					go func() {
-						bgCtx, bgCancel := context.WithTimeout(context.Background(), h.coldStartTimeout())
-						defer bgCancel()
-						_, _ = h.activator.EnsureRunning(bgCtx, realModel)
-					}()
-					c.Header("Retry-After", "10")
-					abortErr(c, http.StatusServiceUnavailable, "model_starting",
-						fmt.Sprintf("model %q is starting, please retry in ~10 seconds", realModel))
+				// Local model not yet running — delegate to the shared cold-start handler.
+				// handleColdStart writes 503 and returns for the starting case, or sets
+				// X-Nexus-Warmup-Ms and returns (probe fast-path) when the model is
+				// already ready but the registry was stale.
+				h.handleColdStart(c, realModel)
+				if c.IsAborted() || c.Writer.Written() {
 					return pipelineResult{}, false
 				}
+				// Probe fast-path: fall through to endpoint re-resolution below.
 			}
 			// Remote model — fall through to stage 8 where the virtual
 			// resolver will handle it. No cold-start attempted.

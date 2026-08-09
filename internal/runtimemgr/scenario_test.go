@@ -4,12 +4,13 @@
 // No mocks. No inline re-implementations of the logic under test.
 //
 // Scenarios:
-//   A1 – enqueueStartModel port-env sync: cfg.BindPort>0 injects correct vars
-//   A2 – enqueueStartModel zero BindPort: stale UVICORN_PORT not cleaned
-//   A3 – custom env vars preserved across the payloadEnv construction
-//   A4 – ContainerPortEnvVars called via registry.BackendForType (live call graph)
-//   A5 – Multi-cycle: three restart cycles, port changes each time
-//   A6 – Concurrent inflightMap: exactly one owner per model
+//
+//	A1 – enqueueStartModel port-env sync: cfg.BindPort>0 injects correct vars
+//	A2 – enqueueStartModel zero BindPort: stale UVICORN_PORT not cleaned
+//	A3 – custom env vars preserved across the payloadEnv construction
+//	A4 – ContainerPortEnvVars called via registry.BackendForType (live call graph)
+//	A5 – Multi-cycle: three restart cycles, port changes each time
+//	A6 – Concurrent inflightMap: exactly one owner per model
 package runtimemgr
 
 import (
@@ -21,7 +22,8 @@ import (
 // ── A1: payloadEnv construction — BindPort > 0 injects port vars ─────────────
 //
 // When cfg.BindPort > 0, enqueueStartModel calls:
-//   backendInstance.ContainerPortEnvVars(cfg.BindPort) → payloadEnv
+//
+//	backendInstance.ContainerPortEnvVars(cfg.BindPort) → payloadEnv
 //
 // This test replaces that call with the real cpu_native implementation
 // (via the same interface used in production) and verifies the result.
@@ -156,7 +158,7 @@ func TestA3_MultiCycle_PayloadEnvCorrectEachCycle(t *testing.T) {
 	for _, c := range cycles {
 		t.Run("cycle_"+strconv.Itoa(c.cycle), func(t *testing.T) {
 			cfgEnv := map[string]string{
-				"MODEL":         "whisper-large-v3",
+				"MODEL":          "whisper-large-v3",
 				"CUSTOM_SETTING": "x",
 			}
 			if c.stalePort != 0 {
@@ -242,14 +244,15 @@ func TestA4_InflightMap_ExactlyOneOwner(t *testing.T) {
 // ── A5: Scenario 4 full — admin restart preserves lazy config, replaces port ──
 //
 // Reproduces the exact Scenario 4 from the audit:
-//   Before: UVICORN_PORT=8000, MODEL=small in mrc.env
-//   Admin updates lazy config: MODEL=large
-//   Admin triggers restart → new port allocated
-//   Expected: MODEL=large preserved, UVICORN_PORT = new port
+//
+//	Before: UVICORN_PORT=8000, MODEL=small in mrc.env
+//	Admin updates lazy config: MODEL=large
+//	Admin triggers restart → new port allocated
+//	Expected: MODEL=large preserved, UVICORN_PORT = new port
 func TestA5_Scenario4_AdminRestart_FullContract(t *testing.T) {
 	// Updated mrc.env after admin change.
 	updatedMrcEnv := map[string]string{
-		"MODEL":        "large",  // operator updated this
+		"MODEL":        "large", // operator updated this
 		"UVICORN_PORT": "8000",  // stale — was set at initial deploy
 		"LANGUAGE":     "en",    // extra setting unchanged
 	}
