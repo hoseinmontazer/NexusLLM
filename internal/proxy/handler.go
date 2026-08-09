@@ -1293,6 +1293,15 @@ func (h *Handler) streamChat(
 		streamModel      string
 		streamCreated    int64
 		done             bool
+
+		// streamStatus tracks actual completion outcome for accurate usage accounting.
+		//   "success"            — upstream sent [DONE] cleanly
+		//   "client_disconnected"— context was canceled (client dropped connection)
+		//   "stream_error"       — upstream closed the stream before [DONE]
+		// Initialized to "stream_error" so any early-exit path that forgets to set
+		// it explicitly is still recorded as a non-success rather than silently
+		// inflating the success counter.
+		streamStatus = "stream_error"
 	)
 
 	writeSSE := func(data string) {
@@ -1305,6 +1314,13 @@ func (h *Handler) streamChat(
 	for {
 		line, readErr := resp.Stream.ReadLine()
 		if readErr != nil {
+			// Distinguish client disconnect (context canceled/deadline exceeded)
+			// from a genuine provider-side stream error.
+			if c.Request.Context().Err() != nil {
+				streamStatus = "client_disconnected"
+			} else {
+				streamStatus = "stream_error"
+			}
 			// Stream ended — may be normal EOF or a mid-stream error.
 			// If we haven't sent [DONE] yet, emit a mid-stream error event
 			// per the Kilo Code spec: finish_reason="error".
@@ -1341,6 +1357,7 @@ func (h *Handler) streamChat(
 		// Robust [DONE] detection — handles "data: [DONE]", "data:[DONE]", etc.
 		if payload == "[DONE]" {
 			done = true
+			streamStatus = "success" // clean provider termination
 			// Synthesize a usage chunk before [DONE] if the client requested it
 			// and the upstream never sent one. This satisfies the Kilo Code / OpenAI
 			// SDK expectation that usage is always present in the final stream chunk.
@@ -1415,11 +1432,11 @@ func (h *Handler) streamChat(
 	// FIX C-1: provider metrics for streaming cloud requests.
 	if runtime.IsProviderBackend(ep.BackendType) {
 		latencySec := float64(latencyMs) / 1000.0
-		status := "success"
+		providerStatus := streamStatus
 		if promptTokens+completionTokens == 0 {
-			status = "error"
+			providerStatus = "error"
 		}
-		middleware.RecordProviderRequest(string(ep.BackendType), req.Model, status, latencySec, 0)
+		middleware.RecordProviderRequest(string(ep.BackendType), req.Model, providerStatus, latencySec, 0)
 		if promptTokens+completionTokens > 0 {
 			middleware.RecordProviderTokens(string(ep.BackendType), req.Model,
 				promptTokens, completionTokens, 0, 0)
@@ -1445,7 +1462,7 @@ func (h *Handler) streamChat(
 		EndpointID: ep.ID, PromptTokens: promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
-		LatencyMs:        latencyMs, Status: "success",
+		LatencyMs:        latencyMs, Status: streamStatus,
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 		ProjectPriorityWeight: projPriorityWeight,
 	})

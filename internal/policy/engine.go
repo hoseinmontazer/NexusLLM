@@ -275,9 +275,16 @@ func (e *Engine) Evaluate(
 	// ── Step 0: Model ACL ────────────────────────────────────────────────────
 	// Two parallel authorization paths:
 	//
-	// A. Public Model (managed / hybrid): model must be in the org's allowed-models
-	//    set (nexus:org:<OrgID>:models) or the legacy team set. This covers every
-	//    model registered via team_model_permissions, regardless of backend type.
+	// A. Public Model (managed / hybrid): model must be in the TEAM's explicit
+	//    grant set (nexus:team:<TeamID>:models). This is the canonical,
+	//    per-team ACL and is the primary enforcement mechanism.
+	//
+	//    IMPORTANT: the org-level set (nexus:org:<OrgID>:models) is intentionally
+	//    NOT used for per-request ACL decisions. It aggregates grants from ALL
+	//    teams in the org, so checking it would allow a Team-A token to call a
+	//    model that was only granted to Team-B — an authorization bypass.
+	//    The org set is retained for org-level governance (budget checks, etc.)
+	//    but MUST NOT be used here.
 	//
 	// B. Virtual catalog model (catalog / hybrid): model is NOT registered as a
 	//    Public Model, but the project has been granted access to its provider via
@@ -287,12 +294,9 @@ func (e *Engine) Evaluate(
 	// Either path passing is sufficient — OR semantics.
 	// For the legacy team-only path (no ProjectID), only path A applies.
 	modelAllowed := false
-	if req.OrgID != "" {
-		ok, _ := e.rdb.SIsMember(ctx, orgPrefix+req.OrgID+":models", req.Model).Result()
-		modelAllowed = ok
-	}
-	if !modelAllowed && req.TeamID != "" {
-		// Legacy fallback — team-level ACL set (pre-031 schema)
+	if req.TeamID != "" {
+		// Primary ACL path: team-level explicit grant (nexus:team:<id>:models).
+		// This is the only set that reflects what this specific team was granted.
 		ok, _ := e.rdb.SIsMember(ctx, teamModelsPrefix+req.TeamID+":models", req.Model).Result()
 		modelAllowed = ok
 	}

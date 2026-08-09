@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +17,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 // RuntimeHandler manages the runtime lifecycle API.
@@ -25,11 +28,13 @@ type RuntimeHandler struct {
 	ctrl     *controller.ModelController
 	sched    *scheduler.Scheduler // optional; nil = manual GPU assignment only
 	taskMgr  *taskmanager.Manager // optional; nil = local Docker deployment only
+	log      *zap.Logger
 }
 
 // NewRuntimeHandler constructs a RuntimeHandler.
 func NewRuntimeHandler(db *sqlx.DB, rdb *redis.Client, registry *runtime.Registry, ctrl *controller.ModelController) *RuntimeHandler {
-	return &RuntimeHandler{db: db, rdb: rdb, registry: registry, ctrl: ctrl}
+	log, _ := zap.NewProduction()
+	return &RuntimeHandler{db: db, rdb: rdb, registry: registry, ctrl: ctrl, log: log}
 }
 
 // WithScheduler attaches the placement scheduler to the handler.
@@ -262,6 +267,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	_, _ = h.db.ExecContext(c.Request.Context(),
 		`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
 		uuid.New().String(), mID)
+
+	// Restore team_model_permissions from snapshot if this model name was previously
+	// soft-deleted.  No-op on first-ever deployment of a new name.
+	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
 
 	// Runtime config — save all fields including llamacpp source so lazy config modal can read them back
 	_, _ = h.db.ExecContext(c.Request.Context(), `
@@ -692,6 +701,10 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
 		uuid.New().String(), mID)
 
+	// Restore team_model_permissions from snapshot if this model name was previously
+	// soft-deleted.  No-op on first-ever deployment of a new name.
+	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
+
 	epID := uuid.New().String()
 	_, _ = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_endpoints
@@ -933,6 +946,10 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 	_, _ = h.db.ExecContext(c.Request.Context(),
 		`INSERT INTO model_versions (id, model_id, version, is_default) VALUES ($1,$2,'v1',TRUE)`,
 		uuid.New().String(), mID)
+
+	// Restore team_model_permissions from snapshot if this model name was previously
+	// soft-deleted.  No-op on first-ever registration of a new name.
+	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
 
 	// Insert endpoint row — immediately active, no container lifecycle.
 	// host/port are placeholders (0.0.0.0:0) since routing uses upstream_base_url.
@@ -1764,23 +1781,169 @@ func nilableStr(s string) interface{} {
 // ─── DeleteModel ──────────────────────────────────────────────────────────────
 
 // DeleteModel handles DELETE /admin/v1/models/:id
-// Removes the model and all associated endpoints from the DB.
-// Does NOT stop running containers — call stop/drain first.
+//
+// Performs a SOFT DELETE: sets lifecycle='deleted' and enabled=FALSE rather
+// than issuing a hard DELETE FROM models.  This preserves the model UUID row
+// in the database so that:
+//
+//   a) team_model_permissions rows are NOT cascade-deleted (migration 053
+//      changed that FK to ON DELETE RESTRICT).
+//   b) The DB trigger fn_snapshot_model_permissions fires on the lifecycle
+//      UPDATE and saves a snapshot of all current team grants into
+//      model_permission_snapshots, keyed by model name.  The next call to
+//      DeployModel / RegisterModel / RegisterExternalModel with the same name
+//      will find that snapshot and automatically restore the grants.
+//   c) usage_events / audit_logs retain a valid foreign-key reference.
+//
+// If a hard purge is genuinely required (GDPR, storage cleanup) it must be
+// done explicitly via a separate admin purge endpoint that checks for active
+// runtimes first — not via this normal delete path.
+//
+// Does NOT stop running containers — call stop/drain before deleting.
 func (h *RuntimeHandler) DeleteModel(c *gin.Context) {
+	ctx := c.Request.Context()
 	modelID := c.Param("id")
-	res, err := h.db.ExecContext(c.Request.Context(),
-		`DELETE FROM models WHERE id = $1`, modelID)
+
+	// Verify the model exists and is not already soft-deleted.
+	var modelName string
+	var currentLifecycle string
+	err := h.db.QueryRowContext(ctx,
+		`SELECT name, COALESCE(lifecycle,'active') FROM models WHERE id = $1`, modelID,
+	).Scan(&modelName, &currentLifecycle)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+		return
+	}
+	if currentLifecycle == "deleted" {
+		c.JSON(http.StatusConflict, gin.H{"error": "model is already deleted"})
+		return
+	}
+
+	// Disable all endpoints first so the gateway stops routing immediately.
+	// The registry reload below removes the model from the in-memory pool.
+	_, _ = h.db.ExecContext(ctx, `
+		UPDATE model_endpoints
+		SET is_enabled = FALSE, health_status = 'down', updated_at = NOW()
+		WHERE model_id = $1`, modelID)
+
+	// Soft-delete: the DB trigger fn_snapshot_model_permissions fires here and
+	// writes the team grant snapshot to model_permission_snapshots.
+	res, err := h.db.ExecContext(ctx, `
+		UPDATE models
+		SET lifecycle = 'deleted', enabled = FALSE, updated_at = NOW()
+		WHERE id = $1 AND lifecycle != 'deleted'`, modelID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to soft-delete model: " + err.Error()})
 		return
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found or already deleted"})
 		return
 	}
-	_ = h.registry.Reload(c.Request.Context())
-	c.JSON(http.StatusOK, gin.H{"message": "model deleted", "model_id": modelID})
+
+	// Audit trail.
+	_, _ = h.db.ExecContext(ctx, `
+		INSERT INTO model_lifecycle_events_v2 (model_id, from_state, to_state, reason, actor)
+		VALUES ($1, $2, 'deleted', 'admin soft-deleted', 'admin')`,
+		modelID, currentLifecycle)
+
+	// Remove from registry hot-path immediately.
+	_ = h.registry.Reload(ctx)
+
+	h.log.Info("model soft-deleted",
+		zap.String("model_id", modelID),
+		zap.String("model_name", modelName),
+		zap.String("previous_lifecycle", currentLifecycle),
+	)
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "model soft-deleted — permissions snapshot saved for restore on redeploy",
+		"model_id": modelID,
+		"name":     modelName,
+	})
+}
+
+// restorePermissionsFromSnapshot looks up the most recent unrestored permission
+// snapshot for modelName and re-inserts team_model_permissions rows for newModelID.
+//
+// This is called immediately after a new model row is inserted during
+// DeployModel / RegisterModel / RegisterExternalModel so that a redeploy of a
+// previously deleted model automatically recovers all team grants without
+// requiring the admin to re-grant each team manually.
+//
+// If no snapshot exists (first-ever deployment of this name) the function is a
+// no-op.  All errors are logged at WARN and do not fail the outer request.
+func (h *RuntimeHandler) restorePermissionsFromSnapshot(ctx context.Context, modelName, newModelID string) {
+	restorePermissionsFromSnapshot(ctx, h.db, h.log, modelName, newModelID)
+}
+
+// restorePermissionsFromSnapshot is the package-level implementation shared by
+// RuntimeHandler and CatalogHandler.  Pass a nil logger to suppress logging.
+func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, log *zap.Logger, modelName, newModelID string) {
+	if log == nil {
+		log = zap.NewNop()
+	}
+	// Find the most recent unconsumed snapshot for this name.
+	var snapID string
+	var teamIDsJSON string
+	err := db.QueryRowContext(ctx, `
+		SELECT id::text, team_ids::text
+		FROM model_permission_snapshots
+		WHERE model_name = $1 AND restored = FALSE
+		ORDER BY deleted_at DESC
+		LIMIT 1`, modelName,
+	).Scan(&snapID, &teamIDsJSON)
+	if err != nil {
+		// No snapshot — first-ever deployment of this name, nothing to restore.
+		return
+	}
+
+	// Parse the JSON array of team UUIDs.
+	var teamIDs []string
+	if jsonErr := json.Unmarshal([]byte(teamIDsJSON), &teamIDs); jsonErr != nil || len(teamIDs) == 0 {
+		log.Warn("permission snapshot found but team_ids is empty or unparseable",
+			zap.String("snapshot_id", snapID),
+			zap.String("model_name", modelName),
+		)
+		return
+	}
+
+	// Re-insert one team_model_permissions row per team.
+	restored := 0
+	for _, teamID := range teamIDs {
+		teamID = strings.TrimSpace(teamID)
+		if teamID == "" {
+			continue
+		}
+		_, insertErr := db.ExecContext(ctx, `
+			INSERT INTO team_model_permissions (team_id, model_id)
+			VALUES ($1::uuid, $2::uuid)
+			ON CONFLICT DO NOTHING`,
+			teamID, newModelID,
+		)
+		if insertErr != nil {
+			log.Warn("failed to restore team permission from snapshot",
+				zap.String("team_id", teamID),
+				zap.String("model_id", newModelID),
+				zap.Error(insertErr),
+			)
+		} else {
+			restored++
+		}
+	}
+
+	// Mark snapshot as consumed so it is not applied again on a subsequent redeploy.
+	_, _ = db.ExecContext(ctx, `
+		UPDATE model_permission_snapshots
+		SET restored = TRUE, restored_at = NOW()
+		WHERE id = $1::uuid`, snapID)
+
+	log.Info("permissions restored from snapshot",
+		zap.String("snapshot_id", snapID),
+		zap.String("model_name", modelName),
+		zap.String("new_model_id", newModelID),
+		zap.Int("teams_restored", restored),
+	)
 }
 
 // GetDeployStatus handles GET /admin/v1/models/:id/deploy-status

@@ -15,6 +15,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"go.uber.org/zap"
 )
 
 // CatalogHandler exposes the Provider Catalog admin REST API.
@@ -25,6 +26,7 @@ type CatalogHandler struct {
 	scheduler *catalog.SyncScheduler
 	resolver  *catalog.VirtualModelResolver
 	registry  *runtime.Registry
+	log       *zap.Logger
 }
 
 // NewCatalogHandler constructs a CatalogHandler.
@@ -34,6 +36,7 @@ func NewCatalogHandler(
 	resolver *catalog.VirtualModelResolver,
 	registry *runtime.Registry,
 ) *CatalogHandler {
+	log, _ := zap.NewProduction()
 	return &CatalogHandler{
 		db:        db,
 		store:     catalog.NewProviderStore(db),
@@ -41,6 +44,7 @@ func NewCatalogHandler(
 		scheduler: scheduler,
 		resolver:  resolver,
 		registry:  registry,
+		log:       log,
 	}
 }
 
@@ -601,6 +605,10 @@ func (h *CatalogHandler) RegisterCatalogAlias(c *gin.Context) {
 		`INSERT INTO model_versions (id,model_id,version,is_default) VALUES ($1,$2,'v1',TRUE)`,
 		uuid.New().String(), mID)
 
+	// Restore team_model_permissions from snapshot if this model name was previously
+	// soft-deleted.  No-op on first-ever registration.
+	restorePermissionsFromSnapshot(c.Request.Context(), h.db, h.log, in.Name, mID)
+
 	epID := uuid.New().String()
 	_, _ = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO model_endpoints
@@ -962,6 +970,10 @@ func (h *CatalogHandler) BulkRegisterFromCatalog(c *gin.Context) {
 		_, _ = h.db.ExecContext(ctx,
 			`INSERT INTO model_versions (id,model_id,version,is_default) VALUES ($1,$2,'v1',TRUE)`,
 			uuid.New().String(), mID)
+
+		// Restore team_model_permissions from snapshot if this model name was previously
+		// soft-deleted.  No-op on first-ever registration.
+		restorePermissionsFromSnapshot(ctx, h.db, h.log, entry.PublicName, mID)
 
 		epID := uuid.New().String()
 		_, _ = h.db.ExecContext(ctx, `
