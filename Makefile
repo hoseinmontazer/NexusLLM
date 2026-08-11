@@ -200,8 +200,10 @@ MIGRATIONS := \
 	049_unified_model_permissions.sql \
 	050_provider_exposure_modes.sql \
 	051_self_service_developer_portal.sql \
-	052_user_auth_and_credentials.sql
-
+	052_user_auth_and_credentials.sql \
+	053_stable_model_identity.sql \
+    054_billing_core_tables.sql
+ 
 migrate:
 	@echo "→ Waiting for postgres..."
 	@until docker compose exec -T postgres pg_isready -U nexus -d nexusllm > /dev/null 2>&1; \

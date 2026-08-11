@@ -12,8 +12,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/nexusllm/nexusllm/internal/admission"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
+	"github.com/nexusllm/nexusllm/internal/billing"
+	billingsweep "github.com/nexusllm/nexusllm/internal/billing/sweep"
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/config"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
@@ -157,6 +160,61 @@ func main() {
 	seedModelPermissions(ctx, db, policyEngine, log)
 	seedProjectPolicies(ctx, db, policyEngine, log)
 	seedProjectProviderAccess(ctx, db, policyEngine, log)
+
+	// ── Admission gate ────────────────────────────────────────────────────────
+	// Uses a dedicated standalone Redis instance (redis-admission) to avoid
+	// Redis Cluster cross-slot violations. Falls back to PostgreSQL checks
+	// when admission Redis is disabled or unavailable.
+	var admissionGate *admission.Gate
+	if cfg.AdmissionRedis.Enabled {
+		admissionRDB, admErr := admission.NewClient(admission.Config{
+			Addr:     cfg.AdmissionRedis.Addr,
+			Password: cfg.AdmissionRedis.Password,
+			DB:       cfg.AdmissionRedis.DB,
+		})
+		if admErr != nil {
+			log.Warn("admission redis unavailable — admission gate will use PostgreSQL fallback",
+				zap.Error(admErr))
+		} else {
+			admissionGate = admission.NewGate(admissionRDB, db, log)
+			log.Info("admission gate initialised",
+				zap.String("addr", cfg.AdmissionRedis.Addr))
+
+			// Rebuild admission Redis counters from PostgreSQL on startup.
+			rebuilder := billingsweep.NewRedisRebuilder(db, admissionRDB, log)
+			if err := rebuilder.Run(ctx); err != nil {
+				log.Warn("admission redis rebuild error on startup", zap.Error(err))
+			}
+			// Periodic rebuild every 6 hours as a safety net.
+			go rebuilder.Start(watchCtx, 6*time.Hour)
+		}
+	} else {
+		log.Info("admission redis disabled — gate operates in PostgreSQL-fallback mode")
+	}
+
+	// ── Billing services ──────────────────────────────────────────────────────
+	expiryPolicy := billing.ExpiryRecoveryPolicy(cfg.Billing.ExpiryRecoveryPolicy)
+	billingReserver := billing.NewReserver(db, log).WithAuthTTL(cfg.Billing.AuthTTL)
+	billingSettler  := billing.NewSettler(db, log, expiryPolicy)
+
+	// ── Billing background sweeps ─────────────────────────────────────────────
+	// All sweeps are idempotent and safe to run concurrently with requests.
+	pendingSweep := billingsweep.NewPendingSweep(db, billingSettler, billingReserver, log)
+	expirySweep  := billingsweep.NewExpirySweep(db, log)
+	walletRecon  := billingsweep.NewWalletReconciler(db, log)
+	quotaSync    := billingsweep.NewQuotaLedgerSync(db, log)
+
+	go pendingSweep.Start(watchCtx, 5*time.Minute)
+	go expirySweep.Start(watchCtx, 2*time.Minute)
+	go walletRecon.Start(watchCtx, 1*time.Hour)
+	go quotaSync.Start(watchCtx, 15*time.Minute)
+
+	log.Info("billing sweeps started")
+
+	// Keep billing and admission variables alive (used by proxy handler below).
+	_ = admissionGate
+	_ = billingReserver
+	_ = billingSettler
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
 	catalogResolver := catalog.NewVirtualModelResolver(db, log)

@@ -538,9 +538,9 @@ func (h *PortalHandler) ReviewPortalAccessRequest(c *gin.Context) {
 
 	// 4. Rate Limits & Quotas (project_policies)
 	_, _ = tx.ExecContext(c.Request.Context(), `
-		INSERT INTO project_policies (project_id, rpm_limit, tpm_limit, updated_at)
+		INSERT INTO project_policies (project_id, rpm, tpm, updated_at)
 		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (project_id) DO UPDATE SET rpm_limit = $2, tpm_limit = $3, updated_at = NOW()`,
+		ON CONFLICT (project_id) DO UPDATE SET rpm = $2, tpm = $3, updated_at = NOW()`,
 		req.ProjectID, rpm, tpm)
 
 	// 5. Automatic API Key Generation
@@ -796,11 +796,11 @@ func (h *PortalHandler) GetPortalUsage(c *gin.Context) {
 
 	// Fetch rate limit policy
 	var pol struct {
-		RPMLimit int `db:"rpm_limit"`
-		TPMLimit int `db:"tpm_limit"`
+		RPMLimit int `db:"rpm"`
+		TPMLimit int `db:"tpm"`
 	}
 	_ = h.db.GetContext(c.Request.Context(), &pol,
-		`SELECT rpm_limit, tpm_limit FROM project_policies WHERE project_id = $1`, projID)
+		`SELECT rpm, tpm FROM project_policies WHERE project_id = $1`, projID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":        projID,

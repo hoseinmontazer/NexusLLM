@@ -9,14 +9,16 @@ import (
 
 // Config aggregates all subsystem configurations.
 type Config struct {
-	Server     ServerConfig
-	Database   DatabaseConfig
-	Redis      RedisConfig
-	Auth       AuthConfig
-	Scheduler  SchedulerConfig
-	VLLM       VLLMConfig
-	RuntimeMgr RuntimeMgrConfig
-	Upstream   UpstreamConfig
+	Server          ServerConfig
+	Database        DatabaseConfig
+	Redis           RedisConfig
+	AdmissionRedis  AdmissionRedisConfig
+	Auth            AuthConfig
+	Scheduler       SchedulerConfig
+	VLLM            VLLMConfig
+	RuntimeMgr      RuntimeMgrConfig
+	Upstream        UpstreamConfig
+	Billing         BillingConfig
 }
 
 // ServerConfig controls the HTTP listener.
@@ -42,6 +44,28 @@ type RedisConfig struct {
 	Addr     string
 	Password string
 	DB       int
+}
+
+// AdmissionRedisConfig controls the dedicated admission Redis instance.
+// This MUST be a standalone (non-cluster) Redis instance.
+// Memory policy requirement: maxmemory-policy noeviction.
+type AdmissionRedisConfig struct {
+	Addr     string
+	Password string
+	DB       int
+	// Enabled controls whether the admission gate uses this dedicated instance.
+	// When false, the admission gate falls back to PostgreSQL-only checks.
+	Enabled bool
+}
+
+// BillingConfig controls billing system behaviour.
+type BillingConfig struct {
+	// ExpiryRecoveryPolicy is "best_effort" or "write_off".
+	// best_effort: attempt unplanned debit if funds available after auth expires.
+	// write_off:   accept revenue loss, mark as disputed.
+	ExpiryRecoveryPolicy string
+	// AuthTTL is how long a billing authorization stays active before expiry sweep.
+	AuthTTL time.Duration
 }
 
 // AuthConfig controls JWT and API-key validation.
@@ -117,6 +141,14 @@ func Load() (*Config, error) {
 	v.SetDefault("redis.password", "")
 	v.SetDefault("redis.db", 0)
 
+	v.SetDefault("admissionredis.addr", "localhost:6380")
+	v.SetDefault("admissionredis.password", "")
+	v.SetDefault("admissionredis.db", 0)
+	v.SetDefault("admissionredis.enabled", false)
+
+	v.SetDefault("billing.expiryrecoverypolicy", "best_effort")
+	v.SetDefault("billing.authttl", "15m")
+
 	v.SetDefault("auth.jwtsecret", "change-me-in-production")
 	v.SetDefault("auth.apikeycachettl", "5m")
 	v.SetDefault("auth.jwtcachettl", "1m")
@@ -167,6 +199,16 @@ func Load() (*Config, error) {
 	cfg.Redis.Addr = v.GetString("redis.addr")
 	cfg.Redis.Password = v.GetString("redis.password")
 	cfg.Redis.DB = v.GetInt("redis.db")
+
+	// AdmissionRedis
+	cfg.AdmissionRedis.Addr = v.GetString("admissionredis.addr")
+	cfg.AdmissionRedis.Password = v.GetString("admissionredis.password")
+	cfg.AdmissionRedis.DB = v.GetInt("admissionredis.db")
+	cfg.AdmissionRedis.Enabled = v.GetBool("admissionredis.enabled")
+
+	// Billing
+	cfg.Billing.ExpiryRecoveryPolicy = v.GetString("billing.expiryrecoverypolicy")
+	cfg.Billing.AuthTTL = v.GetDuration("billing.authttl")
 
 	// Auth
 	cfg.Auth.JWTSecret = v.GetString("auth.jwtsecret")
