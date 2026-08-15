@@ -800,6 +800,14 @@ func (a *RuntimeActivator) waitForReady(ctx context.Context, cfg *ModelConfig, s
 // The endpoint_id column is type uuid; cast $1 explicitly to avoid the
 // "operator does not exist: text = uuid" error when PostgreSQL infers text.
 func (a *RuntimeActivator) RecordActivity(ctx context.Context, endpointID string) {
+	// Virtual catalog/hybrid-provider endpoints ("virt:<providerID>:<modelID>",
+	// see internal/catalog/resolver.go) are synthetic pass-through IDs with no
+	// backing agent_runtimes row — there's no idle clock to reset. Casting one
+	// to ::uuid below would just fail in Postgres on every request through a
+	// catalog model, so skip the no-op update instead of erroring on it.
+	if strings.HasPrefix(endpointID, "virt:") {
+		return
+	}
 	res, err := a.db.ExecContext(ctx, `
 		UPDATE agent_runtimes
 		SET last_used_at = NOW(),

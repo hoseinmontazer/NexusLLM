@@ -5,6 +5,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -180,10 +181,14 @@ func (t *Tracker) processMessage(ctx context.Context, stream string, msg redis.X
 }
 
 func (t *Tracker) persist(ctx context.Context, e Event) {
-	// Sanitise nullable UUID fields — empty string is not a valid UUID in Postgres
+	// Sanitise nullable UUID fields — empty string is not a valid UUID in Postgres.
+	// Catalog/hybrid-provider requests carry synthetic "virt:<providerID>:<modelID>"
+	// identifiers (see internal/catalog/resolver.go) instead of real model_endpoints/
+	// models UUIDs — there's no backing row for those, so treat them as NULL too
+	// rather than letting Postgres reject the insert outright.
 	apiKeyID := nilIfEmpty(e.APIKeyID)
-	modelID := nilIfEmpty(e.ModelID)
-	endpointID := nilIfEmpty(e.EndpointID)
+	modelID := sanitizeUUIDField(e.ModelID)
+	endpointID := sanitizeUUIDField(e.EndpointID)
 	providerName := nilIfEmpty(e.ProviderName)
 	providerRequestID := nilIfEmpty(e.ProviderRequestID)
 	currency := e.CostCurrency
@@ -217,6 +222,16 @@ func (t *Tracker) persist(ctx context.Context, e Event) {
 // rather than rejecting them as invalid UUID syntax.
 func nilIfEmpty(s string) interface{} {
 	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// sanitizeUUIDField returns nil for empty strings AND synthetic "virt:" catalog
+// identifiers, so Postgres treats them as NULL rather than rejecting them as
+// invalid UUID syntax.
+func sanitizeUUIDField(s string) interface{} {
+	if s == "" || strings.HasPrefix(s, "virt:") {
 		return nil
 	}
 	return s

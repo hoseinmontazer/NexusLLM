@@ -232,6 +232,12 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelName stri
 		EnableMod         bool     `db:"enable_moderation"`
 	}
 
+	// Postgres rejects '' cast to ::uuid outright (unlike NULL, which just never
+	// matches) — a statement-level error, not a per-row skip. Any of org/team/
+	// model can legitimately be unresolved (e.g. a catalog/passthrough model
+	// with no local `models` row), so pass NULL rather than '' for those, or
+	// the whole policy load silently returns zero rows, including the org/team
+	// policies that otherwise would have matched.
 	_ = e.db.SelectContext(ctx, &rows, `
 		SELECT id, scope, scope_id, name, priority, enabled,
 		       COALESCE(system_prompt,'') AS system_prompt,
@@ -247,7 +253,7 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelName stri
 		      )
 		ORDER BY
 		  CASE scope WHEN 'org' THEN 1 WHEN 'team' THEN 2 ELSE 3 END,
-		  priority ASC`, orgID, teamID, modelID)
+		  priority ASC`, nilIfEmpty(orgID), nilIfEmpty(teamID), nilIfEmpty(modelID))
 
 	policies := make([]Policy, len(rows))
 	for i, r := range rows {
@@ -265,6 +271,15 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelName stri
 func (e *Engine) invalidateCache(ctx context.Context, scope, scopeID string) {
 	key := fmt.Sprintf("nexus:promptpolicy:%s:%s", scope, scopeID)
 	_ = e.rdb.Del(ctx, key).Err()
+}
+
+// nilIfEmpty returns nil for an empty string so Postgres treats a query
+// parameter as NULL rather than rejecting it as invalid UUID syntax.
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func (e *Engine) checkDenyList(messages []models.Message, denyList []string) (bool, string) {
