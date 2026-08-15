@@ -752,7 +752,7 @@ curl -X POST $ADMIN_URL/admin/v1/models/deploy \
     "capabilities": ["embedding"],
     "image": "michaelf34/infinity:latest",
     "host": "localhost", "port": 8300,
-    "extra_args": ["v2", "--model-name-or-path", "BAAI/bge-m3"],
+    "extra_args": ["v2", "--model-id", "BAAI/bge-m3"],
     "start_now": false
   }'
 

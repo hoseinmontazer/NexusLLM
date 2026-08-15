@@ -373,7 +373,7 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 			if !hasV2 {
 				spec.ExtraArgs = append([]string{"v2"}, spec.ExtraArgs...)
 			}
-			spec.ExtraArgs = append(spec.ExtraArgs, "--model-name-or-path", spec.ModelName)
+			spec.ExtraArgs = append(spec.ExtraArgs, "--model-id", spec.ModelName)
 		}
 	}
 

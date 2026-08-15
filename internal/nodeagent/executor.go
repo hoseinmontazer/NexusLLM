@@ -1416,7 +1416,7 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 				if !hasV2 {
 					p.ExtraArgs = append([]string{"v2"}, p.ExtraArgs...)
 				}
-				p.ExtraArgs = append(p.ExtraArgs, "--model-name-or-path", p.ModelName)
+				p.ExtraArgs = append(p.ExtraArgs, "--model-id", p.ModelName)
 			}
 		}
 	}

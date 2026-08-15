@@ -55,7 +55,7 @@ docker run -d --name infinity \
   --cpuset-cpus "0-31" \
   -p 7997:7997 \
   michaelf34/infinity:latest \
-  v2 --model-name-or-path BAAI/bge-m3 --port 7997
+  v2 --model-id BAAI/bge-m3 --port 7997
 
 curl -X POST http://localhost:8081/admin/v1/services \
   -H "Content-Type: application/json" \
