@@ -189,6 +189,14 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	if input.MaxOutput == 0 {
 		input.MaxOutput = 4096
 	}
+	// Capture whether the caller actually supplied a host BEFORE defaulting it
+	// to "localhost" below. bindHost (used for the node-agent dispatch path)
+	// needs to know the true "unset" state so the node-IP resolution further
+	// down actually runs — defaulting input.Host here first meant bindHost was
+	// never empty by the time that check ran, so a deploy with an explicit
+	// node_id but no host always ended up registered at "localhost" instead of
+	// the node's real IP.
+	callerSuppliedHost := input.Host != ""
 	if input.Host == "" {
 		input.Host = "localhost"
 	}
@@ -209,10 +217,55 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		modelID = input.Name
 	}
 
-	// ── Resolve bind host from node IP ────────────────────────────────────
-	// NOTE: This block runs AFTER NodeID is resolved from SpecificNodeID below.
-	// Placeholder — actual resolution deferred to resolveBindHost() call.
-	bindHost := input.Host
+	// Start from the caller's real (possibly empty) input so the node-IP
+	// resolution below actually fires when no explicit host was given.
+	bindHost := ""
+	if callerSuppliedHost {
+		bindHost = input.Host
+	}
+
+	// ── Resolve effective NodeID from placement mode ───────────────────────
+	// For specific_node: use SpecificNodeID directly (already validated by scheduler).
+	// For legacy node_id field: honour it as-is.
+	// For node_group / label_selector: the scheduler picks the node; NodeID stays empty
+	// here and the caller should use the scheduler path instead.
+	//
+	// This MUST run before the model_endpoints INSERT below — that row's `host`
+	// column is what the admin API/UI displays for this endpoint, and it was
+	// previously written before this resolution ran, so it always showed
+	// whatever bindHost was at INSERT time (i.e. "localhost") regardless of
+	// which node the model actually ended up dispatched to.
+	if input.PlacementMode == "specific_node" && input.SpecificNodeID != "" && input.NodeID == "" {
+		input.NodeID = input.SpecificNodeID
+	}
+
+	// ── Resolve bind host from node IP (runs AFTER NodeID is finalised) ───
+	// Now that NodeID is set (either from node_id or specific_node_id),
+	// resolve the real IP so both the DB row and the gateway route to the
+	// node over the network instead of "localhost".
+	if input.NodeID != "" && bindHost == "" {
+		var nodeIP string
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
+		).Scan(&nodeIP)
+		if nodeIP != "" {
+			bindHost = nodeIP
+		} else {
+			var hostname string
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
+			).Scan(&hostname)
+			if hostname != "" {
+				bindHost = hostname
+			}
+		}
+	}
+
+	// No node ended up assigned (pure local/legacy deploy) and the caller gave
+	// no explicit host — fall back to localhost, matching prior behavior.
+	if bindHost == "" {
+		bindHost = "localhost"
+	}
 
 	// ── 1. Insert model row ────────────────────────────────────────────────
 	mID := uuid.New().String()
@@ -315,58 +368,6 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		input.BackendType == "tgi" || input.BackendType == "llamacpp" ||
 		input.BackendType == "cpu_native" || input.BackendType == "openai_compat"
 	shouldStart := startNow && canDeploy && input.Image != ""
-
-	// ── Resolve effective NodeID from placement mode ───────────────────────
-	// For specific_node: use SpecificNodeID directly (already validated by scheduler).
-	// For legacy node_id field: honour it as-is.
-	// For node_group / label_selector: the scheduler picks the node; NodeID stays empty
-	// here and the caller should use the scheduler path instead.
-	if input.PlacementMode == "specific_node" && input.SpecificNodeID != "" && input.NodeID == "" {
-		input.NodeID = input.SpecificNodeID
-	}
-
-	// ── Resolve bind host from node IP (runs AFTER NodeID is finalised) ───
-	// The early bindHost assignment above was a placeholder.
-	// Now that NodeID is set (either from node_id, specific_node_id, or scheduler),
-	// resolve the real IP so the gateway can route to the node over the network.
-	if input.NodeID != "" && bindHost == "" {
-		var nodeIP string
-		_ = h.db.QueryRowContext(c.Request.Context(),
-			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
-		).Scan(&nodeIP)
-		if nodeIP != "" {
-			bindHost = nodeIP
-		} else {
-			var hostname string
-			_ = h.db.QueryRowContext(c.Request.Context(),
-				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
-			).Scan(&hostname)
-			if hostname != "" {
-				bindHost = hostname
-			}
-		}
-	}
-
-	// ── Resolve bind host from node IP (runs after NodeID is finalised) ───
-	// When a node is assigned, the endpoint host must be the node's real IP
-	// so the gateway can route to it over the network.
-	if input.NodeID != "" && bindHost == "" {
-		var nodeIP string
-		_ = h.db.QueryRowContext(c.Request.Context(),
-			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
-		).Scan(&nodeIP)
-		if nodeIP != "" {
-			bindHost = nodeIP
-		} else {
-			var hostname string
-			_ = h.db.QueryRowContext(c.Request.Context(),
-				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
-			).Scan(&hostname)
-			if hostname != "" {
-				bindHost = hostname
-			}
-		}
-	}
 
 	// ── Auto-placement: scheduler picks the best node + GPU allocation ────────
 	// Activated when auto_place=true and no explicit NodeID was given.
