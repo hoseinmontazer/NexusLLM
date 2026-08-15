@@ -201,26 +201,9 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	}
 
 	// ── Resolve bind host from node IP ────────────────────────────────────
-	// When deploying to a specific node, the endpoint host must be the node's
-	// real IP address (not localhost) so the gateway can route to it over the network.
+	// NOTE: This block runs AFTER NodeID is resolved from SpecificNodeID below.
+	// Placeholder — actual resolution deferred to resolveBindHost() call.
 	bindHost := input.Host
-	if input.NodeID != "" {
-		var nodeIP string
-		_ = h.db.QueryRowContext(c.Request.Context(),
-			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
-		).Scan(&nodeIP)
-		if nodeIP != "" {
-			bindHost = nodeIP
-		} else {
-			var hostname string
-			_ = h.db.QueryRowContext(c.Request.Context(),
-				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
-			).Scan(&hostname)
-			if hostname != "" {
-				bindHost = hostname
-			}
-		}
-	}
 
 	// ── 1. Insert model row ────────────────────────────────────────────────
 	mID := uuid.New().String()
@@ -320,7 +303,8 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 	// ── 3. Deploy the runtime ─────────────────────────────────────────────────
 	canDeploy := input.BackendType == "vllm" ||
-		input.BackendType == "tgi" || input.BackendType == "llamacpp" || input.BackendType == "cpu_native"
+		input.BackendType == "tgi" || input.BackendType == "llamacpp" ||
+		input.BackendType == "cpu_native" || input.BackendType == "openai_compat"
 	shouldStart := startNow && canDeploy && input.Image != ""
 
 	// ── Resolve effective NodeID from placement mode ───────────────────────
@@ -330,6 +314,49 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	// here and the caller should use the scheduler path instead.
 	if input.PlacementMode == "specific_node" && input.SpecificNodeID != "" && input.NodeID == "" {
 		input.NodeID = input.SpecificNodeID
+	}
+
+	// ── Resolve bind host from node IP (runs AFTER NodeID is finalised) ───
+	// The early bindHost assignment above was a placeholder.
+	// Now that NodeID is set (either from node_id, specific_node_id, or scheduler),
+	// resolve the real IP so the gateway can route to the node over the network.
+	if input.NodeID != "" && bindHost == "" {
+		var nodeIP string
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
+		).Scan(&nodeIP)
+		if nodeIP != "" {
+			bindHost = nodeIP
+		} else {
+			var hostname string
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
+			).Scan(&hostname)
+			if hostname != "" {
+				bindHost = hostname
+			}
+		}
+	}
+
+	// ── Resolve bind host from node IP (runs after NodeID is finalised) ───
+	// When a node is assigned, the endpoint host must be the node's real IP
+	// so the gateway can route to it over the network.
+	if input.NodeID != "" && bindHost == "" {
+		var nodeIP string
+		_ = h.db.QueryRowContext(c.Request.Context(),
+			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
+		).Scan(&nodeIP)
+		if nodeIP != "" {
+			bindHost = nodeIP
+		} else {
+			var hostname string
+			_ = h.db.QueryRowContext(c.Request.Context(),
+				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
+			).Scan(&hostname)
+			if hostname != "" {
+				bindHost = hostname
+			}
+		}
 	}
 
 	// ── Auto-placement: scheduler picks the best node + GPU allocation ────────
