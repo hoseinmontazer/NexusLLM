@@ -191,11 +191,18 @@ func (h *TeamHandler) ListTeamModels(c *gin.Context) {
 		Name string `db:"name" json:"name"`
 	}
 	var rows []modelRow
+	// Soft-deleting a model (DeleteModel) deliberately leaves its old
+	// team_model_permissions row in place so a later redeploy under the same
+	// name can restore grants from model_permission_snapshots — but that means
+	// a team can accumulate one permission row per historical (now-deleted)
+	// model_id sharing the same name. DISTINCT + excluding lifecycle='deleted'
+	// keeps this listing showing only the currently-live model per name.
 	if err := h.db.SelectContext(c.Request.Context(), &rows, `
-		SELECT m.name
+		SELECT DISTINCT m.name
 		FROM team_model_permissions tmp
 		JOIN models m ON m.id = tmp.model_id
 		WHERE tmp.team_id = $1
+		  AND COALESCE(m.lifecycle, 'active') != 'deleted'
 		ORDER BY m.name`, teamID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
