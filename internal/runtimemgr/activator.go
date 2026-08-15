@@ -38,6 +38,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
@@ -469,13 +470,20 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 	// rows (e.g. no matching model_endpoints row) we must detect that and fail
 	// with a clear error rather than silently orphaning runtimeID (which would
 	// cause an FK violation when the task references it).
+	// bind_host is bound directly from cfg.BindHost — NOT re-read from
+	// model_endpoints.host — because cfg.BindHost (resolved in
+	// loadConfigQuery, above) is already the canonical reachable address of
+	// cfg.NodeID. Re-reading me.host here would silently discard that
+	// correct value in favor of whatever model_endpoints.host happens to
+	// still say, which is exactly the bug this fixes (forensic audit,
+	// Case File 003).
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port,
 		   cpu_affinity, numa_node, requested_mode, effective_mode, workload_policy)
 		SELECT $1, $2, me.id, $3, $4, $8, 'pending',
-		       $7::jsonb, me.host, $12,
+		       $7::jsonb, $13, $12,
 		       $5, $6, $9, $10, $11
 		FROM model_endpoints me
 		WHERE me.model_id = $3
@@ -490,6 +498,7 @@ func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConf
 		effectiveMode,
 		workloadPolicy,
 		cfg.BindPort,
+		cfg.BindHost,
 	)
 	if err != nil {
 		return fmt.Errorf("insert agent_runtime: %w", err)
@@ -1169,6 +1178,16 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 	}
 	if row.IdleTimeout != nil {
 		cfg.IdleTimeout = time.Duration(*row.IdleTimeout) * time.Second
+	}
+	// The query above prefers an EXISTING ar.bind_host/me.host, which can
+	// perpetuate a stale or wrong value indefinitely across lazy cold-starts
+	// (forensic audit, Case File 003). Since the node is known, always
+	// resolve its current canonical reachable address instead — this makes
+	// cfg.BindHost the actual source of truth callers (enqueueStartModel,
+	// waitForReady) can trust directly, rather than one more fallback in a
+	// chain of stale values.
+	if cfg.NodeID != "" {
+		cfg.BindHost = nodeaddr.CanonicalHost(ctx, a.db, cfg.NodeID)
 	}
 	return cfg, nil
 }

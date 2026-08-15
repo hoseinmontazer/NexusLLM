@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
@@ -117,6 +118,14 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 		c.JSON(http.StatusBadRequest, gin.H{"error": "endpoint has no assigned node — deploy to a node first"})
 		return nil, false
 	}
+	// The query above prefers an EXISTING ar.bind_host/me.host, which can
+	// perpetuate a stale or wrong value indefinitely across restart/upgrade/
+	// rollback (forensic audit, Case File 003). Since the node is known,
+	// always resolve its current canonical reachable address instead of
+	// trusting whatever was stored before — this is the single choke point
+	// every caller (Start/Restart/Upgrade/Rollback) goes through, so fixing
+	// it here fixes it for all four.
+	row.BindHost = nodeaddr.CanonicalHost(c.Request.Context(), h.db, row.NodeID)
 	return &row, true
 }
 

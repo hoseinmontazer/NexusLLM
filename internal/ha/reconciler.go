@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
@@ -390,16 +391,11 @@ func (r *Reconciler) allocatePort(ctx context.Context, nodeID, modelID string) (
 	return port, nil
 }
 
-// nodeIP returns the IP or hostname of a node for container bind_host.
+// nodeIP returns the canonical reachable address of a node for container
+// bind_host. Delegates to nodeaddr.CanonicalHost — the single shared
+// implementation — rather than duplicating the resolution query here.
 func (r *Reconciler) nodeIP(ctx context.Context, nodeID string) string {
-	var ip string
-	_ = r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(host(ip_address), hostname, 'localhost') FROM nodes WHERE id = $1`, nodeID,
-	).Scan(&ip)
-	if ip == "" {
-		return "localhost"
-	}
-	return ip
+	return nodeaddr.CanonicalHost(ctx, r.db, nodeID)
 }
 
 func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action ReconcileAction) error {

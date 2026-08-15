@@ -5,11 +5,13 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -164,23 +166,54 @@ func (t *Tracker) StartConsumer(ctx context.Context) {
 	}
 }
 
+// processMessage persists a usage event and only Acks the Redis Stream entry
+// once that succeeds (or is given up on after bounded retry) — never
+// unconditionally. Acking before persist is confirmed to succeed means a
+// transient Postgres error silently and permanently drops a billable usage
+// event, since there is no redelivery mechanism (no XClaim/XPending handling
+// exists) once an entry is Acked.
+//
+// A malformed event (bad JSON, or a payload persist() can never succeed on)
+// is still Acked immediately — there is nothing to retry, and leaving it
+// unacked would wedge the consumer group on one poison message forever.
 func (t *Tracker) processMessage(ctx context.Context, stream string, msg redis.XMessage) {
-	defer func() {
-		_ = t.rdb.XAck(ctx, stream, "usage-writer", msg.ID)
-	}()
-
 	raw, ok := msg.Values["event"].(string)
 	if !ok {
+		_ = t.rdb.XAck(ctx, stream, "usage-writer", msg.ID)
 		return
 	}
 	var e Event
 	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		_ = t.rdb.XAck(ctx, stream, "usage-writer", msg.ID)
 		return
 	}
-	t.persist(ctx, e)
+
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = t.persist(ctx, e); err == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			t.log.Warn("usage persist failed — retrying",
+				zap.Error(err), zap.String("event_id", e.ID), zap.Int("attempt", attempt))
+			select {
+			case <-ctx.Done():
+				return // leave unacked; a fresh consumer will pick it up on restart
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+	}
+	if err != nil {
+		t.log.Error("usage persist error — giving up after retries, dropping event to avoid blocking the consumer",
+			zap.Error(err), zap.String("event_id", e.ID))
+	}
+	_ = t.rdb.XAck(ctx, stream, "usage-writer", msg.ID)
 }
 
-func (t *Tracker) persist(ctx context.Context, e Event) {
+func (t *Tracker) persist(ctx context.Context, e Event) error {
 	// Sanitise nullable UUID fields — empty string is not a valid UUID in Postgres.
 	// Catalog/hybrid-provider requests carry synthetic "virt:<providerID>:<modelID>"
 	// identifiers (see internal/catalog/resolver.go) instead of real model_endpoints/
@@ -213,9 +246,27 @@ func (t *Tracker) persist(ctx context.Context, e Event) {
 		e.ProjectPriorityWeight,
 		e.CachedTokens, e.ReasoningTokens, providerName, providerRequestID, currency,
 	)
-	if err != nil {
-		t.log.Error("usage persist error", zap.Error(err), zap.String("event_id", e.ID))
+	if isUniqueViolation(err) {
+		// Either this exact event.ID was already committed by an earlier attempt
+		// (a retry after a false-negative network error) or request_id collided
+		// with an already-recorded logical request (migration 056) — either way
+		// the event is already durably persisted, so this is success, not a
+		// failure to retry.
+		return nil
 	}
+	return err
+}
+
+// isUniqueViolation reports whether err is a Postgres unique_violation (23505).
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "23505"
+	}
+	return false
 }
 
 // nilIfEmpty returns nil for empty strings so Postgres treats them as NULL
@@ -257,7 +308,7 @@ func (t *Tracker) aggregateOrgDaily(ctx context.Context) {
 		SELECT
 		  org_id,
 		  COALESCE(model_name, '') AS model_name,
-		  created_at::date         AS day,
+		  (created_at AT TIME ZONE 'UTC')::date         AS day,
 		  COUNT(*),
 		  COUNT(*) FILTER (WHERE status != 'success'),
 		  COALESCE(SUM(prompt_tokens), 0),
@@ -267,8 +318,8 @@ func (t *Tracker) aggregateOrgDaily(ctx context.Context) {
 		  COALESCE(AVG(latency_ms), 0)
 		FROM usage_events
 		WHERE org_id IS NOT NULL
-		  AND created_at::date = CURRENT_DATE
-		GROUP BY org_id, COALESCE(model_name, ''), created_at::date
+		  AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date
+		GROUP BY org_id, COALESCE(model_name, ''), (created_at AT TIME ZONE 'UTC')::date
 		ON CONFLICT (org_id, model_name, day) DO UPDATE SET
 		  request_count     = EXCLUDED.request_count,
 		  error_count       = EXCLUDED.error_count,
@@ -312,14 +363,14 @@ func (t *Tracker) aggregateDaily(ctx context.Context) {
 		   prompt_tokens, completion_tokens, total_tokens, cost_usd)
 		SELECT
 		  team_id, model_name,
-		  created_at::date AS day,
+		  (created_at AT TIME ZONE 'UTC')::date AS day,
 		  COUNT(*),
 		  COUNT(*) FILTER (WHERE status != 'success'),
 		  SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
 		  SUM(cost_usd)
 		FROM usage_events
-		WHERE created_at::date = CURRENT_DATE
-		GROUP BY team_id, model_name, created_at::date
+		WHERE (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date
+		GROUP BY team_id, model_name, (created_at AT TIME ZONE 'UTC')::date
 		ON CONFLICT (team_id, model_name, day) DO UPDATE SET
 		  request_count     = EXCLUDED.request_count,
 		  error_count       = EXCLUDED.error_count,
@@ -340,7 +391,7 @@ func (t *Tracker) aggregateProjectDaily(ctx context.Context) {
 		SELECT
 		  project_id,
 		  COALESCE(model_name,'') AS model_name,
-		  created_at::date        AS day,
+		  (created_at AT TIME ZONE 'UTC')::date        AS day,
 		  COUNT(*),
 		  COUNT(*) FILTER (WHERE status != 'success'),
 		  COALESCE(SUM(prompt_tokens),0),
@@ -350,8 +401,8 @@ func (t *Tracker) aggregateProjectDaily(ctx context.Context) {
 		  COALESCE(AVG(latency_ms),0)
 		FROM usage_events
 		WHERE project_id IS NOT NULL
-		  AND created_at::date = CURRENT_DATE
-		GROUP BY project_id, COALESCE(model_name,''), created_at::date
+		  AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date
+		GROUP BY project_id, COALESCE(model_name,''), (created_at AT TIME ZONE 'UTC')::date
 		ON CONFLICT (project_id, model_name, day) DO UPDATE SET
 		  request_count     = EXCLUDED.request_count,
 		  error_count       = EXCLUDED.error_count,
@@ -413,7 +464,7 @@ func (t *Tracker) GetProjectDailyUsage(ctx context.Context, projectID, from, to 
 	rows := []ProjectDailySummary{}
 	err := t.db.SelectContext(ctx, &rows, `
 		SELECT project_id::text, COALESCE(model_name,'') AS model_name,
-		       created_at::date::text AS day,
+		       (created_at AT TIME ZONE 'UTC')::date::text AS day,
 		       COUNT(*)                                              AS request_count,
 		       COUNT(*) FILTER (WHERE status != 'success')          AS error_count,
 		       COALESCE(SUM(prompt_tokens),0)                       AS prompt_tokens,
@@ -424,7 +475,7 @@ func (t *Tracker) GetProjectDailyUsage(ctx context.Context, projectID, from, to 
 		FROM usage_events
 		WHERE project_id = $1::uuid
 		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz
-		GROUP BY project_id, COALESCE(model_name,''), created_at::date
+		GROUP BY project_id, COALESCE(model_name,''), (created_at AT TIME ZONE 'UTC')::date
 		ORDER BY day DESC, model_name`,
 		projectID, from, to)
 	return rows, err
@@ -472,7 +523,7 @@ func (t *Tracker) GetOrgDailyUsage(ctx context.Context, orgID, from, to string) 
 	err := t.db.SelectContext(ctx, &rows, `
 		SELECT org_id,
 		       COALESCE(model_name, '') AS model_name,
-		       created_at::date::text   AS day,
+		       (created_at AT TIME ZONE 'UTC')::date::text   AS day,
 		       COUNT(*)                                              AS request_count,
 		       COUNT(*) FILTER (WHERE status != 'success')          AS error_count,
 		       COALESCE(SUM(prompt_tokens), 0)                      AS prompt_tokens,
@@ -483,7 +534,7 @@ func (t *Tracker) GetOrgDailyUsage(ctx context.Context, orgID, from, to string) 
 		FROM usage_events
 		WHERE org_id = $1::uuid
 		  AND created_at BETWEEN $2::timestamptz AND $3::timestamptz
-		GROUP BY org_id, COALESCE(model_name, ''), created_at::date
+		GROUP BY org_id, COALESCE(model_name, ''), (created_at AT TIME ZONE 'UTC')::date
 		ORDER BY day DESC, model_name`,
 		orgID, from, to)
 	return rows, err

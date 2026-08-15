@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/controller"
+	"github.com/nexusllm/nexusllm/internal/nodeaddr"
+	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
@@ -31,6 +34,7 @@ type RuntimeHandler struct {
 	sched    *scheduler.Scheduler // optional; nil = manual GPU assignment only
 	taskMgr  *taskmanager.Manager // optional; nil = local Docker deployment only
 	log      *zap.Logger
+	engine   *policy.Engine // required for permission-restore Redis sync — see WithPolicyEngine
 }
 
 // NewRuntimeHandler constructs a RuntimeHandler.
@@ -55,6 +59,17 @@ func (h *RuntimeHandler) WithPlacement(_ interface{}) *RuntimeHandler {
 // WithTaskManager attaches a task manager, enabling node-agent based deployment.
 func (h *RuntimeHandler) WithTaskManager(tm *taskmanager.Manager) *RuntimeHandler {
 	h.taskMgr = tm
+	return h
+}
+
+// WithPolicyEngine attaches the gateway's policy engine so permission
+// restoration (restorePermissionsFromSnapshot) can synchronize restored
+// team_model_permissions rows into the live Redis ACL set via the same
+// canonical SetModelAllowed path the admin grant endpoint uses — never a
+// duplicate Redis write. Required for restore to report success; see
+// restorePermissionsFromSnapshot's doc comment.
+func (h *RuntimeHandler) WithPolicyEngine(e *policy.Engine) *RuntimeHandler {
+	h.engine = e
 	return h
 }
 
@@ -243,24 +258,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 	// ── Resolve bind host from node IP (runs AFTER NodeID is finalised) ───
 	// Now that NodeID is set (either from node_id or specific_node_id),
-	// resolve the real IP so both the DB row and the gateway route to the
-	// node over the network instead of "localhost".
+	// resolve the canonical reachable address via the single shared
+	// nodeaddr.CanonicalHost implementation so both the DB row and the
+	// gateway route to the node over the network instead of "localhost".
 	if input.NodeID != "" && bindHost == "" {
-		var nodeIP string
-		_ = h.db.QueryRowContext(c.Request.Context(),
-			`SELECT COALESCE(host(ip_address), '') FROM nodes WHERE id = $1`, input.NodeID,
-		).Scan(&nodeIP)
-		if nodeIP != "" {
-			bindHost = nodeIP
-		} else {
-			var hostname string
-			_ = h.db.QueryRowContext(c.Request.Context(),
-				`SELECT hostname FROM nodes WHERE id = $1`, input.NodeID,
-			).Scan(&hostname)
-			if hostname != "" {
-				bindHost = hostname
-			}
-		}
+		bindHost = nodeaddr.CanonicalHost(c.Request.Context(), h.db, input.NodeID)
 	}
 
 	// No node ended up assigned (pure local/legacy deploy) and the caller gave
@@ -317,7 +319,11 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 
 	// Restore team_model_permissions from snapshot if this model name was previously
 	// soft-deleted.  No-op on first-ever deployment of a new name.
-	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
+	if _, restoreErr := h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID); restoreErr != nil {
+		h.log.Error("permission restore failed — this deploy will NOT have any team grants "+
+			"automatically recovered from a previous deletion of this model name; grant access manually if needed",
+			zap.String("model_name", input.Name), zap.String("model_id", mID), zap.Error(restoreErr))
+	}
 
 	// Runtime config — save all fields including llamacpp source so lazy config modal can read them back
 	_, _ = h.db.ExecContext(c.Request.Context(), `
@@ -795,7 +801,11 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 
 	// Restore team_model_permissions from snapshot if this model name was previously
 	// soft-deleted.  No-op on first-ever deployment of a new name.
-	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
+	if _, restoreErr := h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID); restoreErr != nil {
+		h.log.Error("permission restore failed — this deploy will NOT have any team grants "+
+			"automatically recovered from a previous deletion of this model name; grant access manually if needed",
+			zap.String("model_name", input.Name), zap.String("model_id", mID), zap.Error(restoreErr))
+	}
 
 	epID := uuid.New().String()
 	_, _ = h.db.ExecContext(c.Request.Context(), `
@@ -1041,7 +1051,11 @@ func (h *RuntimeHandler) RegisterExternalModel(c *gin.Context) {
 
 	// Restore team_model_permissions from snapshot if this model name was previously
 	// soft-deleted.  No-op on first-ever registration of a new name.
-	h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID)
+	if _, restoreErr := h.restorePermissionsFromSnapshot(c.Request.Context(), input.Name, mID); restoreErr != nil {
+		h.log.Error("permission restore failed — this deploy will NOT have any team grants "+
+			"automatically recovered from a previous deletion of this model name; grant access manually if needed",
+			zap.String("model_name", input.Name), zap.String("model_id", mID), zap.Error(restoreErr))
+	}
 
 	// Insert endpoint row — immediately active, no container lifecycle.
 	// host/port are placeholders (0.0.0.0:0) since routing uses upstream_base_url.
@@ -1963,31 +1977,81 @@ func (h *RuntimeHandler) DeleteModel(c *gin.Context) {
 // previously deleted model automatically recovers all team grants without
 // requiring the admin to re-grant each team manually.
 //
-// If no snapshot exists (first-ever deployment of this name) the function is a
-// no-op.  All errors are logged at WARN and do not fail the outer request.
-func (h *RuntimeHandler) restorePermissionsFromSnapshot(ctx context.Context, modelName, newModelID string) {
-	restorePermissionsFromSnapshot(ctx, h.db, h.log, modelName, newModelID)
+// If no snapshot exists (first-ever deployment of this name) this returns
+// (nil, nil) — not an error. A non-nil error means NOTHING changed: no
+// team_model_permissions row from this attempt survives, no Redis key was
+// touched, and the snapshot remains available (restored=FALSE) for a future
+// retry. Callers must not treat a non-nil error as a partial success.
+func (h *RuntimeHandler) restorePermissionsFromSnapshot(ctx context.Context, modelName, newModelID string) ([]string, error) {
+	return restorePermissionsFromSnapshot(ctx, h.db, h.engine, h.log, modelName, newModelID)
 }
 
 // restorePermissionsFromSnapshot is the package-level implementation shared by
-// RuntimeHandler and CatalogHandler.  Pass a nil logger to suppress logging.
-func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, log *zap.Logger, modelName, newModelID string) {
+// RuntimeHandler and CatalogHandler.
+//
+// Phase 2A/2B fix (forensic audit, Case File 002 §02 — the two confirmed,
+// schema-independent bugs; the cross-tenant model-name collision itself,
+// §02.B, is explicitly NOT addressed here and remains open, requiring the
+// separate org/project architecture migration):
+//
+//  1. Redis enforcement sync (2A). The previous version wrote
+//     team_model_permissions directly to Postgres and never touched the
+//     Redis ACL set the gateway's policy engine actually enforces against —
+//     so a restored grant showed up in the database and the admin panel, but
+//     silently denied every real inference request. This version restores
+//     each team through the SAME canonical function the admin grant endpoint
+//     uses — engine.SetModelAllowed — never a duplicate rdb.SAdd call, so
+//     there is exactly one code path that can ever write that Redis set.
+//
+//  2. Atomicity (2B). The entire operation — locking the snapshot, inserting
+//     team_model_permissions rows, syncing Redis, and marking the snapshot
+//     restored — now happens inside one transaction. SELECT ... FOR UPDATE
+//     takes a row lock on the snapshot so a concurrent restore attempt for
+//     the same model name blocks instead of racing; once the first commits,
+//     the second finds restored=TRUE already and treats it as "no snapshot"
+//     (see the re-check after acquiring the lock). Any failure — a bad
+//     team_id, a Redis error, a failed final UPDATE — rolls back everything:
+//     Postgres and Redis either both change together or neither does.
+func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, engine *policy.Engine, log *zap.Logger, modelName, newModelID string) ([]string, error) {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	// Find the most recent unconsumed snapshot for this name.
+
+	tx, err := db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("restore permissions: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Lock the most recent unconsumed snapshot row for this name. FOR UPDATE
+	// blocks a concurrent restore attempt targeting the SAME row until this
+	// transaction commits or rolls back. Once unblocked, Postgres re-checks
+	// the row against the WHERE clause using its now-current (committed)
+	// value — if the first transaction already consumed it, restored is now
+	// TRUE, the row no longer matches, and this query correctly returns
+	// sql.ErrNoRows instead of restoring the same snapshot twice.
 	var snapID string
 	var teamIDsJSON string
-	err := db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT id::text, team_ids::text
 		FROM model_permission_snapshots
 		WHERE model_name = $1 AND restored = FALSE
 		ORDER BY deleted_at DESC
-		LIMIT 1`, modelName,
+		LIMIT 1
+		FOR UPDATE`, modelName,
 	).Scan(&snapID, &teamIDsJSON)
 	if err != nil {
-		// No snapshot — first-ever deployment of this name, nothing to restore.
-		return
+		if errors.Is(err, sql.ErrNoRows) {
+			// No unconsumed snapshot — first-ever deployment of this name, or
+			// already restored by a concurrent/prior attempt. Not an error.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("restore permissions: lock snapshot: %w", err)
 	}
 
 	// Parse the JSON array of team UUIDs.
@@ -1997,45 +2061,75 @@ func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, log *zap.L
 			zap.String("snapshot_id", snapID),
 			zap.String("model_name", modelName),
 		)
-		return
+		return nil, nil
 	}
 
-	// Re-insert one team_model_permissions row per team.
-	restored := 0
+	// Re-insert one team_model_permissions row per team, inside the tx. Any
+	// failure aborts the whole restore rather than silently skipping that
+	// team — a partial restore is exactly the kind of DB/Redis divergence
+	// risk this fix exists to eliminate.
+	var restoredTeamIDs []string
 	for _, teamID := range teamIDs {
 		teamID = strings.TrimSpace(teamID)
 		if teamID == "" {
 			continue
 		}
-		_, insertErr := db.ExecContext(ctx, `
+		if _, insertErr := tx.ExecContext(ctx, `
 			INSERT INTO team_model_permissions (team_id, model_id)
 			VALUES ($1::uuid, $2::uuid)
 			ON CONFLICT DO NOTHING`,
 			teamID, newModelID,
-		)
-		if insertErr != nil {
-			log.Warn("failed to restore team permission from snapshot",
-				zap.String("team_id", teamID),
-				zap.String("model_id", newModelID),
-				zap.Error(insertErr),
-			)
-		} else {
-			restored++
+		); insertErr != nil {
+			return nil, fmt.Errorf("restore permissions: insert team_model_permissions (team %s): %w", teamID, insertErr)
+		}
+		restoredTeamIDs = append(restoredTeamIDs, teamID)
+	}
+
+	// Synchronize the SAME teams into the live enforcement set via the one
+	// canonical function that writes it. A failure here rolls back the whole
+	// transaction — the INSERTs above are undone — so Postgres never ends up
+	// saying a grant exists when the gateway can't see it.
+	if len(restoredTeamIDs) > 0 {
+		if engine == nil {
+			return nil, fmt.Errorf("restore permissions: no policy engine configured — cannot synchronize gateway enforcement, refusing to report a partial restore as successful")
+		}
+		for _, teamID := range restoredTeamIDs {
+			if syncErr := engine.SetModelAllowed(ctx, teamID, modelName); syncErr != nil {
+				return nil, fmt.Errorf("restore permissions: sync team %s to gateway enforcement: %w", teamID, syncErr)
+			}
 		}
 	}
 
-	// Mark snapshot as consumed so it is not applied again on a subsequent redeploy.
-	_, _ = db.ExecContext(ctx, `
+	// Mark snapshot as consumed, in the SAME transaction — error is no longer
+	// discarded; a failure here rolls back the INSERTs and Redis writes above
+	// (Redis SAdd is not itself transactional, but since we only reach this
+	// point after every SetModelAllowed call already succeeded, the only way
+	// this UPDATE can fail is an unrelated DB-level error, and rolling back
+	// the Postgres side leaves the snapshot re-attemptable rather than
+	// wrongly marked restored).
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE model_permission_snapshots
 		SET restored = TRUE, restored_at = NOW()
-		WHERE id = $1::uuid`, snapID)
+		WHERE id = $1::uuid`, snapID,
+	); err != nil {
+		return nil, fmt.Errorf("restore permissions: mark snapshot restored: %w", err)
+	}
 
-	log.Info("permissions restored from snapshot",
-		zap.String("snapshot_id", snapID),
-		zap.String("model_name", modelName),
-		zap.String("new_model_id", newModelID),
-		zap.Int("teams_restored", restored),
-	)
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("restore permissions: commit: %w", err)
+	}
+	committed = true
+
+	if len(restoredTeamIDs) > 0 {
+		log.Info("restored team permissions from a previous deletion of this model name — "+
+			"verify these teams are actually expected to have access before assuming this is routine",
+			zap.String("model_name", modelName),
+			zap.String("new_model_id", newModelID),
+			zap.Strings("restored_team_ids", restoredTeamIDs),
+		)
+	}
+
+	return restoredTeamIDs, nil
 }
 
 // GetDeployStatus handles GET /admin/v1/models/:id/deploy-status

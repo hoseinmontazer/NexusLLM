@@ -286,8 +286,15 @@ type anthropicResponse struct {
 		Text string `json:"text"`
 	} `json:"content"`
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens int `json:"input_tokens"`
+		// CacheReadInputTokens is Anthropic's count of prompt tokens served from
+		// an existing prompt cache — the discount-eligible equivalent of
+		// OpenAI's prompt_tokens_details.cached_tokens. CacheCreationInputTokens
+		// (tokens newly written to cache) is a distinct, non-discounted cost and
+		// is intentionally not mapped to CachedTokens.
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
 	} `json:"usage"`
 }
 
@@ -337,6 +344,11 @@ func translateAnthropicResponse(raw []byte, nexusModelName string) ([]byte, erro
 			TotalTokens:      ar.Usage.InputTokens + ar.Usage.OutputTokens,
 		},
 	}
+	if ar.Usage.CacheReadInputTokens > 0 {
+		oaiResp.Usage.PromptTokensDetails = &models.UsageTokenDetails{
+			CachedTokens: ar.Usage.CacheReadInputTokens,
+		}
+	}
 	return json.Marshal(oaiResp)
 }
 
@@ -358,11 +370,12 @@ func translateAnthropicResponse(raw []byte, nexusModelName string) ([]byte, erro
 //
 //	data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"..."},...}]}
 type anthropicSSEStream struct {
-	reader    *bufio.Reader
-	closer    io.Closer
-	model     string
-	messageID string
-	done      bool
+	reader      *bufio.Reader
+	closer      io.Closer
+	model       string
+	messageID   string
+	done        bool
+	inputTokens int // captured from message_start; Anthropic never repeats it later
 }
 
 func (s *anthropicSSEStream) ReadLine() (string, error) {
@@ -404,14 +417,21 @@ func (s *anthropicSSEStream) ReadLine() (string, error) {
 
 		switch eventType {
 		case "message_start":
-			// Extract message ID for subsequent chunks.
+			// Extract message ID and input token count for subsequent chunks —
+			// input_tokens is only ever reported here; message_delta only carries
+			// output_tokens. Without capturing it here, streaming Anthropic
+			// responses report zero prompt tokens for the whole request.
 			var ms struct {
 				Message struct {
-					ID string `json:"id"`
+					ID    string `json:"id"`
+					Usage struct {
+						InputTokens int `json:"input_tokens"`
+					} `json:"usage"`
 				} `json:"message"`
 			}
 			if jsonErr := json.Unmarshal([]byte(payload), &ms); jsonErr == nil {
 				s.messageID = ms.Message.ID
+				s.inputTokens = ms.Message.Usage.InputTokens
 			}
 			continue
 
@@ -446,6 +466,17 @@ func (s *anthropicSSEStream) ReadLine() (string, error) {
 				finishReason = "length"
 			}
 			chunk := buildOAIStreamChunk(s.messageID, s.model, "", &finishReason)
+			// message_delta is the only point where Anthropic reports output_tokens
+			// for a streamed response — attach usage here (combined with the
+			// input_tokens captured from message_start) so the gateway's generic
+			// SSE usage parser (which watches every chunk for chunk.Usage.*, not
+			// just a dedicated final chunk) picks up real token counts instead of
+			// silently recording zero for every streamed Anthropic request.
+			chunk["usage"] = map[string]interface{}{
+				"prompt_tokens":     s.inputTokens,
+				"completion_tokens": md.Usage.OutputTokens,
+				"total_tokens":      s.inputTokens + md.Usage.OutputTokens,
+			}
 			out, _ := json.Marshal(chunk)
 			return "data: " + string(out), nil
 

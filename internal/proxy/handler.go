@@ -615,8 +615,12 @@ virtualDispatch:
 					req.Model = ep.UpstreamModelName
 				}
 			}
-			done, emptyContent := h.syncChat(c, claims, req, chatReq, backend, ep, start, thinkingCaps)
-			if done && emptyContent && thinkingOn && h.thinkingRes != nil {
+			// A retry is possible whenever thinking is on and enabled for this
+			// model — skipBillingIfEmpty=true so this attempt isn't billed if it
+			// turns out to be the discarded one (see syncChat's billing gate).
+			mayRetry := thinkingOn && h.thinkingRes != nil
+			done, emptyContent := h.syncChat(c, claims, req, chatReq, backend, ep, start, thinkingCaps, mayRetry)
+			if done && emptyContent && mayRetry {
 				// Thinking consumed all tokens — retry once with thinking disabled.
 				h.log.Info("thinking produced empty content — retrying with thinking disabled",
 					zap.String("model", req.Model),
@@ -626,7 +630,7 @@ virtualDispatch:
 				c.Header("X-Nexus-Thinking-Retry", "1")
 				middleware.ThinkingRequestsTotal.WithLabelValues(
 					claims.TeamID, claims.ProjectID, req.Model, "fast_retry").Inc()
-				h.syncChat(c, claims, req, retryReq, backend, ep, start, thinkingCaps)
+				h.syncChat(c, claims, req, retryReq, backend, ep, start, thinkingCaps, false)
 				return
 			}
 			if done {
@@ -1065,6 +1069,7 @@ func (h *Handler) syncChat(
 	ep *runtime.Endpoint,
 	start time.Time,
 	thinkingCaps thinking.ModelCaps,
+	skipBillingIfEmpty bool,
 ) (ok bool, emptyContent bool) {
 	resp, err := backend.Chat(c.Request.Context(), chatReq)
 	if err != nil {
@@ -1142,60 +1147,80 @@ func (h *Handler) syncChat(
 	}
 
 	// ── Token usage recording ─────────────────────────────────────────────
-	// Layer-1: project token counters (RPM/TPM/daily/monthly budget tracking)
-	_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID,
-		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
-	// Layer-2: org monthly governance counter
-	_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID,
-		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
-	// Legacy: team daily quota counter (only meaningful for team-only keys)
-	if claims.ProjectID == "" {
-		_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
+	// Skipped entirely when this attempt burned its whole budget on hidden
+	// thinking and produced no visible content, AND the caller is about to
+	// silently retry with thinking disabled (skipBillingIfEmpty) — otherwise
+	// one client-visible response bills two usage events (this attempt's,
+	// discarded, plus the retry's), across every quota counter, Prometheus
+	// metric, and the usage_events row alike. The retry call always passes
+	// skipBillingIfEmpty=false, so whichever attempt's content actually reaches
+	// the client is exactly the one that gets billed.
+	if !(contentEmpty && skipBillingIfEmpty) {
+		// Layer-1: project token counters (RPM/TPM/daily/monthly budget tracking)
+		_ = h.policy.RecordProjectTokenUsage(context.Background(), claims.ProjectID,
 			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
-	}
-	middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model,
-		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+		// Layer-2: org monthly governance counter
+		_ = h.policy.RecordOrgTokenUsage(context.Background(), claims.OrgID,
+			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+		// Legacy: team daily quota counter (only meaningful for team-only keys)
+		if claims.ProjectID == "" {
+			_ = h.policy.RecordTokenUsage(context.Background(), claims.TeamID,
+				chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+		}
+		middleware.RecordTokens(claims.TeamID, claims.ProjectID, req.Model,
+			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 
-	visibleTok := chatResp.Usage.CompletionTokens - chatResp.Usage.ThinkingTokens
-	if visibleTok < 0 {
-		visibleTok = 0
-	}
-	if thinkingCaps.SupportsThinking {
-		middleware.VisibleCompletionTokensTotal.WithLabelValues(
-			claims.TeamID, claims.ProjectID, req.Model).Add(float64(visibleTok))
-	}
+		visibleTok := chatResp.Usage.CompletionTokens - chatResp.Usage.ThinkingTokens
+		if visibleTok < 0 {
+			visibleTok = 0
+		}
+		if thinkingCaps.SupportsThinking {
+			middleware.VisibleCompletionTokensTotal.WithLabelValues(
+				claims.TeamID, claims.ProjectID, req.Model).Add(float64(visibleTok))
+		}
 
-	// FIX C-1: record per-provider Prometheus metrics for cloud provider backends.
-	if runtime.IsProviderBackend(ep.BackendType) {
-		latencySec := float64(latencyMs) / 1000.0
-		middleware.RecordProviderRequest(string(ep.BackendType), req.Model, "success", latencySec, 0)
-		middleware.RecordProviderTokens(string(ep.BackendType), req.Model,
-			chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, 0, chatResp.Usage.ThinkingTokens)
+		// FIX C-1: record per-provider Prometheus metrics for cloud provider backends.
+		if runtime.IsProviderBackend(ep.BackendType) {
+			latencySec := float64(latencyMs) / 1000.0
+			middleware.RecordProviderRequest(string(ep.BackendType), req.Model, "success", latencySec, 0)
+			middleware.RecordProviderTokens(string(ep.BackendType), req.Model,
+				chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, 0, chatResp.Usage.ThinkingTokens)
+		}
+		// FIX L-1: skip redundant DB lookup when project context already in claims.
+		var projID *string
+		var projName *string
+		var projPriority *string
+		var projPriorityWeight *int
+		if claims.ProjectID != "" {
+			pid := claims.ProjectID
+			pname := claims.ProjectName
+			ppw := claims.ProjectPriorityWeight
+			projID = &pid
+			projName = &pname
+			projPriorityWeight = &ppw
+		} else {
+			projID, projName, projPriority, projPriorityWeight = h.lookupProjectContext(context.Background(), req.Model, claims)
+		}
+		syncCachedTokens := 0
+		syncReasoningTokens := 0
+		if chatResp.Usage.PromptTokensDetails != nil {
+			syncCachedTokens = chatResp.Usage.PromptTokensDetails.CachedTokens
+		}
+		if chatResp.Usage.CompletionTokensDetails != nil {
+			syncReasoningTokens = chatResp.Usage.CompletionTokensDetails.ReasoningTokens
+		}
+		h.usageTracker.Record(context.Background(), usage.Event{
+			OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
+			EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
+			CompletionTokens: chatResp.Usage.CompletionTokens,
+			TotalTokens:      chatResp.Usage.TotalTokens,
+			CachedTokens:     syncCachedTokens,
+			ReasoningTokens:  syncReasoningTokens,
+			LatencyMs:        latencyMs, Status: "success",
+			ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
+			ProjectPriorityWeight: projPriorityWeight,
+		})
 	}
-	// FIX L-1: skip redundant DB lookup when project context already in claims.
-	var projID *string
-	var projName *string
-	var projPriority *string
-	var projPriorityWeight *int
-	if claims.ProjectID != "" {
-		pid := claims.ProjectID
-		pname := claims.ProjectName
-		ppw := claims.ProjectPriorityWeight
-		projID = &pid
-		projName = &pname
-		projPriorityWeight = &ppw
-	} else {
-		projID, projName, projPriority, projPriorityWeight = h.lookupProjectContext(context.Background(), req.Model, claims)
-	}
-	h.usageTracker.Record(context.Background(), usage.Event{
-		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
-		EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
-		CompletionTokens: chatResp.Usage.CompletionTokens,
-		TotalTokens:      chatResp.Usage.TotalTokens,
-		LatencyMs:        latencyMs, Status: "success",
-		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
-		ProjectPriorityWeight: projPriorityWeight,
-	})
 	c.JSON(resp.StatusCode, chatResp)
 	return true, contentEmpty
 }
@@ -1288,6 +1313,8 @@ func (h *Handler) streamChat(
 		firstToken       bool
 		promptTokens     int
 		completionTokens int
+		cachedTokens     int
+		reasoningTokens  int
 		seenUsageChunk   bool   // true if upstream already sent a usage chunk
 		streamID         string // captured from first chunk for synthesized usage chunk
 		streamModel      string
@@ -1400,6 +1427,12 @@ func (h *Handler) streamChat(
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 				promptTokens = chunk.Usage.PromptTokens
 				completionTokens = chunk.Usage.CompletionTokens
+				if chunk.Usage.PromptTokensDetails != nil {
+					cachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				}
+				if chunk.Usage.CompletionTokensDetails != nil {
+					reasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+				}
 			}
 			// Detect if upstream already sent a usage chunk (choices=[]).
 			if len(chunk.Choices) == 0 && chunk.Usage.TotalTokens > 0 {
@@ -1462,6 +1495,8 @@ func (h *Handler) streamChat(
 		EndpointID: ep.ID, PromptTokens: promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
+		CachedTokens:     cachedTokens,
+		ReasoningTokens:  reasoningTokens,
 		LatencyMs:        latencyMs, Status: streamStatus,
 		ProjectID: projID, ProjectName: projName, ProjectPriority: projPriority,
 		ProjectPriorityWeight: projPriorityWeight,

@@ -203,8 +203,9 @@ MIGRATIONS := \
 	052_user_auth_and_credentials.sql \
 	053_stable_model_identity.sql \
     054_billing_core_tables.sql \
-    055_billing_hardening.sql
- 
+    055_billing_hardening.sql \
+    056_usage_events_idempotency.sql
+
 migrate:
 	@echo "→ Waiting for postgres..."
 	@until docker compose exec -T postgres pg_isready -U nexus -d nexusllm > /dev/null 2>&1; \

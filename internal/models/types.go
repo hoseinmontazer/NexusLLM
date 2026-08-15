@@ -271,6 +271,17 @@ type Delta struct {
 }
 
 // Usage holds token counts for a completion.
+//
+// PromptTokensDetails/CompletionTokensDetails match the OpenAI wire shape
+// verbatim. Because openai_compat/vLLM/TGI/OpenAI/Azure/Groq/Together/
+// Mistral/DeepSeek/OpenRouter responses are passed through as raw bytes and
+// decoded directly into this struct (see internal/proxy/handler.go's
+// json.Unmarshal into ChatCompletionResponse), any of those providers that
+// already return cached/reasoning token breakdowns populate these fields for
+// free, with no per-provider parsing code. Anthropic doesn't return this
+// shape natively — translateAnthropicResponse populates it explicitly from
+// Anthropic's own usage fields so billing has one source of truth regardless
+// of provider.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -279,6 +290,16 @@ type Usage struct {
 	// ThinkingTokens is the number of tokens consumed by internal reasoning.
 	// VisibleTokens is completion_tokens minus thinking_tokens.
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
+
+	PromptTokensDetails     *UsageTokenDetails `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *UsageTokenDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// UsageTokenDetails is the OpenAI-shaped breakdown of cached/reasoning tokens
+// nested under prompt_tokens_details/completion_tokens_details.
+type UsageTokenDetails struct {
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // EmbeddingRequest mirrors the OpenAI Embeddings request body.

@@ -24,6 +24,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/gpu"
 	"github.com/nexusllm/nexusllm/internal/ha"
+	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/nodeagent"
 	"github.com/nexusllm/nexusllm/internal/nodehealth"
 	"github.com/nexusllm/nexusllm/internal/policy"
@@ -181,7 +182,7 @@ func main() {
 	teamH := handlers.NewTeamHandler(db, rdb, policyEngine)
 	apikeyH := handlers.NewAPIKeyHandler(db, rdb)
 	orgGovH := handlers.NewOrgGovernanceHandler(db, rdb, policyEngine)
-	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithScheduler(sched).WithTaskManager(taskMgr)
+	runtimeH := handlers.NewRuntimeHandler(db, rdb, registry, modelCtrl).WithScheduler(sched).WithTaskManager(taskMgr).WithPolicyEngine(policyEngine)
 	controllerH := handlers.NewControllerHandler(db, taskMgr, log)
 	gpuH := handlers.NewGPUHandler(gpuInventory)
 	usageH := handlers.NewUsageHandler(usageTracker)
@@ -201,7 +202,7 @@ func main() {
 	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
 	go catalogScheduler.Start(usageCtx)
 	authSvc := internalauth.NewService(rdb, db, cfg.Auth.JWTSecret, 24*time.Hour)
-	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry)
+	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry).WithPolicyEngine(policyEngine)
 	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver, authSvc)
 	userH := handlers.NewUserHandler(db, authSvc)
 
@@ -859,6 +860,11 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			cfg.CtxSize = 4096
 		}
 
+		// Resolve the canonical reachable address of the target node instead
+		// of copying model_endpoints.host, which can be stale or wrong
+		// (forensic audit, Case File 003) — nothing else ever corrects it.
+		bindHost := nodeaddr.CanonicalHost(ctx, db, row.NodeID)
+
 		// Insert the new runtime row inside the same tx that claimed the slot,
 		// so the advisory lock covers the INSERT and is released only on commit.
 		// The task FK requires the row to exist before dispatch below.
@@ -868,7 +874,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
 			   requested_mode, effective_mode, workload_policy)
 			SELECT $1, $2, me.id, $3, $4, $5,
-			       'pending', '[]'::jsonb, me.host, 0, '', -1,
+			       'pending', '[]'::jsonb, $8, 0, '', -1,
 			       $6, $6, $7
 			FROM model_endpoints me
 			WHERE me.model_id = $3
@@ -877,6 +883,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			LIMIT 1`,
 			newRuntimeID, row.NodeID, row.ModelID, containerName, row.Backend,
 			cfg.ExecutionMode, cfg.WorkloadPolicy,
+			bindHost,
 		)
 		if insertErr != nil {
 			_ = tx.Rollback()

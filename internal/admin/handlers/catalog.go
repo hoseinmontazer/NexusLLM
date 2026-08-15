@@ -14,6 +14,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"github.com/nexusllm/nexusllm/internal/catalog"
+	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"go.uber.org/zap"
 )
@@ -27,6 +28,7 @@ type CatalogHandler struct {
 	resolver  *catalog.VirtualModelResolver
 	registry  *runtime.Registry
 	log       *zap.Logger
+	engine    *policy.Engine // required for permission-restore Redis sync — see WithPolicyEngine
 }
 
 // NewCatalogHandler constructs a CatalogHandler.
@@ -46,6 +48,15 @@ func NewCatalogHandler(
 		registry:  registry,
 		log:       log,
 	}
+}
+
+// WithPolicyEngine attaches the gateway's policy engine so permission
+// restoration can synchronize restored team_model_permissions rows into the
+// live Redis ACL set via the canonical SetModelAllowed path. See
+// RuntimeHandler.WithPolicyEngine / restorePermissionsFromSnapshot.
+func (h *CatalogHandler) WithPolicyEngine(e *policy.Engine) *CatalogHandler {
+	h.engine = e
+	return h
 }
 
 // ── Provider CRUD ─────────────────────────────────────────────────────────────
@@ -607,7 +618,11 @@ func (h *CatalogHandler) RegisterCatalogAlias(c *gin.Context) {
 
 	// Restore team_model_permissions from snapshot if this model name was previously
 	// soft-deleted.  No-op on first-ever registration.
-	restorePermissionsFromSnapshot(c.Request.Context(), h.db, h.log, in.Name, mID)
+	if _, restoreErr := restorePermissionsFromSnapshot(c.Request.Context(), h.db, h.engine, h.log, in.Name, mID); restoreErr != nil {
+		h.log.Error("permission restore failed — this registration will NOT have any team grants "+
+			"automatically recovered from a previous deletion of this model name; grant access manually if needed",
+			zap.String("model_name", in.Name), zap.String("model_id", mID), zap.Error(restoreErr))
+	}
 
 	epID := uuid.New().String()
 	_, _ = h.db.ExecContext(c.Request.Context(), `
@@ -973,7 +988,11 @@ func (h *CatalogHandler) BulkRegisterFromCatalog(c *gin.Context) {
 
 		// Restore team_model_permissions from snapshot if this model name was previously
 		// soft-deleted.  No-op on first-ever registration.
-		restorePermissionsFromSnapshot(ctx, h.db, h.log, entry.PublicName, mID)
+		if _, restoreErr := restorePermissionsFromSnapshot(ctx, h.db, h.engine, h.log, entry.PublicName, mID); restoreErr != nil {
+			h.log.Error("permission restore failed — this registration will NOT have any team grants "+
+				"automatically recovered from a previous deletion of this model name; grant access manually if needed",
+				zap.String("model_name", entry.PublicName), zap.String("model_id", mID), zap.Error(restoreErr))
+		}
 
 		epID := uuid.New().String()
 		_, _ = h.db.ExecContext(ctx, `
