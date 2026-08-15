@@ -202,8 +202,8 @@ MIGRATIONS := \
 	051_self_service_developer_portal.sql \
 	052_user_auth_and_credentials.sql \
 	053_stable_model_identity.sql \
-        054_billing_core_tables.sql \
-        055_billing_hardening.sql
+    054_billing_core_tables.sql \
+    055_billing_hardening.sql
  
 migrate:
 	@echo "→ Waiting for postgres..."
