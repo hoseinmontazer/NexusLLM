@@ -309,9 +309,14 @@ func (d *dockerDriver) buildVLLMArgs(spec RuntimeSpec) []string {
 // These containers get CPU affinity via --cpuset-cpus and NUMA via --cpuset-mems,
 // but NO --gpus flag.
 //
-// Port configuration is handled exclusively via environment variables injected
-// by applyCommonResourceArgs → Backend.ContainerPortEnvVars(). Do NOT pass
-// --port here — cpu_native images read PORT/HTTP_PORT/UVICORN_PORT env vars.
+// Port injection strategy (dual-path):
+//  1. Env vars: PORT, HTTP_PORT, UVICORN_PORT are injected by
+//     applyCommonResourceArgs → Backend.ContainerPortEnvVars() for servers
+//     that read them (uvicorn-based: faster-whisper-server, Kokoro).
+//  2. --port CMD arg: injected below for CLI-driven servers that ignore env
+//     vars and only accept --port as a flag (Infinity, TEI-cpu, EasyOCR).
+//     Only injected when BindPort > 0 and ExtraArgs doesn't already supply
+//     --port (to avoid duplicates).
 func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 	args := []string{"run", "-d",
 		"--name", containerName(spec),
@@ -333,9 +338,44 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 
 	args = append(args, spec.Image)
 
-	// Do NOT pass --port as a CMD arg for cpu_native backends.
-	// Port configuration comes exclusively from env vars (PORT, HTTP_PORT,
-	// UVICORN_PORT) injected by applyCommonResourceArgs via Backend interface.
+	if spec.BindPort > 0 {
+		hasPortFlag := false
+		for _, a := range spec.ExtraArgs {
+			if a == "--port" || a == "-p" || strings.HasPrefix(a, "--port=") {
+				hasPortFlag = true
+				break
+			}
+		}
+		if !hasPortFlag {
+			spec.ExtraArgs = append(spec.ExtraArgs, "--port", strconv.Itoa(spec.BindPort))
+		}
+	}
+
+	// Infinity model injection: infinity_emb serves its own built-in default
+	// model (bge-small-en-v1.5) whenever it isn't told which model to load.
+	// If the operator forgot to put --model-name-or-path/--model-id in
+	// ExtraArgs, the container comes up healthy but silently serves the
+	// wrong model. Auto-inject it from ModelName for Infinity images only —
+	// other cpu_native services have their own model flag conventions and
+	// must keep specifying them via ExtraArgs.
+	if strings.Contains(strings.ToLower(spec.Image), "infinity") && spec.ModelName != "" {
+		hasModelFlag := false
+		hasV2 := false
+		for _, a := range spec.ExtraArgs {
+			if a == "--model-name-or-path" || a == "--model-id" || strings.HasPrefix(a, "--model-name-or-path=") || strings.HasPrefix(a, "--model-id=") {
+				hasModelFlag = true
+			}
+			if a == "v2" {
+				hasV2 = true
+			}
+		}
+		if !hasModelFlag {
+			if !hasV2 {
+				spec.ExtraArgs = append([]string{"v2"}, spec.ExtraArgs...)
+			}
+			spec.ExtraArgs = append(spec.ExtraArgs, "--model-name-or-path", spec.ModelName)
+		}
+	}
 
 	args = append(args, spec.ExtraArgs...)
 	return args

@@ -1393,6 +1393,32 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 				p.ExtraArgs = append(p.ExtraArgs, "--port", strconv.Itoa(p.BindPort))
 			}
 		}
+
+		// Infinity model injection: infinity_emb serves its own built-in default
+		// model (bge-small-en-v1.5) whenever it isn't told which model to load.
+		// If the operator forgot to put --model-name-or-path/--model-id in
+		// ExtraArgs, the container comes up healthy but silently serves the
+		// wrong model. Auto-inject it from ModelName for Infinity images only —
+		// other cpu_native services (faster-whisper, Kokoro, EasyOCR) have their
+		// own model flag conventions and must keep specifying them via ExtraArgs.
+		if strings.Contains(strings.ToLower(p.Image), "infinity") && p.ModelName != "" {
+			hasModelFlag := false
+			hasV2 := false
+			for _, a := range p.ExtraArgs {
+				if a == "--model-name-or-path" || a == "--model-id" || strings.HasPrefix(a, "--model-name-or-path=") || strings.HasPrefix(a, "--model-id=") {
+					hasModelFlag = true
+				}
+				if a == "v2" {
+					hasV2 = true
+				}
+			}
+			if !hasModelFlag {
+				if !hasV2 {
+					p.ExtraArgs = append([]string{"v2"}, p.ExtraArgs...)
+				}
+				p.ExtraArgs = append(p.ExtraArgs, "--model-name-or-path", p.ModelName)
+			}
+		}
 	}
 
 	// ── GPU assignment — controlled exclusively by ExecutionMode ─────────────

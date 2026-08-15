@@ -715,6 +715,29 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			fmt.Sprintf("auto-reset by stuck-runtime sweeper after %s in state %s", age.Round(time.Second), row.State),
 		)
 
+		// Step 1b: reap the orphaned container on its node. A stuck runtime never
+		// became ready, so there's nothing to gracefully drain — force-remove it
+		// directly rather than leaving it running forever. Without this, every
+		// stuck-then-replaced runtime leaks its container: the sweeper spawns a
+		// replacement below but never touches the old one.
+		if containerID != "" {
+			_, delErr := taskMgr.Enqueue(ctx, row.NodeID,
+				taskmanager.TaskDeleteRuntime,
+				taskmanager.DeleteRuntimePayload{RuntimeID: row.RuntimeID, ContainerID: containerID},
+				taskmanager.WithPriority(70),
+				taskmanager.WithActor("stuck-sweeper"),
+				taskmanager.WithRuntimeID(row.RuntimeID),
+				taskmanager.WithIdempotencyKey(fmt.Sprintf("stuck-reap:%s", row.RuntimeID)),
+			)
+			if delErr != nil {
+				log.Warn("stuck-runtime sweep: failed to enqueue DELETE_RUNTIME for orphaned container",
+					zap.String("runtime_id", row.RuntimeID),
+					zap.String("container_id", containerID),
+					zap.Error(delErr),
+				)
+			}
+		}
+
 		// Step 2: load the model config needed to build a START_MODEL payload.
 		var cfg struct {
 			Image          string  `db:"image"`
