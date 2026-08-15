@@ -30,6 +30,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/preemption"
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
+	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
@@ -791,23 +792,47 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		}
 
 		// Step 3: create a fresh runtime row and enqueue START_MODEL.
-		// Guard: skip if there's already a newer pending/starting runtime for
-		// this model on this node that was created AFTER we marked this one failed.
-		// This prevents the sweeper from spawning a new container every 60s
-		// when the previous recovery attempt is still in progress.
-		var newerPendingCount int
-		_ = db.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM agent_runtimes
-			WHERE model_id = $1
-			  AND node_id  = $2
-			  AND id       != $3
-			  AND state IN ('pending','validating','downloading','starting','loading_model','waiting_ready','ready','active','warm','idle')`,
-			row.ModelID, row.NodeID, row.RuntimeID,
-		).Scan(&newerPendingCount)
-		if newerPendingCount > 0 {
-			log.Info("stuck-runtime sweep: newer runtime already in progress — skipping re-enqueue",
+		//
+		// Guard against concurrent duplicate creation: this sweeper is one of
+		// several independent code paths that can spawn a runtime for the same
+		// model (the HA reconciler and DeployModel/cold-start are the others).
+		// A plain COUNT-then-INSERT here is a TOCTOU race against those other
+		// paths — replicaguard.ClaimSlot closes it by doing the count-and-claim
+		// inside a single transaction holding a per-model advisory lock, the
+		// same mechanism internal/ha/reconciler.go already uses. Without this,
+		// the sweeper and the reconciler can each independently decide "this
+		// model needs a replica" at nearly the same moment and both create one.
+		desired, desErr := replicaguard.DesiredReplicas(ctx, db, row.ModelID)
+		if desErr != nil {
+			log.Warn("stuck-runtime sweep: failed to load desired_replicas — skipping re-enqueue",
 				zap.String("model", row.ModelName),
-				zap.Int("newer_count", newerPendingCount),
+				zap.Error(desErr),
+			)
+			continue
+		}
+
+		tx, txErr := db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if txErr != nil {
+			log.Warn("stuck-runtime sweep: failed to begin claim tx — skipping re-enqueue",
+				zap.String("model", row.ModelName),
+				zap.Error(txErr),
+			)
+			continue
+		}
+
+		slotAvailable, slotErr := replicaguard.ClaimSlot(ctx, tx, row.ModelID, desired)
+		if slotErr != nil {
+			_ = tx.Rollback()
+			log.Warn("stuck-runtime sweep: claim_replica_slot error — skipping re-enqueue",
+				zap.String("model", row.ModelName),
+				zap.Error(slotErr),
+			)
+			continue
+		}
+		if !slotAvailable {
+			_ = tx.Rollback()
+			log.Info("stuck-runtime sweep: model already at desired_replicas capacity — skipping re-enqueue",
+				zap.String("model", row.ModelName),
 			)
 			continue
 		}
@@ -834,8 +859,10 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			cfg.CtxSize = 4096
 		}
 
-		// Insert the new runtime row. The task FK requires it to exist first.
-		_, insertErr := db.ExecContext(ctx, `
+		// Insert the new runtime row inside the same tx that claimed the slot,
+		// so the advisory lock covers the INSERT and is released only on commit.
+		// The task FK requires the row to exist before dispatch below.
+		_, insertErr := tx.ExecContext(ctx, `
 			INSERT INTO agent_runtimes
 			  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
@@ -852,9 +879,17 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			cfg.ExecutionMode, cfg.WorkloadPolicy,
 		)
 		if insertErr != nil {
+			_ = tx.Rollback()
 			log.Warn("stuck-runtime sweep: failed to insert new runtime row",
 				zap.String("model", row.ModelName),
 				zap.Error(insertErr),
+			)
+			continue
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			log.Warn("stuck-runtime sweep: failed to commit claimed runtime row",
+				zap.String("model", row.ModelName),
+				zap.Error(commitErr),
 			)
 			continue
 		}

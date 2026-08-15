@@ -144,7 +144,8 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*RequestClaim
 			t.name                                                 AS team_name,
 			COALESCE(ak.project_id::text, '')                     AS project_id,
 			COALESCE(ak.project_name,     '')                     AS project_name,
-			COALESCE(ak.project_priority_weight, 500)             AS project_priority_weight
+			COALESCE(ak.project_priority_weight, 500)             AS project_priority_weight,
+			ak.expires_at                                          AS expires_at
 		FROM api_keys ak
 		JOIN teams        t ON t.id  = ak.team_id
 		JOIN organizations o ON o.id = t.org_id
@@ -155,13 +156,14 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*RequestClaim
 		  AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
 	`
 	type row struct {
-		APIKeyID              string `db:"api_key_id"`
-		OrgID                 string `db:"org_id"`
-		TeamID                string `db:"team_id"`
-		TeamName              string `db:"team_name"`
-		ProjectID             string `db:"project_id"`
-		ProjectName           string `db:"project_name"`
-		ProjectPriorityWeight int    `db:"project_priority_weight"`
+		APIKeyID              string     `db:"api_key_id"`
+		OrgID                 string     `db:"org_id"`
+		TeamID                string     `db:"team_id"`
+		TeamName              string     `db:"team_name"`
+		ProjectID             string     `db:"project_id"`
+		ProjectName           string     `db:"project_name"`
+		ProjectPriorityWeight int        `db:"project_priority_weight"`
+		ExpiresAt             *time.Time `db:"expires_at"`
 	}
 	var r row
 	if err := s.db.GetContext(ctx, &r, query, hash); err != nil {
@@ -196,9 +198,22 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*RequestClaim
 			"UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1", hash)
 	}()
 
-	// Cache the resolved claims
+	// Cache the resolved claims. Clamp the cache entry's own TTL to the key's
+	// actual expiry so a key that expires mid-window can't keep authorizing
+	// requests off a stale cache hit until the fixed TTL naturally elapses —
+	// ValidateAPIKey's Redis fast path (above) trusts a cache hit unconditionally
+	// and never re-checks expires_at itself.
+	ttl := s.cacheTTL
+	if r.ExpiresAt != nil {
+		if until := time.Until(*r.ExpiresAt); until < ttl {
+			if until <= 0 {
+				return claims, nil // already expired — don't cache at all
+			}
+			ttl = until
+		}
+	}
 	if data, marshalErr := json.Marshal(claims); marshalErr == nil {
-		_ = s.rdb.Set(ctx, cacheKey, data, s.cacheTTL).Err()
+		_ = s.rdb.Set(ctx, cacheKey, data, ttl).Err()
 	}
 
 	return claims, nil
@@ -269,17 +284,19 @@ func (s *Service) loadPermissions(ctx context.Context, teamID string) ([]string,
 // validateAPIKeyLegacy handles the pre-migration-022 schema (no project columns).
 func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*RequestClaims, error) {
 	type row struct {
-		APIKeyID string `db:"api_key_id"`
-		OrgID    string `db:"org_id"`
-		TeamID   string `db:"team_id"`
-		TeamName string `db:"team_name"`
+		APIKeyID  string     `db:"api_key_id"`
+		OrgID     string     `db:"org_id"`
+		TeamID    string     `db:"team_id"`
+		TeamName  string     `db:"team_name"`
+		ExpiresAt *time.Time `db:"expires_at"`
 	}
 	var r row
 	if err := s.db.GetContext(ctx, &r, `
 		SELECT ak.id AS api_key_id,
 		       o.id  AS org_id,
 		       t.id  AS team_id,
-		       t.name AS team_name
+		       t.name AS team_name,
+		       ak.expires_at AS expires_at
 		FROM api_keys ak
 		JOIN teams t        ON t.id  = ak.team_id
 		JOIN organizations o ON o.id = t.org_id
@@ -299,8 +316,18 @@ func (s *Service) validateAPIKeyLegacy(ctx context.Context, hash string) (*Reque
 		TeamName:    r.TeamName,
 		Permissions: perms,
 	}
+	// Same expiry-clamp as the primary path — see ValidateAPIKey.
+	ttl := s.cacheTTL
+	if r.ExpiresAt != nil {
+		if until := time.Until(*r.ExpiresAt); until < ttl {
+			if until <= 0 {
+				return claims, nil
+			}
+			ttl = until
+		}
+	}
 	if data, err := json.Marshal(claims); err == nil {
-		_ = s.rdb.Set(ctx, apiKeyCachePrefix+hash, data, s.cacheTTL).Err()
+		_ = s.rdb.Set(ctx, apiKeyCachePrefix+hash, data, ttl).Err()
 	}
 	return claims, nil
 }

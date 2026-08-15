@@ -360,10 +360,24 @@ CREATE INDEX IF NOT EXISTS idx_ql_lookup
     ON quota_ledger(scope_type, scope_id, period_type, period_key);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 11. Add default_max_output_tokens to model_policies
---     model_policies was created in migration 053 (or earlier).
---     This column supplies the max_tokens ceiling when client omits it.
+-- 11. model_policies
+--     Per-model behavioural limits. Created here with IF NOT EXISTS so this
+--     migration is safe whether or not an earlier migration already created
+--     the table. The ADD COLUMN below is then a guaranteed no-op on fresh
+--     installs and a safe add-if-missing on existing databases.
 -- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS model_policies (
+    id                          UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
+    model_id                    UUID    NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
+    default_max_output_tokens   INTEGER NOT NULL DEFAULT 2048
+        CHECK (default_max_output_tokens > 0),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_policies_model_id ON model_policies(model_id);
+
+-- Ensure the column exists on databases where the table predates this migration.
 ALTER TABLE model_policies
     ADD COLUMN IF NOT EXISTS default_max_output_tokens INTEGER NOT NULL DEFAULT 2048
         CHECK (default_max_output_tokens > 0);

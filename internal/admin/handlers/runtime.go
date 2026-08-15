@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/project"
+	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/scheduler"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
@@ -439,12 +441,56 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			}
 		}
 
+		// Claim a replica slot before inserting. mID is brand new in this
+		// request so it can't collide with itself, but the HA reconciler and
+		// the stuck-runtime sweeper both run on independent timers and can
+		// pick up this same model_id (e.g. via its own under-replication scan)
+		// concurrently with this handler — without a shared claim, both this
+		// INSERT and a concurrent reconciler/sweeper INSERT can succeed,
+		// producing two runtimes for a model that wants one. ClaimSlot performs
+		// the same atomic count-and-claim under a per-model advisory lock that
+		// internal/ha/reconciler.go already uses.
+		ctx := c.Request.Context()
+		desiredReplicas, desErr := replicaguard.DesiredReplicas(ctx, h.db, mID)
+		if desErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "failed to load desired_replicas: " + desErr.Error(),
+			})
+			return
+		}
+		tx, txErr := h.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if txErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "failed to begin claim transaction: " + txErr.Error(),
+			})
+			return
+		}
+		slotAvailable, slotErr := replicaguard.ClaimSlot(ctx, tx, mID, desiredReplicas)
+		if slotErr != nil {
+			_ = tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "claim_replica_slot error: " + slotErr.Error(),
+			})
+			return
+		}
+		if !slotAvailable {
+			_ = tx.Rollback()
+			c.JSON(http.StatusConflict, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "model already at desired_replicas capacity — a concurrent process claimed the slot first",
+			})
+			return
+		}
+
 		// Insert runtime row at state="pending" — the only value guaranteed
 		// to be in the agent_runtimes_state_check constraint on all DB versions.
 		// We check RowsAffected: if it's 0 the task enqueue must not proceed
 		// because runtimeID won't exist and the FK on agent_tasks.runtime_id
 		// will reject the insert.
-		rtRes, rtErr := h.db.ExecContext(c.Request.Context(), `
+		rtRes, rtErr := tx.ExecContext(ctx, `
 			INSERT INTO agent_runtimes
 			  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 			   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node)
@@ -454,6 +500,7 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			gpuIDsJSON, bindHost, input.Port,
 		)
 		if rtErr != nil {
+			_ = tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"model_id": mID, "endpoint_id": epID,
 				"error": "failed to create runtime record: " + rtErr.Error(),
@@ -461,9 +508,17 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			return
 		}
 		if n, _ := rtRes.RowsAffected(); n == 0 {
+			_ = tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"model_id": mID, "endpoint_id": epID,
 				"error": "runtime record not created (possible duplicate) — cannot dispatch task",
+			})
+			return
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"model_id": mID, "endpoint_id": epID,
+				"error": "failed to commit claimed runtime row: " + commitErr.Error(),
 			})
 			return
 		}
@@ -1823,14 +1878,14 @@ func nilableStr(s string) interface{} {
 // than issuing a hard DELETE FROM models.  This preserves the model UUID row
 // in the database so that:
 //
-//   a) team_model_permissions rows are NOT cascade-deleted (migration 053
-//      changed that FK to ON DELETE RESTRICT).
-//   b) The DB trigger fn_snapshot_model_permissions fires on the lifecycle
-//      UPDATE and saves a snapshot of all current team grants into
-//      model_permission_snapshots, keyed by model name.  The next call to
-//      DeployModel / RegisterModel / RegisterExternalModel with the same name
-//      will find that snapshot and automatically restore the grants.
-//   c) usage_events / audit_logs retain a valid foreign-key reference.
+//	a) team_model_permissions rows are NOT cascade-deleted (migration 053
+//	   changed that FK to ON DELETE RESTRICT).
+//	b) The DB trigger fn_snapshot_model_permissions fires on the lifecycle
+//	   UPDATE and saves a snapshot of all current team grants into
+//	   model_permission_snapshots, keyed by model name.  The next call to
+//	   DeployModel / RegisterModel / RegisterExternalModel with the same name
+//	   will find that snapshot and automatically restore the grants.
+//	c) usage_events / audit_logs retain a valid foreign-key reference.
 //
 // If a hard purge is genuinely required (GDPR, storage cleanup) it must be
 // done explicitly via a separate admin purge endpoint that checks for active

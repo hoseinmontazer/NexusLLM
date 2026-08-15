@@ -276,7 +276,7 @@ func (e *Executor) RecoverContainers(ctx context.Context) map[string]int {
 			// Fallback: inspect environment variables for common port definitions.
 			port = e.inspectEnvPort(ctx, name, []string{"PORT", "HTTP_PORT", "UVICORN_PORT", "OLLAMA_HOST"})
 		}
-		
+
 		if port > 0 {
 			recovered[name] = port
 		} else {
@@ -1401,6 +1401,16 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		// wrong model. Auto-inject it from ModelName for Infinity images only —
 		// other cpu_native services (faster-whisper, Kokoro, EasyOCR) have their
 		// own model flag conventions and must keep specifying them via ExtraArgs.
+		//
+		// ONLY inject when ModelName looks like a real HuggingFace repo id
+		// ("org/repo"). DeployModel falls back to the short display name
+		// (input.Name, e.g. "paraphrase-multilingual-minilm-l12") whenever
+		// hf_model_id wasn't set — injecting THAT as --model-id makes
+		// infinity_emb fail to resolve the model and crash-loop on every
+		// start, turning a harmless "serving the wrong default model" bug
+		// into a hard outage. Skipping injection preserves the old (silently
+		// wrong but at least running) behavior for misconfigured deploys, and
+		// the warning below makes the misconfiguration visible instead.
 		if strings.Contains(strings.ToLower(p.Image), "infinity") && p.ModelName != "" {
 			hasModelFlag := false
 			hasV2 := false
@@ -1412,11 +1422,16 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 					hasV2 = true
 				}
 			}
-			if !hasModelFlag {
+			if !hasModelFlag && strings.Contains(p.ModelName, "/") {
 				if !hasV2 {
 					p.ExtraArgs = append([]string{"v2"}, p.ExtraArgs...)
 				}
 				p.ExtraArgs = append(p.ExtraArgs, "--model-id", p.ModelName)
+			} else if !hasModelFlag {
+				e.log.Warn("infinity deploy has no model flag and ModelName is not a valid HF repo id — skipping auto-injection, container will serve its built-in default model instead of crash-looping",
+					zap.String("runtime", p.RuntimeName),
+					zap.String("model_name", p.ModelName),
+				)
 			}
 		}
 	}

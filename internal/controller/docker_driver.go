@@ -358,6 +358,14 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 	// wrong model. Auto-inject it from ModelName for Infinity images only —
 	// other cpu_native services have their own model flag conventions and
 	// must keep specifying them via ExtraArgs.
+	//
+	// ONLY inject when ModelName looks like a real HuggingFace repo id
+	// ("org/repo"). Callers (e.g. DeployModel) fall back to the short display
+	// name when hf_model_id wasn't set — injecting THAT as --model-id makes
+	// infinity_emb fail to resolve the model and crash-loop on every start,
+	// turning a harmless "serving the wrong default model" bug into a hard
+	// outage. Skipping injection preserves the old (silently wrong but at
+	// least running) behavior for misconfigured deploys.
 	if strings.Contains(strings.ToLower(spec.Image), "infinity") && spec.ModelName != "" {
 		hasModelFlag := false
 		hasV2 := false
@@ -369,7 +377,7 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 				hasV2 = true
 			}
 		}
-		if !hasModelFlag {
+		if !hasModelFlag && strings.Contains(spec.ModelName, "/") {
 			if !hasV2 {
 				spec.ExtraArgs = append([]string{"v2"}, spec.ExtraArgs...)
 			}
