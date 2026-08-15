@@ -171,6 +171,15 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			input.BackendType = "vllm"
 		}
 	}
+	// Force cpu_native for EMBEDDING on CPU.
+	// openai_compat only tries /v1/embeddings; cpu_native tries both
+	// /v1/embeddings and /embeddings, which is required for Infinity v2.
+	// This override fires even when the caller explicitly sends openai_compat.
+	if input.ServiceType == "EMBEDDING" &&
+		(input.ExecutionMode == "cpu" || input.AcceleratorType == "cpu") &&
+		input.BackendType == "openai_compat" {
+		input.BackendType = "cpu_native"
+	}
 	if input.Provider == "" {
 		input.Provider = "local"
 	}
