@@ -188,7 +188,11 @@ export interface PlacementDecision {
 export interface DeployModelInput {
   name: string; display_name: string; provider?: string
   backend_type: string; image?: string; hf_model_id?: string
-  host: string; port: number; gpu_devices?: number[]
+  // host is intentionally optional: when a node is targeted (node_id/
+  // specific_node_id set), the backend resolves the node's own canonical
+  // reachable address and it must not be overridable by a client-supplied
+  // placeholder — omit this field for any node-backed deployment.
+  host?: string; port: number; gpu_devices?: number[]
   tensor_parallel?: number; gpu_memory_util?: number
   max_model_len?: number; dtype?: string; hf_token?: string
   start_now?: boolean

@@ -206,14 +206,10 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	if input.MaxOutput == 0 {
 		input.MaxOutput = 4096
 	}
-	// Capture whether the caller actually supplied a host BEFORE defaulting it
-	// to "localhost" below. bindHost (used for the node-agent dispatch path)
-	// needs to know the true "unset" state so the node-IP resolution further
-	// down actually runs — defaulting input.Host here first meant bindHost was
-	// never empty by the time that check ran, so a deploy with an explicit
-	// node_id but no host always ended up registered at "localhost" instead of
-	// the node's real IP.
-	callerSuppliedHost := input.Host != ""
+	// Default input.Host for the legacy no-node Docker path (Path B, below),
+	// which reads input.Host directly. This default has no bearing on the
+	// node-backed bind-host resolution further down, which never consults
+	// input.Host when a node is assigned — see the invariant comment there.
 	if input.Host == "" {
 		input.Host = "localhost"
 	}
@@ -234,40 +230,38 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		modelID = input.Name
 	}
 
-	// Start from the caller's real (possibly empty) input so the node-IP
-	// resolution below actually fires when no explicit host was given.
-	bindHost := ""
-	if callerSuppliedHost {
-		bindHost = input.Host
-	}
-
 	// ── Resolve effective NodeID from placement mode ───────────────────────
 	// For specific_node: use SpecificNodeID directly (already validated by scheduler).
 	// For legacy node_id field: honour it as-is.
 	// For node_group / label_selector: the scheduler picks the node; NodeID stays empty
 	// here and the caller should use the scheduler path instead.
 	//
-	// This MUST run before the model_endpoints INSERT below — that row's `host`
-	// column is what the admin API/UI displays for this endpoint, and it was
-	// previously written before this resolution ran, so it always showed
-	// whatever bindHost was at INSERT time (i.e. "localhost") regardless of
-	// which node the model actually ended up dispatched to.
+	// This MUST run before the bind-host resolution and the model_endpoints
+	// INSERT below — that row's `host` column is what the admin API/UI
+	// displays for this endpoint.
 	if input.PlacementMode == "specific_node" && input.SpecificNodeID != "" && input.NodeID == "" {
 		input.NodeID = input.SpecificNodeID
 	}
 
-	// ── Resolve bind host from node IP (runs AFTER NodeID is finalised) ───
-	// Now that NodeID is set (either from node_id or specific_node_id),
-	// resolve the canonical reachable address via the single shared
-	// nodeaddr.CanonicalHost implementation so both the DB row and the
-	// gateway route to the node over the network instead of "localhost".
-	if input.NodeID != "" && bindHost == "" {
+	// ── Resolve bind host ──────────────────────────────────────────────────
+	// INVARIANT (Case File 003): node_id != "" implies
+	//   bind_host == nodeaddr.CanonicalHost(node_id)
+	// unconditionally. A caller-supplied `host` can NEVER override a selected
+	// node's canonical address — not even when the caller explicitly sends
+	// "localhost", "127.0.0.1", or any other literal. This closes the gap
+	// where the Admin Panel unconditionally sent host:"localhost" alongside a
+	// real node_id: the previous "only resolve when the caller supplied none"
+	// guard trusted that literal as genuine intent and never ran resolution.
+	//
+	// Only when no node is assigned at all (pure local/legacy/provider-backed
+	// deployment) does a caller-supplied host — or the "localhost" default
+	// above — apply, preserving prior behavior for that case.
+	var bindHost string
+	if input.NodeID != "" {
 		bindHost = nodeaddr.CanonicalHost(c.Request.Context(), h.db, input.NodeID)
-	}
-
-	// No node ended up assigned (pure local/legacy deploy) and the caller gave
-	// no explicit host — fall back to localhost, matching prior behavior.
-	if bindHost == "" {
+	} else if input.Host != "" {
+		bindHost = input.Host
+	} else {
 		bindHost = "localhost"
 	}
 

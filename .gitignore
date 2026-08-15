@@ -57,9 +57,12 @@ clickhouse_data/
 clickhouse_logs/
 
 # ── HuggingFace model cache (can be hundreds of GB) ─────────────────────────
+# Anchored to repo root: a bare `models/` also matched web/app/models/ (the
+# Next.js route folder), silently excluding it from git — including the
+# Case File 003 frontend fix — until this was caught during that incident.
 hf_cache/
 .cache/huggingface/
-models/
+/models/
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
