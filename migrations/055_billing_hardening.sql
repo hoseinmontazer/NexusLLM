@@ -146,6 +146,12 @@ CREATE TRIGGER trg_completions_no_delete
 --    These are hard invariants — the application should never reach them,
 --    but the DB must catch bugs.
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Postgres has no ADD CONSTRAINT IF NOT EXISTS for CHECK constraints, so this
+-- migration re-runs cleanly (e.g. after a partial apply) by dropping first.
+ALTER TABLE wallets DROP CONSTRAINT IF EXISTS chk_wallet_balance_non_negative;
+ALTER TABLE wallets DROP CONSTRAINT IF EXISTS chk_wallet_reserved_non_negative;
+ALTER TABLE wallets DROP CONSTRAINT IF EXISTS chk_wallet_reserved_le_balance;
+
 ALTER TABLE wallets
     ADD CONSTRAINT chk_wallet_balance_non_negative
         CHECK (balance >= 0),
@@ -187,6 +193,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cl_one_release_per_auth
 -- 10. is_billable requires billing_account_id
 --     A billable inference must always have a billing account.
 -- ─────────────────────────────────────────────────────────────────────────────
+ALTER TABLE inference_usage DROP CONSTRAINT IF EXISTS chk_billable_needs_account;
 ALTER TABLE inference_usage
     ADD CONSTRAINT chk_billable_needs_account
         CHECK (is_billable = FALSE OR billing_account_id IS NOT NULL);
@@ -194,6 +201,7 @@ ALTER TABLE inference_usage
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 11. Terminal execution states require completed_at
 -- ─────────────────────────────────────────────────────────────────────────────
+ALTER TABLE inference_usage DROP CONSTRAINT IF EXISTS chk_terminal_has_completed_at;
 ALTER TABLE inference_usage
     ADD CONSTRAINT chk_terminal_has_completed_at
         CHECK (
@@ -223,24 +231,28 @@ CREATE TRIGGER set_billing_accounts_updated_at
 -- 13. wallet_ledger FK to billing_authorizations for release entries
 --     Added here (not 054) because billing_authorizations is in 054.
 -- ─────────────────────────────────────────────────────────────────────────────
+ALTER TABLE wallet_ledger DROP CONSTRAINT IF EXISTS fk_wallet_ledger_auth;
 ALTER TABLE wallet_ledger
     ADD CONSTRAINT fk_wallet_ledger_auth
         FOREIGN KEY (authorization_id)
         REFERENCES billing_authorizations(id) ON DELETE RESTRICT
         DEFERRABLE INITIALLY DEFERRED;
 
+ALTER TABLE wallet_ledger DROP CONSTRAINT IF EXISTS fk_wallet_ledger_usage;
 ALTER TABLE wallet_ledger
     ADD CONSTRAINT fk_wallet_ledger_usage
         FOREIGN KEY (inference_usage_id)
         REFERENCES inference_usage(id) ON DELETE RESTRICT
         DEFERRABLE INITIALLY DEFERRED;
 
+ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS fk_credit_ledger_auth;
 ALTER TABLE credit_ledger
     ADD CONSTRAINT fk_credit_ledger_auth
         FOREIGN KEY (authorization_id)
         REFERENCES billing_authorizations(id) ON DELETE RESTRICT
         DEFERRABLE INITIALLY DEFERRED;
 
+ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS fk_credit_ledger_usage;
 ALTER TABLE credit_ledger
     ADD CONSTRAINT fk_credit_ledger_usage
         FOREIGN KEY (inference_usage_id)

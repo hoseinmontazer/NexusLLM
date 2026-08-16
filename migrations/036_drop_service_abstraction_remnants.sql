@@ -71,7 +71,12 @@ DROP TABLE IF EXISTS cpu_allocations;
 --    This view was originally created in migration 033 with runtime_type.
 --    Now that the column is dropped, recreate it without that field.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW universal_models AS
+-- DROP first (not CREATE OR REPLACE) — this view's column set differs from
+-- migration 033's and from later migrations' (044), so a re-run against a
+-- DB where either version is already live would otherwise fail with
+-- "cannot drop columns from view".
+DROP VIEW IF EXISTS universal_models CASCADE;
+CREATE VIEW universal_models AS
 SELECT
     m.id,
     m.name,

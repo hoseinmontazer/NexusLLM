@@ -204,7 +204,8 @@ MIGRATIONS := \
 	053_stable_model_identity.sql \
     054_billing_core_tables.sql \
     055_billing_hardening.sql \
-    056_usage_events_idempotency.sql
+    056_usage_events_idempotency.sql \
+    057_runtime_replica_status_lifecycle_guard.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."
@@ -215,9 +216,15 @@ migrate:
 	@echo "→ Applying all migrations in order..."
 	@for f in $(MIGRATIONS); do \
 	  echo "  → $$f"; \
-	  docker compose exec -T postgres psql -U nexus -d nexusllm \
-	    -v ON_ERROR_STOP=1 -f /migrations/$$f \
-	    2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|$$)" || true; \
+	  out=$$(docker compose exec -T postgres psql -U nexus -d nexusllm \
+	    -v ON_ERROR_STOP=1 -f /migrations/$$f 2>&1); \
+	  rc=$$?; \
+	  echo "$$out" | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|$$)" || true; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo ""; \
+	    echo "✗ Migration $$f FAILED — stopping (later migrations were NOT applied)."; \
+	    exit 1; \
+	  fi; \
 	done
 	@echo "✓ All migrations complete"
 
@@ -268,7 +275,7 @@ migrate-external: _check-dsn
 	@PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')"; \
 	for f in $(MIGRATIONS); do \
 	  echo "  → $$f"; \
-	  docker run --rm \
+	  out=$$(docker run --rm \
 	    --network host \
 	    -e PGPASSWORD="$$PGPASSWORD" \
 	    -e PGCONNECT_TIMEOUT=10 \
@@ -277,8 +284,14 @@ migrate-external: _check-dsn
 	    psql "$(DB_DSN)" \
 	      --no-password \
 	      -v ON_ERROR_STOP=1 \
-	      -f /migrations/$$f \
-	    2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true; \
+	      -f /migrations/$$f 2>&1); \
+	  rc=$$?; \
+	  echo "$$out" | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo ""; \
+	    echo "✗ Migration $$f FAILED — stopping (later migrations were NOT applied)."; \
+	    exit 1; \
+	  fi; \
 	done
 	@echo ""
 	@echo "✓ All migrations complete on external DB"
@@ -286,14 +299,16 @@ migrate-external: _check-dsn
 # Internal target kept for backward compat but no longer used by the loop above.
 _run-migration-external:
 	@PGPASSWORD="$$(echo '$(DB_DSN)' | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')"; \
-	docker run --rm \
+	out=$$(docker run --rm \
 	  --network host \
 	  -e PGPASSWORD="$$PGPASSWORD" \
 	  -e PGCONNECT_TIMEOUT=10 \
 	  -v "$(CURDIR)/migrations:/migrations:ro" \
 	  postgres:15-alpine \
-	  psql "$(DB_DSN)" --no-password -v ON_ERROR_STOP=1 -f /migrations/$(FILE) \
-	  2>&1 | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true
+	  psql "$(DB_DSN)" --no-password -v ON_ERROR_STOP=1 -f /migrations/$(FILE) 2>&1); \
+	rc=$$?; \
+	echo "$$out" | grep -vE "^(COMMIT|BEGIN|ALTER|CREATE|DROP|INSERT 0|NOTICE|SET|DO|[-]+|$$)" || true; \
+	exit $$rc
 
 # Dry-run: print the SQL files that would be applied without connecting
 migrate-dry:

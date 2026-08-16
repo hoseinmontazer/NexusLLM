@@ -170,7 +170,13 @@ WHERE workload_policy IS NULL OR workload_policy = '';
 --    Single view that returns every model with its deployment and health status.
 --    Replaces the need to query models + services separately.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW universal_models AS
+-- CREATE OR REPLACE VIEW cannot change a view's column set, only append to
+-- it — and later migrations (036, 044) redefine this same view with a
+-- different column set. A re-run against a DB where a later migration's
+-- version is already live fails with "cannot drop columns from view". DROP
+-- first so this migration is order-independent of what currently exists.
+DROP VIEW IF EXISTS universal_models CASCADE;
+CREATE VIEW universal_models AS
 SELECT
     m.id,
     m.name,

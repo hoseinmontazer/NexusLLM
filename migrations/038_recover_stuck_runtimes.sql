@@ -43,9 +43,10 @@ WHERE ar.endpoint_id = me.id
 -- 'unhealthy' was set by the watcher's circuit breaker firing during loading.
 -- If the container is actually listening (bind_port > 0 and agent set it),
 -- reset to 'loading_model' so the watcher can re-probe and promote to 'ready'.
+-- error_msg is NOT NULL DEFAULT '' (migration 010) — clear it to '', not NULL.
 UPDATE agent_runtimes
 SET state      = 'loading_model',
-    error_msg  = NULL,
+    error_msg  = '',
     updated_at = NOW()
 WHERE state     = 'unhealthy'
   AND bind_port > 0
