@@ -69,7 +69,8 @@ func setupStuckSweeperTestDB(t *testing.T) *sqlx.DB {
 			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			name         VARCHAR(255) NOT NULL UNIQUE,
 			backend_type VARCHAR(50) NOT NULL DEFAULT 'openai_compat',
-			enabled      BOOLEAN NOT NULL DEFAULT TRUE
+			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+			lifecycle    VARCHAR(30) NOT NULL DEFAULT 'active'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_endpoints (
@@ -112,6 +113,25 @@ func setupStuckSweeperTestDB(t *testing.T) *sqlx.DB {
 			workload_policy VARCHAR(30) NOT NULL DEFAULT 'lazy_load',
 			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS agent_tasks (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			node_id         UUID NOT NULL,
+			task_type       VARCHAR(50) NOT NULL,
+			payload         JSONB NOT NULL DEFAULT '{}',
+			status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+			priority        INTEGER NOT NULL DEFAULT 50,
+			created_by      VARCHAR(100) NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			claimed_at      TIMESTAMPTZ,
+			started_at      TIMESTAMPTZ,
+			completed_at    TIMESTAMPTZ,
+			timeout_at      TIMESTAMPTZ,
+			result          JSONB,
+			error_msg       TEXT,
+			runtime_id      UUID,
+			idempotency_key TEXT UNIQUE
 		);
 
 		CREATE TABLE IF NOT EXISTS model_replica_specs (

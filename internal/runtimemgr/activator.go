@@ -1107,6 +1107,11 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		      AND ar.node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))
 		WHERE m.name    = $1
 		  AND m.enabled = TRUE
+		  -- A model can have enabled=TRUE while lifecycle='deleted' (EnableModel
+		  -- does not clear a stale 'deleted' lifecycle when re-enabling), so
+		  -- enabled alone is not sufficient — see internal/modelguard
+		  -- (forensic audit, Case File 003, round 6).
+		  AND COALESCE(m.lifecycle,'active') != 'deleted'
 		ORDER BY
 		    (me.node_id IS NOT NULL) DESC,
 		    me.priority ASC,

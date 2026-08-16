@@ -74,7 +74,8 @@ func setupBindHostTestDB(t *testing.T) *sqlx.DB {
 			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			name         VARCHAR(255) NOT NULL UNIQUE,
 			backend_type VARCHAR(50) NOT NULL DEFAULT 'openai_compat',
-			enabled      BOOLEAN NOT NULL DEFAULT TRUE
+			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+			lifecycle    VARCHAR(30) NOT NULL DEFAULT 'active'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_endpoints (

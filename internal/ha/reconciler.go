@@ -211,10 +211,41 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 		ModelName:  status.ModelName,
 		Action:     "start_replica",
 		TargetNode: node,
-		ReplicaIdx: nonTerminal,
+		ReplicaIdx: r.nextReplicaIndex(ctx, status.ModelID),
 		Reason: fmt.Sprintf("ha_recovery: non_terminal=%d lost=%d desired=%d",
 			nonTerminal, status.LostReplicas, status.DesiredReplicas),
 	}}
+}
+
+// nextReplicaIndex picks the smallest non-negative integer not currently
+// held by any non-terminal replica of this model, so the human-readable
+// "-r<N>-" container-name label doesn't collide during legitimate surge
+// overlap (forensic audit, Case File 003, round 6 — production data showed
+// two simultaneously-running replicas both labeled "-r1-", which is a
+// confusing/misleading label collision, not a capacity violation: ClaimSlot
+// already correctly bounds the total count to desired+max_surge independent
+// of what label each row gets). replica_index is not treated as a unique
+// logical identity anywhere in the codebase — id (UUID) is — so this is a
+// display-collision fix, not a correctness fix, and intentionally does not
+// add a DB uniqueness constraint that could reject a legitimate surge insert.
+func (r *Reconciler) nextReplicaIndex(ctx context.Context, modelID string) int {
+	var used []int
+	_ = r.db.SelectContext(ctx, &used, `
+		SELECT COALESCE(replica_index, -1) FROM agent_runtimes
+		WHERE model_id = $1
+		  AND state NOT IN (
+		      'stopped','deleted','archived','unloaded','lost',
+		      'draining','failed','unhealthy'
+		  )`, modelID)
+	taken := make(map[int]bool, len(used))
+	for _, idx := range used {
+		taken[idx] = true
+	}
+	for i := 0; ; i++ {
+		if !taken[i] {
+			return i
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -830,9 +861,14 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 		MaxSurge            int       `db:"max_surge"`
 		ReplacementTimeoutS int       `db:"replacement_start_timeout_s"`
 		ActiveReadyCount    int       `db:"active_ready_count"`
+		RecoveryAttempt     int       `db:"recovery_attempt"`
 	}
 
 	var rows []unhealthyRow
+	// AND COALESCE(m.lifecycle,'active') != 'deleted' — a model can have
+	// enabled=TRUE while lifecycle='deleted' (EnableModel does not clear a
+	// stale 'deleted' lifecycle when re-enabling), so enabled alone is not a
+	// sufficient eligibility check; see internal/modelguard.
 	_ = r.db.SelectContext(ctx, &rows, `
 		SELECT
 		    ar.id,
@@ -847,19 +883,48 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 		    (SELECT COUNT(*) FROM agent_runtimes ar2
 		     WHERE ar2.model_id = ar.model_id
 		       AND ar2.state IN ('ready','active','warm','idle')
-		       AND ar2.id != ar.id)                          AS active_ready_count
+		       AND ar2.id != ar.id)                          AS active_ready_count,
+		    COALESCE(ar.recovery_attempt, 0)                 AS recovery_attempt
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
 		WHERE ar.state = 'unhealthy'
-		  AND m.enabled = TRUE`)
+		  AND m.enabled = TRUE
+		  AND COALESCE(m.lifecycle,'active') != 'deleted'`)
 
 	for _, row := range rows {
 		r.handleUnhealthyReplica(ctx, row.ID, row.ModelID, row.ModelName,
 			row.NodeID, row.ReplacedBy, row.UpdatedAt,
 			row.DesiredReplicas, row.MaxSurge, row.ReplacementTimeoutS,
-			row.ActiveReadyCount)
+			row.ActiveReadyCount, row.RecoveryAttempt)
 	}
+}
+
+// maxUnhealthyRecoveryAttempts bounds how many times handleUnhealthyReplica
+// will spawn a replacement for the same original unhealthy row before giving
+// up and marking it terminal. Without this bound, a persistently-failing
+// cause (bad image, bad config, an unreachable node) produces an unbounded
+// respawn loop: every reconciler tick re-evaluates the row, and the
+// failed/stopped/deleted branch of Case 1 below clears replaced_by
+// immediately with no cooldown, so Case 2 fires again on the very next tick,
+// forever (forensic audit, Case File 003, round 6 — confirmed in production:
+// one model_id accumulated 2,318 agent_runtimes rows this way, still growing
+// at the moment of the audit).
+const maxUnhealthyRecoveryAttempts = 5
+
+// unhealthyRecoveryCooldown returns the minimum wait since the row's last
+// state change before another replacement attempt may be spawned, growing
+// with each attempt (mirrors the cooldown plan() already applies to the
+// sibling under-replication path, which this rolling-replacement path never
+// had).
+func unhealthyRecoveryCooldown(attempt int) time.Duration {
+	const base = 30 * time.Second
+	const maxCooldown = 900 * time.Second
+	d := base * time.Duration(uint(1)<<uint(attempt))
+	if d > maxCooldown {
+		return maxCooldown
+	}
+	return d
 }
 
 func (r *Reconciler) handleUnhealthyReplica(
@@ -869,6 +934,7 @@ func (r *Reconciler) handleUnhealthyReplica(
 	unhealthySince time.Time,
 	desiredReplicas, maxSurge, replacementTimeoutS int,
 	activeReadyCount int,
+	recoveryAttempt int,
 ) {
 	replacementTimeout := time.Duration(replacementTimeoutS) * time.Second
 
@@ -934,6 +1000,31 @@ func (r *Reconciler) handleUnhealthyReplica(
 
 	// ── Case 2: no replacement started yet — spawn one ────────────────────
 	//
+	// Bounded recovery: give up after maxUnhealthyRecoveryAttempts instead of
+	// retrying forever, and enforce a growing cooldown between attempts so a
+	// persistently-failing cause doesn't spawn a new row every 30s tick.
+	if recoveryAttempt >= maxUnhealthyRecoveryAttempts {
+		reason := fmt.Sprintf("rolling replacement abandoned after %d attempts — manual intervention required", recoveryAttempt)
+		_, _ = r.db.ExecContext(ctx, `
+			UPDATE agent_runtimes
+			SET state = 'lost', error_msg = $2, updated_at = NOW()
+			WHERE id = $1 AND state = 'unhealthy'`,
+			runtimeID, reason)
+		logID := uuid.New().String()
+		abandonAction := ReconcileAction{ModelID: modelID, ModelName: modelName, Action: "abandon_replacement", TargetNode: nodeID, ReplicaIdx: -1, Reason: reason}
+		r.recordLog(ctx, logID, abandonAction, runtimeID, "abandoned", reason)
+		r.log.Error("rolling replacement: max recovery attempts exhausted — marking runtime lost, no further retries",
+			zap.String("model", modelName),
+			zap.String("runtime_id", runtimeID),
+			zap.Int("attempts", recoveryAttempt),
+		)
+		return
+	}
+	if cooldown := unhealthyRecoveryCooldown(recoveryAttempt); time.Since(unhealthySince) < cooldown {
+		// Still within backoff — wait for a later sweep before retrying.
+		return
+	}
+
 	// Large-model protection: if this is the LAST ready replica, do not
 	// terminate it prematurely. Spawn the replacement, but leave the
 	// unhealthy replica alive until the replacement is READY.
@@ -969,7 +1060,7 @@ func (r *Reconciler) handleUnhealthyReplica(
 		ModelName:  modelName,
 		Action:     "start_replica",
 		TargetNode: targetNode,
-		ReplicaIdx: desiredReplicas, // surge slot — one beyond desired
+		ReplicaIdx: r.nextReplicaIndex(ctx, modelID), // collision-safe surge slot label
 		Reason:     fmt.Sprintf("rolling_replacement: old=%s unhealthy_since=%s", runtimeID, unhealthySince.Format(time.RFC3339)),
 	}
 
@@ -982,9 +1073,9 @@ func (r *Reconciler) handleUnhealthyReplica(
 		return
 	}
 
-	// Link the old runtime to its replacement.
+	// Link the old runtime to its replacement and record this attempt.
 	_, _ = r.db.ExecContext(ctx,
-		`UPDATE agent_runtimes SET replaced_by = $1, updated_at = NOW() WHERE id = $2`,
+		`UPDATE agent_runtimes SET replaced_by = $1, recovery_attempt = recovery_attempt + 1, updated_at = NOW() WHERE id = $2`,
 		newRuntimeID, runtimeID)
 
 	r.log.Info("rolling replacement: replacement spawned",

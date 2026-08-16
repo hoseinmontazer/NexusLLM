@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -8,7 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/nodeaddr"
+	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
@@ -60,6 +63,8 @@ type runtimeRow struct {
 	EnvJSON        string  `db:"env_json"`
 	EndpointID     string  `db:"endpoint_id"`
 	ModelID        string  `db:"model_id"`
+	ModelEnabled   bool    `db:"model_enabled"`
+	ModelLifecycle string  `db:"model_lifecycle"`
 }
 
 // loadRuntime fetches the best runtime row for an endpoint.
@@ -97,7 +102,9 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 			COALESCE(mrc.extra_args::text, '[]')                  AS extra_args_json,
 			COALESCE(mrc.env::text,        '{}')                  AS env_json,
 			me.id::text                                           AS endpoint_id,
-			m.id::text                                            AS model_id
+			m.id::text                                            AS model_id,
+			m.enabled                                             AS model_enabled,
+			COALESCE(m.lifecycle,'active')                        AS model_lifecycle
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = me.model_id
@@ -112,6 +119,16 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 		LIMIT 1`, endpointID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "endpoint not found: " + err.Error()})
+		return nil, false
+	}
+	// A model can have enabled=TRUE while lifecycle='deleted' (EnableModel
+	// does not clear a stale 'deleted' lifecycle when re-enabling), so
+	// enabled alone is not a sufficient eligibility check — see
+	// internal/modelguard (forensic audit, Case File 003, round 6). Without
+	// this, Start/Restart/Upgrade/Rollback could recreate a runtime for a
+	// model an admin had soft-deleted.
+	if !modelguard.Eligible(row.ModelEnabled, row.ModelLifecycle) {
+		c.JSON(http.StatusConflict, gin.H{"error": "model has been deleted or disabled — redeploy it instead of starting/restarting"})
 		return nil, false
 	}
 	if row.NodeID == "" {
@@ -179,8 +196,55 @@ func buildStartPayload(runtimeID string, row *runtimeRow) taskmanager.StartModel
 }
 
 // ensureRuntimeRow creates a fresh agent_runtimes row for the given runtimeID.
+//
+// This is the only one of the runtime-creation paths (DeployModel, the
+// cold-start activator, the HA reconciler, the stuck-runtime sweeper) that
+// did not call replicaguard.ClaimSlot before this fix (forensic audit, Case
+// File 003, round 6) — meaning concurrent Start/Restart/Upgrade/Rollback
+// calls for the same model could each independently insert a row with no
+// shared capacity check. ClaimSlot's advisory lock now guards the INSERT the
+// same way it guards every other creation path: claim the slot and insert
+// inside one transaction, so the lock covers both the decision and the
+// write.
 func (h *ControllerHandler) ensureRuntimeRow(c *gin.Context, runtimeID string, row *runtimeRow) bool {
-	_, err := h.db.ExecContext(c.Request.Context(), `
+	ctx := c.Request.Context()
+
+	desired, desErr := replicaguard.DesiredReplicas(ctx, h.db, row.ModelID)
+	if desErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load desired_replicas: " + desErr.Error()})
+		return false
+	}
+	var maxSurge int
+	_ = h.db.QueryRowContext(ctx,
+		`SELECT COALESCE(max_surge,1) FROM model_replica_specs WHERE model_id=$1`, row.ModelID,
+	).Scan(&maxSurge)
+	if maxSurge < 1 {
+		maxSurge = 1
+	}
+
+	tx, txErr := h.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if txErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to begin claim transaction: " + txErr.Error()})
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	slotOK, slotErr := replicaguard.ClaimSlot(ctx, tx, row.ModelID, desired, maxSurge)
+	if slotErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "claim_replica_slot error: " + slotErr.Error()})
+		return false
+	}
+	if !slotOK {
+		c.JSON(http.StatusConflict, gin.H{"error": "model already at desired_replicas capacity — a concurrent Start/Restart/Upgrade/Rollback claimed the slot first"})
+		return false
+	}
+
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node)
@@ -194,6 +258,11 @@ func (h *ControllerHandler) ensureRuntimeRow(c *gin.Context, runtimeID string, r
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create runtime record: " + err.Error()})
 		return false
 	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit claimed runtime row: " + commitErr.Error()})
+		return false
+	}
+	committed = true
 	return true
 }
 

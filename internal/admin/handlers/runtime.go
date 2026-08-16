@@ -1236,6 +1236,21 @@ func (h *RuntimeHandler) DrainModel(c *gin.Context) {
 
 func (h *RuntimeHandler) EnableModel(c *gin.Context) {
 	modelID := c.Param("id")
+	// A soft-deleted model must not be silently re-enabled — that would set
+	// enabled=TRUE while lifecycle stays 'deleted', which is exactly the
+	// inconsistent state that let the reconciler and cold-start activator
+	// treat a deleted model as legitimately desired (forensic audit, Case
+	// File 003, round 6). Require an explicit redeploy instead.
+	var lifecycle string
+	if err := h.db.GetContext(c.Request.Context(), &lifecycle,
+		`SELECT COALESCE(lifecycle,'active') FROM models WHERE id = $1`, modelID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found: " + err.Error()})
+		return
+	}
+	if lifecycle == "deleted" {
+		c.JSON(http.StatusConflict, gin.H{"error": "model has been deleted — redeploy it instead of enabling the deleted record"})
+		return
+	}
 	_, _ = h.db.ExecContext(c.Request.Context(),
 		`UPDATE models SET enabled = TRUE, updated_at = NOW() WHERE id = $1`, modelID)
 	_, _ = h.db.ExecContext(c.Request.Context(), `

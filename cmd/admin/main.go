@@ -666,7 +666,12 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		      -- Download/pending: double the threshold to allow slow connections
 		      (ar.state IN ('downloading','pending') AND ar.updated_at < NOW() - ($2 || ' seconds')::interval)
 		  )
-		  AND m.enabled = TRUE`,
+		  AND m.enabled = TRUE
+		  -- A model can have enabled=TRUE while lifecycle='deleted' (EnableModel
+		  -- does not clear a stale 'deleted' lifecycle when re-enabling), so
+		  -- enabled alone is not sufficient — see internal/modelguard
+		  -- (forensic audit, Case File 003, round 6).
+		  AND COALESCE(m.lifecycle,'active') != 'deleted'`,
 		int(threshold.Seconds()),
 		int((threshold * 2).Seconds()),
 	)
@@ -781,6 +786,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			      AND me.lifecycle_state NOT IN ('deleted')
 			LEFT JOIN model_runtime_configs mrc ON mrc.model_id = m.id
 			WHERE m.id = $1 AND m.enabled = TRUE
+			  AND COALESCE(m.lifecycle,'active') != 'deleted'
 			ORDER BY me.priority ASC
 			LIMIT 1`, row.ModelID)
 

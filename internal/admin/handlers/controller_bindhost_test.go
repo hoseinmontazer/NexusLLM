@@ -70,7 +70,9 @@ func setupControllerTestDB(t *testing.T) *sqlx.DB {
 		CREATE TABLE IF NOT EXISTS models (
 			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			name         VARCHAR(255) NOT NULL UNIQUE,
-			backend_type VARCHAR(50) NOT NULL DEFAULT 'openai_compat'
+			backend_type VARCHAR(50) NOT NULL DEFAULT 'openai_compat',
+			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+			lifecycle    VARCHAR(30) NOT NULL DEFAULT 'active'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_endpoints (
@@ -114,7 +116,55 @@ func setupControllerTestDB(t *testing.T) *sqlx.DB {
 			bind_port    INTEGER NOT NULL DEFAULT 0,
 			gpu_ids      JSONB NOT NULL DEFAULT '[]',
 			state        VARCHAR(30) NOT NULL DEFAULT 'active',
+			cpu_affinity TEXT NOT NULL DEFAULT '',
+			numa_node    INTEGER NOT NULL DEFAULT -1,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS model_replica_specs (
+			model_id         UUID PRIMARY KEY REFERENCES models(id),
+			desired_replicas INTEGER NOT NULL DEFAULT 1,
+			max_surge        INTEGER NOT NULL DEFAULT 1
+		);
+
+		CREATE OR REPLACE FUNCTION desired_replicas(p_model_id UUID)
+		RETURNS INTEGER LANGUAGE sql STABLE AS $$
+			SELECT COALESCE((SELECT desired_replicas FROM model_replica_specs WHERE model_id = p_model_id), 1);
+		$$;
+
+		CREATE OR REPLACE FUNCTION claim_replica_slot(
+			p_model_id UUID, p_desired INTEGER, p_max_surge INTEGER DEFAULT 1
+		) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+		DECLARE
+			v_non_terminal INTEGER;
+			v_limit        INTEGER;
+		BEGIN
+			PERFORM pg_advisory_xact_lock(hashtext(p_model_id::text));
+			SELECT COUNT(*) INTO v_non_terminal FROM agent_runtimes
+			WHERE model_id = p_model_id
+			  AND state NOT IN ('stopped','deleted','archived','unloaded','lost','draining','failed','unhealthy');
+			v_limit := p_desired + COALESCE(p_max_surge, 1);
+			RETURN v_non_terminal < v_limit;
+		END;
+		$$;
+
+		CREATE TABLE IF NOT EXISTS agent_tasks (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			node_id         UUID NOT NULL,
+			task_type       VARCHAR(50) NOT NULL,
+			payload         JSONB NOT NULL DEFAULT '{}',
+			status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+			priority        INTEGER NOT NULL DEFAULT 50,
+			created_by      VARCHAR(100) NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			claimed_at      TIMESTAMPTZ,
+			started_at      TIMESTAMPTZ,
+			completed_at    TIMESTAMPTZ,
+			timeout_at      TIMESTAMPTZ,
+			result          JSONB,
+			error_msg       TEXT,
+			runtime_id      UUID,
+			idempotency_key TEXT UNIQUE
 		);
 	`); err != nil {
 		t.Fatalf("schema setup: %v", err)
