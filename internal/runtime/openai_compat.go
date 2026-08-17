@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -180,6 +181,17 @@ func (b *openAICompatBackend) Embeddings(ctx context.Context, r EmbedRequest) (*
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// A non-2xx status must be a hard error, not decoded as if it were a real
+	// EmbeddingResponse — an error body (or an empty one) decodes without
+	// error into a zero-value response (object:"", data:null, usage:{0,0}),
+	// which silently looks like a successful-but-empty embeddings call to the
+	// caller instead of the actual upstream failure (e.g. a transient 503
+	// while the runtime is restarting).
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("embeddings backend returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
 
 	var out models.EmbeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

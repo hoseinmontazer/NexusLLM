@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -158,6 +159,14 @@ func (b *tgiBackend) Embeddings(ctx context.Context, r EmbedRequest) (*models.Em
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// A non-2xx status must be a hard error, not decoded as if it were a real
+	// EmbeddingResponse — see the identical fix in openai_compat.go/cpu.go for
+	// why silently decoding an error body as a zero-value response is wrong.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("embeddings backend returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
 
 	var out models.EmbeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
