@@ -813,6 +813,17 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 				Error: "downloading/validation failed: " + result.Error,
 			}
 		}
+	} else if p.GGUFPath != "" || p.ModelsVolume != "" {
+		// Non-llamacpp backend (vllm, tei, ...) pointed at an existing local
+		// path in the shared volume (GGUFPath set, e.g. via llamacpp_model_path
+		// in the deploy request — the field name is a historical artifact, the
+		// plumbing is backend-agnostic end-to-end) or an explicit models_volume.
+		// No download/cache-check here — unlike llamacpp there is no "let the
+		// server download it at startup" fallback for these backends, and the
+		// whole point of this path is deploying files that already exist.
+		// Just resolve which Docker volume actually holds that path on this
+		// node so buildDockerArgs can mount it at /models.
+		p.ModelsVolume = e.resolveModelsVolumeMount(ctx, &p)
 	}
 
 	// ── Stage: STARTING ─────────────────────────────────────────────────────
@@ -1073,6 +1084,44 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 //     the volume. If yes: set GGUFPath to the local path (avoids HF startup
 //     download). If no: llama-server downloads at startup via --hf-repo/--hf-file.
 //  4. No model source at all → fail fast with a clear error.
+//
+// resolveModelsVolumeMount determines which Docker volume should be mounted
+// at /models for a non-llamacpp deployment that references an existing local
+// path (GGUFPath set) or an explicit ModelsVolume. Mirrors ensureModelCached's
+// own volume-resolution order exactly (explicit ModelsVolume, then
+// "nexus_models", then "llamacpp_models"), but — deliberately unlike
+// ensureModelCached — performs NO file-existence check and NO download
+// fallback: vLLM/TEI have no "download at startup" mode to fall back to, and
+// the whole point of this path is deploying files that are already present.
+// Returns the volume name/absolute path to mount, or "" if this deployment
+// doesn't reference a local path at all (nothing to mount).
+func (e *Executor) resolveModelsVolumeMount(ctx context.Context, p *startModelPayload) string {
+	if p.GGUFPath == "" && p.ModelsVolume == "" {
+		return ""
+	}
+	if strings.HasPrefix(p.ModelsVolume, "/") {
+		return p.ModelsVolume
+	}
+	candidates := []string{"nexus_models", "llamacpp_models"}
+	if p.ModelsVolume != "" {
+		candidates = append([]string{p.ModelsVolume}, candidates...)
+	}
+	for _, cand := range candidates {
+		out, err := exec.CommandContext(ctx, "docker", "volume", "inspect",
+			"--format", "{{.Mountpoint}}", cand).Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			e.log.Info("resolveModelsVolumeMount: resolved models volume",
+				zap.String("volume", cand),
+			)
+			return cand
+		}
+	}
+	// None resolved — fall back to the most specific candidate so `docker run`
+	// at least attempts the mount (and fails loudly if the volume truly
+	// doesn't exist, rather than silently starting with nothing mounted).
+	return candidates[0]
+}
+
 func (e *Executor) ensureModelCached(ctx context.Context, p *startModelPayload) TaskResult {
 	// Case 4: no usable source.
 	if p.GGUFPath == "" && p.HFRepo == "" && !strings.HasPrefix(p.ModelName, "/") {
@@ -1373,6 +1422,18 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		// bge-m3, jina, vllm, tgi, custom HTTP servers, etc.)
 		// host networking — the container binds directly to the node's network.
 		//
+		// Mount the shared models volume whenever this deployment resolved one
+		// (see resolveModelsVolumeMount, called from startModel's DOWNLOADING
+		// stage for any backend that references a local path via GGUFPath or
+		// an explicit ModelsVolume). Previously this mount only ever happened
+		// for the "llamacpp" case above — vLLM/TEI deployments pointed at an
+		// existing local model directory got no /models mount at all, so
+		// "--model /models/<dir>" (below) referenced a path that didn't exist
+		// inside the container.
+		if p.ModelsVolume != "" {
+			args = append(args, "-v", p.ModelsVolume+":/models")
+		}
+
 		// Port injection strategy (dual-path):
 		//   1. Env vars: PORT, HTTP_PORT, UVICORN_PORT are injected above for
 		//      servers that read them (uvicorn-based: faster-whisper-server, Kokoro).
@@ -1498,8 +1559,17 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 	// Backend-specific command args.
 	switch p.Backend {
 	case "vllm":
-		args = append(args, "--model", p.ModelName, "--port", strconv.Itoa(p.BindPort))
-		if p.ServedAs != "" && p.ServedAs != p.ModelName {
+		// Model source priority: GGUFPath (existing local directory, already
+		// mounted at /models by the block above) > ModelName (HF repo id —
+		// vLLM downloads it itself at startup). Mirrors the tei/llamacpp
+		// precedent below — GGUFPath is a historically-named but genuinely
+		// generic "local path already present in the volume" field.
+		vllmModel := p.ModelName
+		if p.GGUFPath != "" {
+			vllmModel = p.GGUFPath
+		}
+		args = append(args, "--model", vllmModel, "--port", strconv.Itoa(p.BindPort))
+		if p.ServedAs != "" && p.ServedAs != vllmModel {
 			args = append(args, "--served-model-name", p.ServedAs)
 		}
 		if p.TensorParallel > 1 {

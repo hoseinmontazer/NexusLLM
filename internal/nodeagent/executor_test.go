@@ -1,7 +1,11 @@
 package nodeagent
 
 import (
+	"context"
+	"strings"
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 func TestBackendPortEnvVars(t *testing.T) {
@@ -77,5 +81,143 @@ func TestSTTLazyRestartPortEnvOverride(t *testing.T) {
 	}
 	if payloadEnv["WHISPER__MODEL"] != "Systran/faster-whisper-large-v3" {
 		t.Errorf("expected WHISPER__MODEL to be preserved, got %s", payloadEnv["WHISPER__MODEL"])
+	}
+}
+
+func hasFlagValue(args []string, flag, value string) bool {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildDockerArgs_VLLMExistingLocalPath is the regression test for the
+// gpt-oss-120b-vllm deployment gap: a vLLM deployment pointed at a model
+// directory that already exists in the shared volume (GGUFPath set, exactly
+// as an admin would configure via "llamacpp_model_path" alongside
+// "backend_type": "vllm" — the field name is a historical artifact, the
+// plumbing is backend-agnostic) must (a) mount that volume at /models, and
+// (b) pass the local path — not ModelName/hf_model_id — as vLLM's --model
+// argument, so vLLM never attempts to download anything.
+func TestBuildDockerArgs_VLLMExistingLocalPath(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName:    "nexus-gpt-oss-120b-r0-abc123",
+		Backend:        "vllm",
+		Image:          "vllm/vllm-openai:latest",
+		ModelName:      "gpt-oss-120b", // e.g. input.Name fallback — must NOT be used as --model
+		ServedAs:       "gpt-oss-120b",
+		BindPort:       8200,
+		GGUFPath:       "/models/gpt-oss-120b-vllm", // resolved by resolveModelsVolumeMount's caller
+		ModelsVolume:   "nexus_models",              // resolved volume name
+		TensorParallel: 2,
+		GPUMemoryUtil:  0.90,
+		ExecutionMode:  "gpu",
+		GPUDevices:     []int{0, 1},
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if !hasFlagValue(args, "-v", "nexus_models:/models") {
+		t.Fatalf("expected the resolved models volume to be mounted at /models, got args: %v", args)
+	}
+	if !hasFlagValue(args, "--model", "/models/gpt-oss-120b-vllm") {
+		t.Fatalf("expected --model to use the existing local path (GGUFPath), not ModelName, got args: %v", args)
+	}
+	if hasFlagValue(args, "--model", "gpt-oss-120b") {
+		t.Fatalf("--model must not be set to ModelName when GGUFPath (a local path) is present, got args: %v", args)
+	}
+	if !hasFlagValue(args, "--served-model-name", "gpt-oss-120b") {
+		t.Fatalf("expected --served-model-name to be set, got args: %v", args)
+	}
+}
+
+// TestBuildDockerArgs_VLLMWithoutLocalPath is the non-regression check: a
+// normal vLLM deployment sourced from an HF repo id (no GGUFPath/ModelsVolume
+// set) must NOT get a /models mount at all, and --model must be ModelName
+// (the HF repo id vLLM will download itself).
+func TestBuildDockerArgs_VLLMWithoutLocalPath(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName: "nexus-llama3-8b-r0-def456",
+		Backend:     "vllm",
+		Image:       "vllm/vllm-openai:v0.4.3",
+		ModelName:   "meta-llama/Meta-Llama-3-8B-Instruct",
+		ServedAs:    "llama3-8b",
+		BindPort:    8100,
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if hasFlag(args, "-v") {
+		t.Fatalf("expected no volume mount for a plain HF-repo vLLM deploy, got args: %v", args)
+	}
+	if !hasFlagValue(args, "--model", "meta-llama/Meta-Llama-3-8B-Instruct") {
+		t.Fatalf("expected --model to be the HF repo id, got args: %v", args)
+	}
+}
+
+// TestBuildDockerArgs_TEIExistingLocalPath proves the same volume-mount fix
+// also closes the identical latent bug on the "tei" backend, which already
+// correctly preferred GGUFPath for --model-id but had nothing mounting it.
+func TestBuildDockerArgs_TEIExistingLocalPath(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName:  "nexus-embed-r0-ghi789",
+		Backend:      "tei",
+		Image:        "ghcr.io/huggingface/text-embeddings-inference:latest",
+		ModelName:    "multilingual-e5-large",
+		GGUFPath:     "/models/multilingual-e5-large-onnx",
+		ModelsVolume: "nexus_models",
+		BindPort:     8300,
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if !hasFlagValue(args, "-v", "nexus_models:/models") {
+		t.Fatalf("expected the resolved models volume to be mounted at /models for tei, got args: %v", args)
+	}
+	if !hasFlagValue(args, "--model-id", "/models/multilingual-e5-large-onnx") {
+		t.Fatalf("expected --model-id to use the local path, got args: %v", args)
+	}
+}
+
+// TestResolveModelsVolumeMount_NoLocalPathReturnsEmpty proves the resolver
+// correctly no-ops for a plain HF-repo deployment (nothing to mount).
+func TestResolveModelsVolumeMount_NoLocalPathReturnsEmpty(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := &startModelPayload{Backend: "vllm", ModelName: "org/repo"}
+	if got := e.resolveModelsVolumeMount(context.Background(), p); got != "" {
+		t.Fatalf("expected empty volume for a deployment with no GGUFPath/ModelsVolume, got %q", got)
+	}
+}
+
+// TestResolveModelsVolumeMount_AbsoluteVolumeUsedDirectly proves an absolute
+// host path passed as ModelsVolume (rather than a named Docker volume) is
+// used as-is, without attempting `docker volume inspect`.
+func TestResolveModelsVolumeMount_AbsoluteVolumeUsedDirectly(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := &startModelPayload{
+		Backend:      "vllm",
+		GGUFPath:     "/models/gpt-oss-120b-vllm",
+		ModelsVolume: "/var/lib/docker/volumes/nexus_models/_data",
+	}
+	got := e.resolveModelsVolumeMount(context.Background(), p)
+	if got != "/var/lib/docker/volumes/nexus_models/_data" {
+		t.Fatalf("expected the absolute path to be used directly, got %q", got)
+	}
+	if strings.HasPrefix(got, "docker") {
+		t.Fatalf("resolver should not have attempted docker volume inspect for an absolute path, got %q", got)
 	}
 }

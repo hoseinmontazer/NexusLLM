@@ -59,6 +59,41 @@ curl -X POST http://localhost:8081/admin/v1/models/deploy \
   }'
 ```
 
+#### vLLM — existing model already present in the volume (no download)
+
+If the model files already exist on disk (e.g. mounted in the `nexus_models` Docker
+volume at `/var/lib/docker/volumes/nexus_models/_data/<model-dir>`), point vLLM at
+the existing directory instead of an `hf_model_id` — this never triggers a download.
+Despite the `llamacpp_*` field names below, this path is backend-agnostic: it works
+identically for `vllm`/`tei`/`llamacpp`, resolving whichever Docker volume already
+contains the given path and mounting it read-only at `/models` in the container.
+
+```bash
+curl -X POST http://localhost:8081/admin/v1/models/deploy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":                   "gpt-oss-120b",
+    "display_name":           "GPT-OSS 120B",
+    "backend_type":           "vllm",
+    "image":                  "vllm/vllm-openai:latest",
+    "llamacpp_model_path":    "/models/gpt-oss-120b-vllm",
+    "llamacpp_models_volume": "nexus_models",
+    "tensor_parallel":        2,
+    "gpu_memory_util":        0.90,
+    "max_model_len":          32768,
+    "dtype":                  "bfloat16",
+    "start_now":              true
+  }'
+```
+
+`llamacpp_model_path` must be the CONTAINER-side path (always under `/models/...`) —
+it is the exact subdirectory name inside the volume, e.g. `/models/gpt-oss-120b-vllm`
+for a model at `<volume mountpoint>/gpt-oss-120b-vllm`. `llamacpp_models_volume` names
+the Docker volume to mount (defaults to `nexus_models` if omitted, falling back to
+`llamacpp_models` if that doesn't exist). Do **not** also set `hf_model_id` for this
+deployment — vLLM only downloads when given a bare HF repo id, never when given a
+path that resolves inside the container.
+
 #### llama.cpp — CPU or GPU, no special runtime required
 
 ```bash
