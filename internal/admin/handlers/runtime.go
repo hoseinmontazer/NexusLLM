@@ -197,6 +197,23 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		input.BackendType == "openai_compat" {
 		input.BackendType = "cpu_native"
 	}
+	// vllm/tgi are GPU-only in practice — there is no meaningful CPU mode for
+	// either image (unlike llamacpp/cpu_native, which legitimately run on
+	// CPU). The NodeAgent's own "auto" fallback (executor.go's wantsGPU
+	// switch) only special-cases llamacpp's NGPULayers, so a vllm/tgi deploy
+	// left at the default execution_mode="auto" with no explicit gpu_devices
+	// silently produced a container with NO --gpus flag at all — vLLM then
+	// fails immediately with "Failed to infer device type" (confirmed in
+	// production: a gpt-oss-120b deploy with tensor_parallel set but no
+	// gpu_devices/execution_mode came up with zero GPU visibility). Default
+	// to "gpu" here so ExecutionMode reaches the agent already resolved,
+	// matching this handler's own stated architecture (see executor.go's
+	// "the control plane resolves auto → cpu|gpu before dispatch" comment) —
+	// an operator who genuinely wants CPU-mode vllm/tgi can still set
+	// execution_mode:"cpu" explicitly.
+	if input.ExecutionMode == "" && (input.BackendType == "vllm" || input.BackendType == "tgi") {
+		input.ExecutionMode = "gpu"
+	}
 	if input.Provider == "" {
 		input.Provider = "local"
 	}
