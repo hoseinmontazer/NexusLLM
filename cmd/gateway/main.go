@@ -33,9 +33,18 @@ import (
 	"go.uber.org/zap"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=$(VERSION)"
+// (see Makefile's GO_FLAGS) — defaults to "dev" for a plain `go build`/`go
+// run`. Logged at startup and exposed via GET /version so a production audit
+// can determine which git commit a running binary actually corresponds to,
+// instead of assuming "the fix is in source" means "the fix is deployed"
+// (forensic audit, Case File 004).
+var Version = "dev"
+
 func main() {
 	log, _ := zap.NewProduction()
 	defer log.Sync()
+	log.Info("nexus-gateway starting", zap.String("version", Version))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -256,6 +265,7 @@ func main() {
 	r.Use(middleware.MetricsMiddleware())
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"service": "nexus-gateway", "version": Version}) })
 	r.GET("/readyz", func(c *gin.Context) {
 		if err := rdb.Ping(c.Request.Context()).Err(); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready"})

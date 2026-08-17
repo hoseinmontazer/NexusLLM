@@ -207,7 +207,8 @@ MIGRATIONS := \
     056_usage_events_idempotency.sql \
     057_runtime_replica_status_lifecycle_guard.sql \
     058_project_model_permissions.sql \
-    059_model_permission_scopes.sql
+    059_model_permission_scopes.sql \
+    060_bounded_recovery_chain.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

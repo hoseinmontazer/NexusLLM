@@ -38,6 +38,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
@@ -1129,12 +1130,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		      -- Only consider runtimes on online nodes for node_id fallback
 		      AND ar.node_id IN (SELECT id FROM nodes WHERE status IN ('online','degraded'))
 		WHERE m.name    = $1
-		  AND m.enabled = TRUE
-		  -- A model can have enabled=TRUE while lifecycle='deleted' (EnableModel
-		  -- does not clear a stale 'deleted' lifecycle when re-enabling), so
-		  -- enabled alone is not sufficient — see internal/modelguard
-		  -- (forensic audit, Case File 003, round 6).
-		  AND COALESCE(m.lifecycle,'active') != 'deleted'
+		  AND ` + modelguard.SQLCondition + `
 		ORDER BY
 		    (me.node_id IS NOT NULL) DESC,
 		    me.priority ASC,

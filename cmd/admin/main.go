@@ -24,6 +24,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/controller"
 	"github.com/nexusllm/nexusllm/internal/gpu"
 	"github.com/nexusllm/nexusllm/internal/ha"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/nodeagent"
 	"github.com/nexusllm/nexusllm/internal/nodehealth"
@@ -41,9 +42,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=$(VERSION)"
+// (see Makefile's GO_FLAGS) — defaults to "dev" for a plain `go build`/`go
+// run`. Production audits repeatedly found "the fix is in source" wrongly
+// treated as "the fix is deployed" with no way to check which git commit a
+// running binary actually corresponds to (forensic audit, Case File 004) —
+// this variable, logged at startup and exposed via GET /version, closes that
+// gap going forward.
+var Version = "dev"
+
 func main() {
 	log, _ := zap.NewProduction()
 	defer log.Sync()
+	log.Info("nexus-admin starting", zap.String("version", Version))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -242,6 +253,7 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Recovery(), gin.Logger())
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"service": "nexus-admin", "version": Version}) })
 
 	a := r.Group("/admin/v1")
 
@@ -706,12 +718,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		      -- Download/pending: double the threshold to allow slow connections
 		      (ar.state IN ('downloading','pending') AND ar.updated_at < NOW() - ($2 || ' seconds')::interval)
 		  )
-		  AND m.enabled = TRUE
-		  -- A model can have enabled=TRUE while lifecycle='deleted' (EnableModel
-		  -- does not clear a stale 'deleted' lifecycle when re-enabling), so
-		  -- enabled alone is not sufficient — see internal/modelguard
-		  -- (forensic audit, Case File 003, round 6).
-		  AND COALESCE(m.lifecycle,'active') != 'deleted'`,
+		  AND `+modelguard.SQLCondition,
 		int(threshold.Seconds()),
 		int((threshold * 2).Seconds()),
 	)
@@ -825,8 +832,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			       ON me.model_id = m.id
 			      AND me.lifecycle_state NOT IN ('deleted')
 			LEFT JOIN model_runtime_configs mrc ON mrc.model_id = m.id
-			WHERE m.id = $1 AND m.enabled = TRUE
-			  AND COALESCE(m.lifecycle,'active') != 'deleted'
+			WHERE m.id = $1 AND `+modelguard.SQLCondition+`
 			ORDER BY me.priority ASC
 			LIMIT 1`, row.ModelID)
 

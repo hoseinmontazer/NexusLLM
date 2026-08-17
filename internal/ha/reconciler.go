@@ -19,18 +19,26 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
+
+// ErrRecoveryChainExhausted is returned by executeReturningID when the
+// logical replica identified by a ReconcileAction's RecoveredFrom has already
+// reached maxUnhealthyRecoveryAttempts — the row has been marked 'lost' and
+// no replacement was created. Callers must not retry immediately.
+var ErrRecoveryChainExhausted = errors.New("recovery chain exhausted: logical replica marked lost")
 
 const (
 	// ReconcileInterval is how often the reconciler runs its sweep.
@@ -95,14 +103,26 @@ func (r *Reconciler) sweep(ctx context.Context) {
 			if action.Action != "start_replica" {
 				continue
 			}
-			if err := r.execute(ctx, status, action); err != nil {
-				r.log.Warn("reconciler: recovery failed",
-					zap.String("model", status.ModelName),
-					zap.String("reason", action.Reason),
-					zap.Error(err),
-				)
-			} else {
-				recoveriesTriggered++
+			newRuntimeID, _, err := r.executeReturningID(ctx, status, action)
+			if err != nil {
+				if !errors.Is(err, ErrRecoveryChainExhausted) {
+					r.log.Warn("reconciler: recovery failed",
+						zap.String("model", status.ModelName),
+						zap.String("reason", action.Reason),
+						zap.Error(err),
+					)
+				}
+				continue
+			}
+			recoveriesTriggered++
+			if action.RecoveredFrom != "" && newRuntimeID != "" {
+				// Advance the chain: mark the predecessor replaced so the NEXT
+				// under-replication top-up (if this new replica also fails)
+				// chains off THIS row instead of re-reading the same stale
+				// predecessor's attempt count forever.
+				_, _ = r.db.ExecContext(ctx,
+					`UPDATE agent_runtimes SET replaced_by = $1, updated_at = NOW() WHERE id = $2`,
+					newRuntimeID, action.RecoveredFrom)
 			}
 		}
 	}
@@ -206,15 +226,74 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 		return nil
 	}
 
+	// Bounded recovery: this under-replication top-up is filling a gap left
+	// by the most recent not-yet-replaced failure for this model, if any —
+	// chain it via RecoveredFrom so it shares the SAME attempt budget as the
+	// rolling-replacement path below, instead of being a second, unbounded
+	// recovery mechanism (production forensic audit: this path previously had
+	// only a time-based cooldown — 6 minutes, or 60s for confirmed
+	// container-death — with no cap on total attempts, and was the dominant
+	// source of unbounded replacement rows since claim_replica_slot()
+	// deliberately excludes 'unhealthy'/'failed' rows from its capacity
+	// count).
+	recoveredFrom := r.mostRecentUnrepairedFailure(ctx, status.ModelID)
+
 	return []ReconcileAction{{
-		ModelID:    status.ModelID,
-		ModelName:  status.ModelName,
-		Action:     "start_replica",
-		TargetNode: node,
-		ReplicaIdx: r.nextReplicaIndex(ctx, status.ModelID),
+		ModelID:       status.ModelID,
+		ModelName:     status.ModelName,
+		Action:        "start_replica",
+		TargetNode:    node,
+		ReplicaIdx:    r.nextReplicaIndex(ctx, status.ModelID),
+		RecoveredFrom: recoveredFrom,
 		Reason: fmt.Sprintf("ha_recovery: non_terminal=%d lost=%d desired=%d",
 			nonTerminal, status.LostReplicas, status.DesiredReplicas),
 	}}
+}
+
+// mostRecentUnrepairedFailure returns the id of the most recently terminal
+// (failed/stopped/lost) agent_runtimes row for modelID that has not already
+// been linked to a replacement (replaced_by IS NULL), or "" if none exists
+// (a brand-new deploy with no prior failure — attempt 1 of a fresh chain).
+// This is the logical-replica identity plan()'s under-replication top-up
+// chains its bounded-recovery attempt count from.
+func (r *Reconciler) mostRecentUnrepairedFailure(ctx context.Context, modelID string) string {
+	var id string
+	err := r.db.GetContext(ctx, &id, `
+		SELECT id FROM agent_runtimes
+		WHERE model_id = $1
+		  AND state IN ('failed','stopped','lost')
+		  AND replaced_by IS NULL
+		ORDER BY updated_at DESC LIMIT 1`, modelID)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// nextRecoveryAttempt computes the attempt number for a new replacement in
+// the logical recovery chain rooted at recoveredFrom (empty = brand new
+// chain — attempt 1, always allowed). Returns ok=false when creating this
+// attempt would exceed maxUnhealthyRecoveryAttempts; the caller must not
+// create the replacement row and must mark the chain terminal instead.
+//
+// This is the single, shared bounded-recovery check for BOTH creation paths
+// that can replace a failing replica (plan()'s under-replication top-up and
+// handleUnhealthyReplica's rolling replacement) — previously only the latter
+// enforced any cap at all.
+func (r *Reconciler) nextRecoveryAttempt(ctx context.Context, recoveredFrom string) (attempt int, ok bool) {
+	if recoveredFrom == "" {
+		return 1, true
+	}
+	var prior int
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(recovery_attempt, 0) FROM agent_runtimes WHERE id = $1`, recoveredFrom,
+	).Scan(&prior); err != nil {
+		// Predecessor row vanished (e.g. hard-deleted) — treat this as the
+		// start of a fresh chain rather than blocking recovery entirely.
+		return 1, true
+	}
+	next := prior + 1
+	return next, next <= maxUnhealthyRecoveryAttempts
 }
 
 // nextReplicaIndex picks the smallest non-negative integer not currently
@@ -229,8 +308,31 @@ func (r *Reconciler) plan(ctx context.Context, status ReplicaStatus) []Reconcile
 // display-collision fix, not a correctness fix, and intentionally does not
 // add a DB uniqueness constraint that could reject a legitimate surge insert.
 func (r *Reconciler) nextReplicaIndex(ctx context.Context, modelID string) int {
+	return nextReplicaIndexUsing(ctx, r.db, modelID)
+}
+
+// nextReplicaIndexTx is the transactional twin of nextReplicaIndex — it MUST
+// be called after ClaimSlot has acquired the per-model advisory lock inside
+// tx, so this is the AUTHORITATIVE index actually written to the new row.
+// Calling nextReplicaIndex before the transaction begins (as
+// action.ReplicaIdx is, for the container-name label only) is a
+// best-effort/display-only estimate with a TOCTOU window between concurrent
+// callers; calling it again here, inside the lock, closes that window for
+// the value that actually matters (production evidence: 12 rows created
+// within ~400ms all sharing replica_index=0 on the same node — the
+// pre-transaction estimate raced across concurrent reconcile passes).
+func (r *Reconciler) nextReplicaIndexTx(ctx context.Context, tx *sqlx.Tx, modelID string) int {
+	return nextReplicaIndexUsing(ctx, tx, modelID)
+}
+
+// replicaIndexQueryer is satisfied by both *sqlx.DB and *sqlx.Tx.
+type replicaIndexQueryer interface {
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+}
+
+func nextReplicaIndexUsing(ctx context.Context, q replicaIndexQueryer, modelID string) int {
 	var used []int
-	_ = r.db.SelectContext(ctx, &used, `
+	_ = q.SelectContext(ctx, &used, `
 		SELECT COALESCE(replica_index, -1) FROM agent_runtimes
 		WHERE model_id = $1
 		  AND state NOT IN (
@@ -429,33 +531,63 @@ func (r *Reconciler) nodeIP(ctx context.Context, nodeID string) string {
 	return nodeaddr.CanonicalHost(ctx, r.db, nodeID)
 }
 
-func (r *Reconciler) execute(ctx context.Context, status ReplicaStatus, action ReconcileAction) error {
-	_, err := r.executeReturningID(ctx, status, action)
-	return err
-}
-
 // executeReturningID carries out a single start_replica action.
 // It mimics what the admin DeployModel handler does: pre-creates the runtime
 // row with all required fields, allocates a port, then dispatches the task.
-func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatus, action ReconcileAction) (string, error) {
+// The returned attempt is the position of the created row within its
+// recovery chain (1 for a brand-new/first attempt) — callers that maintain a
+// persistent "hub" row across many attempts (handleUnhealthyReplica) must
+// write this value back onto that hub's own recovery_attempt column so the
+// NEXT call's nextRecoveryAttempt lookup sees the correct, current chain
+// depth rather than a stale one.
+func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatus, action ReconcileAction) (string, int, error) {
 	logID := uuid.New().String()
+
+	// ── 0. Bounded recovery gate ───────────────────────────────────────────────
+	// Checked BEFORE any side effect (port allocation, container naming) so an
+	// exhausted chain costs nothing beyond one SELECT. This is the single
+	// shared enforcement point for BOTH callers of this function (plan()'s
+	// under-replication top-up and handleUnhealthyReplica's rolling
+	// replacement) — previously only the latter had any cap at all, and even
+	// that cap lived on a per-row counter that was never actually carried
+	// forward into replacement rows (see migration 060 / Case File 004).
+	attempt, attemptOK := r.nextRecoveryAttempt(ctx, action.RecoveredFrom)
+	if !attemptOK {
+		reason := fmt.Sprintf("recovery chain exhausted after %d attempts — manual intervention required", attempt-1)
+		_, _ = r.db.ExecContext(ctx, `
+			UPDATE agent_runtimes
+			SET state = 'lost', error_msg = $2, updated_at = NOW()
+			WHERE id = $1 AND state NOT IN ('lost','stopped','deleted','archived')`,
+			action.RecoveredFrom, reason)
+		abandonAction := action
+		abandonAction.Action = "abandon_replacement"
+		abandonAction.ReplicaIdx = -1
+		abandonAction.Reason = reason
+		r.recordLog(ctx, logID, abandonAction, action.RecoveredFrom, "abandoned", reason)
+		r.log.Error("bounded recovery: chain exhausted — marking logical replica lost, no further automatic replacement",
+			zap.String("model", action.ModelName),
+			zap.String("recovered_from", action.RecoveredFrom),
+			zap.Int("attempt", attempt),
+		)
+		return "", 0, ErrRecoveryChainExhausted
+	}
 
 	// ── 1. Load full model config ─────────────────────────────────────────────
 	cfg, err := r.loadRuntimeConfig(ctx, action.ModelID)
 	if err != nil {
 		r.recordLog(ctx, logID, action, "", "failed", "loadRuntimeConfig: "+err.Error())
-		return "", err
+		return "", 0, err
 	}
 	if cfg.Image == "" {
 		r.recordLog(ctx, logID, action, "", "failed", "model has no runtime_image configured")
-		return "", fmt.Errorf("model %s has no runtime_image", action.ModelName)
+		return "", 0, fmt.Errorf("model %s has no runtime_image", action.ModelName)
 	}
 
 	// ── 2. Allocate unique port on the target node ────────────────────────────
 	port, err := r.allocatePort(ctx, action.TargetNode, action.ModelID)
 	if err != nil {
 		r.recordLog(ctx, logID, action, "", "failed", err.Error())
-		return "", err
+		return "", 0, err
 	}
 	bindHost := r.nodeIP(ctx, action.TargetNode)
 
@@ -483,7 +615,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 	if txErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, "", "failed", "begin tx: "+txErr.Error())
-		return "", fmt.Errorf("begin transaction: %w", txErr)
+		return "", 0, fmt.Errorf("begin transaction: %w", txErr)
 	}
 	// Always rollback on error paths; committed tx ignores this.
 	committed := false
@@ -503,7 +635,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 	if slotErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, "", "skipped", "claim_replica_slot error: "+slotErr.Error())
-		return "", fmt.Errorf("claim_replica_slot: %w", slotErr)
+		return "", 0, fmt.Errorf("claim_replica_slot: %w", slotErr)
 	}
 	if !slotAvailable {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
@@ -513,31 +645,41 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 			zap.String("model", action.ModelName),
 			zap.Int("desired", status.DesiredReplicas),
 		)
-		return "", nil // not an error — another process already handled it
+		return "", 0, nil // not an error — another process already handled it
 	}
+
+	// Compute the authoritative replica_index INSIDE the advisory-lock scope
+	// ClaimSlot just acquired, rather than before the transaction began (as
+	// action.ReplicaIdx was computed) — this closes the TOCTOU window where
+	// two concurrent callers for the same model could each read "index 0 is
+	// free" before either had committed (production evidence: 12 rows created
+	// within ~400ms all sharing replica_index=0 on the same node). Existing
+	// non-terminal rows still exclude 'unhealthy'/'failed'/etc per the same
+	// list ClaimSlot uses, matching nextReplicaIndex's semantics exactly.
+	replicaIdx := r.nextReplicaIndexTx(ctx, tx, action.ModelID)
 
 	res, dbErr := tx.ExecContext(ctx, `
 		INSERT INTO agent_runtimes
 		  (id, node_id, endpoint_id, model_id, runtime_name, backend,
 		   state, gpu_ids, bind_host, bind_port, cpu_affinity, numa_node,
 		   requested_mode, effective_mode, workload_policy,
-		   replica_index, recovery_attempt)
+		   replica_index, recovery_attempt, recovered_from)
 		VALUES ($1,$2,NULL,$3,$4,$5,'pending',
 		        $6::jsonb,$7,$8,'',-1,
-		        $9,$10,$11,$12,1)`,
+		        $9,$10,$11,$12,$13,$14)`,
 		runtimeID, action.TargetNode, action.ModelID, containerName, cfg.Backend,
 		gpuDevicesJSON, bindHost, port,
 		cfg.ExecutionMode, effectiveMode, cfg.WorkloadPolicy,
-		action.ReplicaIdx,
+		replicaIdx, attempt, nullableID(action.RecoveredFrom),
 	)
 	if dbErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "insert agent_runtime: "+dbErr.Error())
-		return "", fmt.Errorf("insert runtime row: %w", dbErr)
+		return "", 0, fmt.Errorf("insert runtime row: %w", dbErr)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
-		return "", fmt.Errorf("insert runtime row: 0 rows affected")
+		return "", 0, fmt.Errorf("insert runtime row: 0 rows affected")
 	}
 
 	// Commit while the advisory lock is still held — the lock releases on commit,
@@ -545,7 +687,7 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 	if commitErr := tx.Commit(); commitErr != nil {
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "commit tx: "+commitErr.Error())
-		return "", fmt.Errorf("commit runtime row: %w", commitErr)
+		return "", 0, fmt.Errorf("commit runtime row: %w", commitErr)
 	}
 	committed = true
 
@@ -618,10 +760,12 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		_, _ = r.db.ExecContext(ctx, `UPDATE agent_runtimes SET state='failed' WHERE id=$1`, runtimeID)
 		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
 		r.recordLog(ctx, logID, action, runtimeID, "failed", "enqueue: "+taskErr.Error())
-		return "", fmt.Errorf("enqueue START_MODEL: %w", taskErr)
+		return "", 0, fmt.Errorf("enqueue START_MODEL: %w", taskErr)
 	}
 
-	r.recordLog(ctx, logID, action, runtimeID, "success", action.Reason)
+	loggedAction := action
+	loggedAction.ReplicaIdx = replicaIdx
+	r.recordLog(ctx, logID, loggedAction, runtimeID, "success", action.Reason)
 
 	r.log.Info("HA recovery initiated",
 		zap.String("model", action.ModelName),
@@ -630,9 +774,21 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		zap.String("container", containerName),
 		zap.String("task_id", taskID),
 		zap.Int("port", port),
-		zap.Int("replica", action.ReplicaIdx),
+		zap.Int("replica", replicaIdx),
+		zap.Int("attempt", attempt),
+		zap.String("recovered_from", action.RecoveredFrom),
 	)
-	return runtimeID, nil
+	return runtimeID, attempt, nil
+}
+
+// nullableID converts an empty string to a nil driver value so an empty
+// RecoveredFrom is stored as SQL NULL in recovered_from (a UUID column)
+// instead of failing to parse "" as a uuid.
+func nullableID(id string) interface{} {
+	if id == "" {
+		return nil
+	}
+	return id
 }
 
 // resolveExecutionMode determines whether to use GPU or CPU on the target node.
@@ -851,24 +1007,20 @@ func (r *Reconciler) rollingReplacementSweep(ctx context.Context) {
 // stepUnhealthyReplicas handles the UNHEALTHY → spawn replacement → DRAINING leg.
 func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 	type unhealthyRow struct {
-		ID                  string    `db:"id"`
-		ModelID             string    `db:"model_id"`
-		ModelName           string    `db:"model_name"`
-		NodeID              string    `db:"node_id"`
-		ReplacedBy          *string   `db:"replaced_by"`
-		UpdatedAt           time.Time `db:"updated_at"`
-		DesiredReplicas     int       `db:"desired_replicas"`
-		MaxSurge            int       `db:"max_surge"`
-		ReplacementTimeoutS int       `db:"replacement_start_timeout_s"`
-		ActiveReadyCount    int       `db:"active_ready_count"`
-		RecoveryAttempt     int       `db:"recovery_attempt"`
+		ID                  string     `db:"id"`
+		ModelID             string     `db:"model_id"`
+		ModelName           string     `db:"model_name"`
+		NodeID              string     `db:"node_id"`
+		ReplacedBy          *string    `db:"replaced_by"`
+		UpdatedAt           time.Time  `db:"updated_at"`
+		DesiredReplicas     int        `db:"desired_replicas"`
+		MaxSurge            int        `db:"max_surge"`
+		ReplacementTimeoutS int        `db:"replacement_start_timeout_s"`
+		ActiveReadyCount    int        `db:"active_ready_count"`
+		NextRetryAt         *time.Time `db:"next_retry_at"`
 	}
 
 	var rows []unhealthyRow
-	// AND COALESCE(m.lifecycle,'active') != 'deleted' — a model can have
-	// enabled=TRUE while lifecycle='deleted' (EnableModel does not clear a
-	// stale 'deleted' lifecycle when re-enabling), so enabled alone is not a
-	// sufficient eligibility check; see internal/modelguard.
 	_ = r.db.SelectContext(ctx, &rows, `
 		SELECT
 		    ar.id,
@@ -884,14 +1036,13 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 		     WHERE ar2.model_id = ar.model_id
 		       AND ar2.state IN ('ready','active','warm','idle')
 		       AND ar2.id != ar.id)                          AS active_ready_count,
-		    COALESCE(ar.recovery_attempt, 0)                 AS recovery_attempt
+		    ar.next_retry_at                                 AS next_retry_at
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
 		WHERE ar.state = 'unhealthy'
-		  AND m.enabled = TRUE
-		  AND COALESCE(m.lifecycle,'active') != 'deleted'
+		  AND `+modelguard.SQLCondition+`
 		  -- lazy_load models are managed by the cold-start activator, which
 		  -- correctly respects model_endpoints.node_id pinning. This
 		  -- reconciler path does unconstrained free-placement (selectNode has
@@ -904,29 +1055,38 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 
 	for _, row := range rows {
 		r.handleUnhealthyReplica(ctx, row.ID, row.ModelID, row.ModelName,
-			row.NodeID, row.ReplacedBy, row.UpdatedAt,
+			row.NodeID, row.ReplacedBy, row.UpdatedAt, row.NextRetryAt,
 			row.DesiredReplicas, row.MaxSurge, row.ReplacementTimeoutS,
-			row.ActiveReadyCount, row.RecoveryAttempt)
+			row.ActiveReadyCount)
 	}
 }
 
-// maxUnhealthyRecoveryAttempts bounds how many times handleUnhealthyReplica
-// will spawn a replacement for the same original unhealthy row before giving
-// up and marking it terminal. Without this bound, a persistently-failing
-// cause (bad image, bad config, an unreachable node) produces an unbounded
-// respawn loop: every reconciler tick re-evaluates the row, and the
-// failed/stopped/deleted branch of Case 1 below clears replaced_by
-// immediately with no cooldown, so Case 2 fires again on the very next tick,
-// forever (forensic audit, Case File 003, round 6 — confirmed in production:
-// one model_id accumulated 2,318 agent_runtimes rows this way, still growing
-// at the moment of the audit).
+// maxUnhealthyRecoveryAttempts bounds how many replacement attempts a single
+// logical recovery chain (rooted at the first replica that went unhealthy,
+// linked forward via recovered_from — see nextRecoveryAttempt) may accumulate
+// before it is marked terminal ('lost') and no longer eligible for automatic
+// replacement. This bound previously lived on a per-ROW recovery_attempt
+// counter that was never actually carried into replacement rows — every new
+// row was inserted with a hardcoded recovery_attempt=1 and recovered_from was
+// never populated, so nothing could ever reach this limit no matter how many
+// replacements were spawned (forensic audit, Case File 003 round 6 confirmed
+// the earlier version of this bug; Case File 004 confirmed it was still
+// present because the fix only incremented the OLD row's own counter, which
+// is a different physical row every time replaced_by is cleared and
+// re-spawned — production data showed a single logical replica accumulate
+// ~639 replacement attempts over ~35 hours with recovery_attempt never
+// climbing above 1). The fix (migration 060 / nextRecoveryAttempt) computes
+// the attempt number by reading the PREDECESSOR row via recovered_from, so it
+// is mathematically guaranteed that for any row: recovery_attempt =
+// (chain length up to and including this row) <= maxUnhealthyRecoveryAttempts,
+// enforced at the single shared insertion point (executeReturningID) rather
+// than independently by each caller.
 const maxUnhealthyRecoveryAttempts = 5
 
-// unhealthyRecoveryCooldown returns the minimum wait since the row's last
-// state change before another replacement attempt may be spawned, growing
-// with each attempt (mirrors the cooldown plan() already applies to the
-// sibling under-replication path, which this rolling-replacement path never
-// had).
+// unhealthyRecoveryCooldown returns the minimum wait before another
+// replacement attempt may be spawned for a chain about to reach the given
+// attempt number, growing exponentially so a persistently-failing cause
+// doesn't spawn a new row every 30s tick.
 func unhealthyRecoveryCooldown(attempt int) time.Duration {
 	const base = 30 * time.Second
 	const maxCooldown = 900 * time.Second
@@ -942,20 +1102,22 @@ func (r *Reconciler) handleUnhealthyReplica(
 	runtimeID, modelID, modelName, nodeID string,
 	replacedBy *string,
 	unhealthySince time.Time,
+	nextRetryAt *time.Time,
 	desiredReplicas, maxSurge, replacementTimeoutS int,
 	activeReadyCount int,
-	recoveryAttempt int,
 ) {
 	replacementTimeout := time.Duration(replacementTimeoutS) * time.Second
 
 	// ── Case 1: replacement already started — check its progress ─────────
 	if replacedBy != nil && *replacedBy != "" {
 		var replacementState string
+		var replacementAttempt int
 		err := r.db.QueryRowContext(ctx,
-			`SELECT state FROM agent_runtimes WHERE id = $1`, *replacedBy,
-		).Scan(&replacementState)
+			`SELECT state, COALESCE(recovery_attempt, 1) FROM agent_runtimes WHERE id = $1`, *replacedBy,
+		).Scan(&replacementState, &replacementAttempt)
 		if err != nil {
-			// Replacement row gone — clear the pointer and retry.
+			// Replacement row gone — clear the pointer and retry immediately
+			// (this is an anomaly, not a normal failure, so no cooldown).
 			_, _ = r.db.ExecContext(ctx,
 				`UPDATE agent_runtimes SET replaced_by = NULL, updated_at = NOW() WHERE id = $1`, runtimeID)
 			return
@@ -977,13 +1139,24 @@ func (r *Reconciler) handleUnhealthyReplica(
 			)
 
 		case "failed", "stopped", "deleted":
-			// Replacement failed. Clear the pointer so we try again next sweep.
+			// Replacement failed. Clear the pointer so we try again next
+			// sweep, but persist next_retry_at on the ORIGINAL row so the
+			// cooldown survives — it must NOT be re-derived from updated_at,
+			// which this very statement is about to touch (production bug:
+			// unhealthySince was read from updated_at, and every Case 1/2
+			// transition bumped updated_at, so the cooldown clock silently
+			// reset on every tick and never actually grew).
+			cooldown := unhealthyRecoveryCooldown(replacementAttempt + 1)
+			retryAt := time.Now().Add(cooldown)
 			_, _ = r.db.ExecContext(ctx,
-				`UPDATE agent_runtimes SET replaced_by = NULL, updated_at = NOW() WHERE id = $1`, runtimeID)
-			r.log.Warn("rolling replacement: replacement FAILED — will retry",
+				`UPDATE agent_runtimes SET replaced_by = NULL, next_retry_at = $2, updated_at = NOW() WHERE id = $1`,
+				runtimeID, retryAt)
+			r.log.Warn("rolling replacement: replacement FAILED — will retry after cooldown",
 				zap.String("model", modelName),
 				zap.String("old_runtime", runtimeID),
 				zap.String("failed_replacement", *replacedBy),
+				zap.Duration("cooldown", cooldown),
+				zap.Time("next_retry_at", retryAt),
 			)
 
 		default:
@@ -995,13 +1168,16 @@ func (r *Reconciler) handleUnhealthyReplica(
 					zap.String("replacement", *replacedBy),
 					zap.Duration("waited", time.Since(unhealthySince)),
 				)
-				// Mark replacement failed; clear pointer; retry next sweep.
+				// Mark replacement failed; clear pointer + set cooldown; retry next sweep.
+				cooldown := unhealthyRecoveryCooldown(replacementAttempt + 1)
+				retryAt := time.Now().Add(cooldown)
 				_, _ = r.db.ExecContext(ctx,
 					`UPDATE agent_runtimes SET state='failed',
 					    error_msg='rolling replacement: startup timeout exceeded',
 					    updated_at=NOW() WHERE id=$1`, *replacedBy)
 				_, _ = r.db.ExecContext(ctx,
-					`UPDATE agent_runtimes SET replaced_by=NULL, updated_at=NOW() WHERE id=$1`, runtimeID)
+					`UPDATE agent_runtimes SET replaced_by=NULL, next_retry_at=$2, updated_at=NOW() WHERE id=$1`,
+					runtimeID, retryAt)
 			}
 			// Still in progress — wait.
 		}
@@ -1010,28 +1186,23 @@ func (r *Reconciler) handleUnhealthyReplica(
 
 	// ── Case 2: no replacement started yet — spawn one ────────────────────
 	//
-	// Bounded recovery: give up after maxUnhealthyRecoveryAttempts instead of
-	// retrying forever, and enforce a growing cooldown between attempts so a
-	// persistently-failing cause doesn't spawn a new row every 30s tick.
-	if recoveryAttempt >= maxUnhealthyRecoveryAttempts {
-		reason := fmt.Sprintf("rolling replacement abandoned after %d attempts — manual intervention required", recoveryAttempt)
-		_, _ = r.db.ExecContext(ctx, `
-			UPDATE agent_runtimes
-			SET state = 'lost', error_msg = $2, updated_at = NOW()
-			WHERE id = $1 AND state = 'unhealthy'`,
-			runtimeID, reason)
-		logID := uuid.New().String()
-		abandonAction := ReconcileAction{ModelID: modelID, ModelName: modelName, Action: "abandon_replacement", TargetNode: nodeID, ReplicaIdx: -1, Reason: reason}
-		r.recordLog(ctx, logID, abandonAction, runtimeID, "abandoned", reason)
-		r.log.Error("rolling replacement: max recovery attempts exhausted — marking runtime lost, no further retries",
-			zap.String("model", modelName),
-			zap.String("runtime_id", runtimeID),
-			zap.Int("attempts", recoveryAttempt),
-		)
-		return
-	}
-	if cooldown := unhealthyRecoveryCooldown(recoveryAttempt); time.Since(unhealthySince) < cooldown {
-		// Still within backoff — wait for a later sweep before retrying.
+	// Cooldown: for every attempt AFTER the first, next_retry_at is persisted
+	// explicitly (set above, in Case 1's failure branches) rather than
+	// derived from updated_at/unhealthySince, so routine bookkeeping updates
+	// on this row cannot silently reset it (the exact production bug: every
+	// Case 1/2 transition touched updated_at, so a cooldown computed from it
+	// never actually elapsed as intended).
+	//
+	// The very FIRST attempt has no next_retry_at yet (nothing has set it —
+	// this row has never been through Case 1), so it falls back to
+	// unhealthySince (the row's own updated_at, set by whatever marked it
+	// unhealthy) as a one-time proxy — this preserves the original guarantee
+	// that a replica isn't replaced the instant it flaps unhealthy.
+	if nextRetryAt != nil {
+		if time.Now().Before(*nextRetryAt) {
+			return
+		}
+	} else if time.Since(unhealthySince) < unhealthyRecoveryCooldown(0) {
 		return
 	}
 
@@ -1066,27 +1237,46 @@ func (r *Reconciler) handleUnhealthyReplica(
 	}
 
 	action := ReconcileAction{
-		ModelID:    modelID,
-		ModelName:  modelName,
-		Action:     "start_replica",
-		TargetNode: targetNode,
-		ReplicaIdx: r.nextReplicaIndex(ctx, modelID), // collision-safe surge slot label
-		Reason:     fmt.Sprintf("rolling_replacement: old=%s unhealthy_since=%s", runtimeID, unhealthySince.Format(time.RFC3339)),
+		ModelID:       modelID,
+		ModelName:     modelName,
+		Action:        "start_replica",
+		TargetNode:    targetNode,
+		ReplicaIdx:    r.nextReplicaIndex(ctx, modelID), // display-label estimate only — see nextReplicaIndexTx for the authoritative value
+		RecoveredFrom: runtimeID,
+		Reason:        fmt.Sprintf("rolling_replacement: old=%s unhealthy_since=%s", runtimeID, unhealthySince.Format(time.RFC3339)),
 	}
 
-	newRuntimeID, err := r.executeReturningID(ctx, status, action)
+	newRuntimeID, attemptNum, err := r.executeReturningID(ctx, status, action)
 	if err != nil {
+		if errors.Is(err, ErrRecoveryChainExhausted) {
+			// Already marked 'lost' and logged inside executeReturningID —
+			// nothing more to do here.
+			return
+		}
 		r.log.Warn("rolling replacement: failed to start replacement",
 			zap.String("model", modelName),
 			zap.Error(err),
 		)
 		return
 	}
+	if newRuntimeID == "" {
+		// A concurrent caller already claimed the slot for this model — not
+		// an error, just nothing for this call to link.
+		return
+	}
 
-	// Link the old runtime to its replacement and record this attempt.
+	// Link the old runtime to its replacement. recovery_attempt bookkeeping
+	// for the CHAIN lives on the new row (via recovered_from), but this hub
+	// row's OWN recovery_attempt must be kept in sync with attemptNum too:
+	// runtimeID stays 'unhealthy' and is re-evaluated on every future sweep
+	// (it is never itself superseded/replaced-away — it coordinates the
+	// whole chain), so the NEXT call to nextRecoveryAttempt(ctx, runtimeID)
+	// must see the current chain depth, not a stale value. Without this, the
+	// chain could never accumulate past attempt 1 no matter how many
+	// replacements were spawned — exactly the production bug this fix closes.
 	_, _ = r.db.ExecContext(ctx,
-		`UPDATE agent_runtimes SET replaced_by = $1, recovery_attempt = recovery_attempt + 1, updated_at = NOW() WHERE id = $2`,
-		newRuntimeID, runtimeID)
+		`UPDATE agent_runtimes SET replaced_by = $1, recovery_attempt = $3, updated_at = NOW() WHERE id = $2`,
+		newRuntimeID, runtimeID, attemptNum)
 
 	r.log.Info("rolling replacement: replacement spawned",
 		zap.String("model", modelName),

@@ -102,4 +102,9 @@ type ReconcileAction struct {
 	TargetNode string // node to deploy to
 	ReplicaIdx int
 	Reason     string
+	// RecoveredFrom is the id of the agent_runtimes row this action is
+	// replacing, if any (empty for a brand-new deploy/first replica with no
+	// prior failure). It is the logical-replica chain identity used to bound
+	// total recovery attempts — see internal/ha.(*Reconciler).nextRecoveryAttempt.
+	RecoveredFrom string
 }

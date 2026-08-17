@@ -1,17 +1,39 @@
 package ha
 
-// Regression tests for the unbounded unhealthy-replacement retry loop and
-// the replica_index label-collision fix (forensic audit, Case File 003,
-// round 6). Production data showed one model_id accumulate 2,318
-// agent_runtimes rows because handleUnhealthyReplica retried on every 30s
-// tick with no cooldown and no attempt limit — these tests prove that is
-// now bounded, without breaking normal (eventually-successful) replacement.
+// Regression tests for the bounded-recovery-chain fix (production forensic
+// audit, Case File 004). An EARLIER round (Case File 003) added a per-row
+// recovery_attempt counter, an exponential cooldown, and a max-attempts cap —
+// but production data kept accumulating unbounded rows anyway (one logical
+// replica reused as a replacement root ~639 times over ~35 hours; a single
+// model saw 360 new agent_runtimes rows/hour for 8 consecutive hours;
+// recovery_attempt stayed ≈1 on ~99.5% of rows) because:
+//  1. Every replacement row was inserted with a HARDCODED recovery_attempt=1
+//     and the pre-existing recovered_from column was never populated, so the
+//     "attempt count" lived on the OLD row (mutated in place) rather than
+//     being a property of the logical replacement CHAIN — nothing could ever
+//     read "how many times has this logical replica already been replaced".
+//  2. The cooldown was derived from updated_at, which every Case 1/2
+//     transition (including just clearing replaced_by) touched — silently
+//     resetting the cooldown clock on every reconciler tick.
+//  3. plan()'s sibling under-replication top-up path had NO attempt cap at
+//     all — only a time-based cooldown — and claim_replica_slot()
+//     deliberately excludes 'unhealthy'/'failed' rows from its capacity
+//     count (so an in-progress replacement never blocks itself), which means
+//     total replacement count was never bounded by capacity either.
+//
+// These tests prove the fix: recovery_attempt is carried forward via
+// recovered_from (so the mathematical invariant attempt <= 5 holds for the
+// whole chain, not per-row), next_retry_at is a persisted, non-resettable
+// cooldown, and BOTH creation paths (rolling replacement and under-replication
+// top-up) share the same bound.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,7 +176,9 @@ func setupReconcilerTestDB(t *testing.T) *sqlx.DB {
 			workload_policy  VARCHAR(30) NOT NULL DEFAULT 'lazy_load',
 			replica_index    INTEGER,
 			replaced_by      UUID,
+			recovered_from   UUID,
 			recovery_attempt INTEGER NOT NULL DEFAULT 0,
+			next_retry_at    TIMESTAMPTZ,
 			created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
@@ -317,6 +341,26 @@ func (f reconcilerFixture) backdateUpdatedAt(t *testing.T, runtimeID string, age
 	}
 }
 
+// setNextRetryAt forces a row's persisted cooldown into the past (or future),
+// simulating the passage of time without needing to actually wait — this is
+// the field that must NOT be silently reset by routine bookkeeping (the
+// production bug this round fixes).
+func (f reconcilerFixture) setNextRetryAt(t *testing.T, runtimeID string, when time.Time) {
+	t.Helper()
+	if _, err := f.db.Exec(`UPDATE agent_runtimes SET next_retry_at = $2 WHERE id=$1`, runtimeID, when); err != nil {
+		t.Fatalf("set next_retry_at: %v", err)
+	}
+}
+
+func (f reconcilerFixture) recoveredFrom(t *testing.T, runtimeID string) *string {
+	t.Helper()
+	var v *string
+	if err := f.db.Get(&v, `SELECT recovered_from::text FROM agent_runtimes WHERE id=$1`, runtimeID); err != nil {
+		t.Fatalf("query recovered_from: %v", err)
+	}
+	return v
+}
+
 func (f reconcilerFixture) rowState(t *testing.T, runtimeID string) (state string, replacedBy *string, attempt int) {
 	t.Helper()
 	if err := f.db.Get(&state, `SELECT state FROM agent_runtimes WHERE id=$1`, runtimeID); err != nil {
@@ -374,20 +418,39 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 	ctx := context.Background()
 
 	for attempt := 0; attempt < maxUnhealthyRecoveryAttempts; attempt++ {
-		// Simulate having waited out this attempt's cooldown.
-		f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(attempt)+time.Second)
+		if attempt == 0 {
+			// First attempt has no persisted next_retry_at yet — falls back
+			// to the row's own updated_at.
+			f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(0)+time.Second)
+		} else {
+			// Subsequent attempts: force the PERSISTED cooldown into the
+			// past directly, rather than backdating updated_at — proving
+			// the cooldown source is next_retry_at, not a value that gets
+			// reset by routine bookkeeping (the production bug).
+			f.setNextRetryAt(t, runtimeID, time.Now().Add(-time.Second))
+		}
 
 		f.r.rollingReplacementSweep(ctx)
 
-		state, replacedBy, gotAttempt := f.rowState(t, runtimeID)
+		state, replacedBy, hubAttempt := f.rowState(t, runtimeID)
 		if state != "unhealthy" {
-			t.Fatalf("attempt %d: expected original row still 'unhealthy' while replacement pending, got %q", attempt, state)
+			t.Fatalf("attempt %d: expected original (hub) row still 'unhealthy' while replacement pending, got %q", attempt, state)
 		}
 		if replacedBy == nil {
 			t.Fatalf("attempt %d: expected replaced_by to be set after spawning a replacement", attempt)
 		}
-		if gotAttempt != attempt+1 {
-			t.Fatalf("attempt %d: expected recovery_attempt=%d, got %d", attempt, attempt+1, gotAttempt)
+		if hubAttempt != attempt+1 {
+			t.Fatalf("attempt %d: expected the hub row's own recovery_attempt to track chain depth (%d), got %d", attempt, attempt+1, hubAttempt)
+		}
+		// The NEW row (not the hub) must carry the same attempt number and
+		// point recovered_from back at the hub — this is the actual
+		// per-attempt bookkeeping the production bug lost entirely.
+		_, _, newAttempt := f.rowState(t, *replacedBy)
+		if newAttempt != attempt+1 {
+			t.Fatalf("attempt %d: expected new replacement row's own recovery_attempt=%d, got %d", attempt, attempt+1, newAttempt)
+		}
+		if rf := f.recoveredFrom(t, *replacedBy); rf == nil || *rf != runtimeID {
+			t.Fatalf("attempt %d: expected new row's recovered_from to point at the hub %s, got %v", attempt, runtimeID, rf)
 		}
 
 		// Simulate the replacement failing quickly (e.g. bad config) so the
@@ -395,9 +458,8 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 		if _, err := db.Exec(`UPDATE agent_runtimes SET state='failed' WHERE id=$1`, *replacedBy); err != nil {
 			t.Fatalf("attempt %d: mark replacement failed: %v", attempt, err)
 		}
-		// One more sweep clears the pointer (Case 1's failed branch) —
-		// without this, the next loop iteration's cooldown backdate would
-		// apply to a row that still has replaced_by set from this attempt.
+		// One more sweep clears the pointer (Case 1's failed branch) and
+		// persists the next cooldown.
 		f.r.rollingReplacementSweep(ctx)
 		state, replacedBy, _ = f.rowState(t, runtimeID)
 		if replacedBy != nil {
@@ -406,8 +468,8 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 	}
 
 	// One more sweep, past the attempt cap: must NOT spawn again, and must
-	// transition the original row to a terminal state.
-	f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(maxUnhealthyRecoveryAttempts)+time.Second)
+	// transition the hub row to a terminal state.
+	f.setNextRetryAt(t, runtimeID, time.Now().Add(-time.Second))
 	rowsBefore := f.countRowsForModel(t)
 	f.r.rollingReplacementSweep(ctx)
 	rowsAfter := f.countRowsForModel(t)
@@ -416,10 +478,10 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 	}
 	finalState, _, finalAttempt := f.rowState(t, runtimeID)
 	if finalState != "lost" {
-		t.Fatalf("expected original row marked terminal ('lost') after exhausting retries, got %q", finalState)
+		t.Fatalf("expected hub row marked terminal ('lost') after exhausting retries, got %q", finalState)
 	}
 	if finalAttempt != maxUnhealthyRecoveryAttempts {
-		t.Fatalf("expected recovery_attempt to stop incrementing at %d, got %d", maxUnhealthyRecoveryAttempts, finalAttempt)
+		t.Fatalf("expected recovery_attempt to stop at %d, got %d", maxUnhealthyRecoveryAttempts, finalAttempt)
 	}
 
 	// Prove subsequent ticks create nothing further — the row is no longer
@@ -437,6 +499,160 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 	}
 	if logCount == 0 {
 		t.Fatal("expected an 'abandoned' entry in runtime_recovery_log for observability — none found")
+	}
+}
+
+// TestExecuteReturningID_ChainAttemptAccumulatesAndCaps directly proves the
+// mathematical invariant required by the production audit: for one logical
+// replica (a chain of rows linked via recovered_from), attempt numbers
+// strictly increase 1..maxUnhealthyRecoveryAttempts and the chain is refused
+// (marked 'lost') beyond that — regardless of which caller (rolling
+// replacement or under-replication top-up) drives it. This bypasses
+// handleUnhealthyReplica entirely and calls executeReturningID directly so
+// the chain mechanics are tested in isolation from cooldown/state-machine
+// concerns already covered above.
+func TestExecuteReturningID_ChainAttemptAccumulatesAndCaps(t *testing.T) {
+	db := setupReconcilerTestDB(t)
+	f := seedReconcilerFixture(t, db, "always_on")
+	ctx := context.Background()
+
+	baseAction := func(recoveredFrom string) ReconcileAction {
+		return ReconcileAction{
+			ModelID:       f.modelID,
+			ModelName:     "chain-test",
+			Action:        "start_replica",
+			TargetNode:    f.nodeID,
+			ReplicaIdx:    0,
+			RecoveredFrom: recoveredFrom,
+			Reason:        "test",
+		}
+	}
+	status := ReplicaStatus{ModelID: f.modelID, ModelName: "chain-test", DesiredReplicas: 1, MaxSurge: 1}
+
+	var chain []string
+	prev := ""
+	for i := 1; i <= maxUnhealthyRecoveryAttempts; i++ {
+		id, attempt, err := f.r.executeReturningID(ctx, status, baseAction(prev))
+		if err != nil {
+			t.Fatalf("attempt %d: unexpected error: %v", i, err)
+		}
+		if attempt != i {
+			t.Fatalf("attempt %d: expected computed attempt=%d, got %d", i, i, attempt)
+		}
+		// Mark this row terminal so the NEXT iteration's ClaimSlot check
+		// (and the next chain link) has a clean, unambiguous predecessor.
+		if _, err := db.Exec(`UPDATE agent_runtimes SET state='failed' WHERE id=$1`, id); err != nil {
+			t.Fatalf("attempt %d: mark failed: %v", i, err)
+		}
+		chain = append(chain, id)
+		prev = id
+	}
+
+	// The 6th attempt must be refused — chain exhausted.
+	_, _, err := f.r.executeReturningID(ctx, status, baseAction(prev))
+	if !errors.Is(err, ErrRecoveryChainExhausted) {
+		t.Fatalf("expected ErrRecoveryChainExhausted on the attempt beyond the cap, got %v", err)
+	}
+	var finalState string
+	if err := db.Get(&finalState, `SELECT state FROM agent_runtimes WHERE id=$1`, prev); err != nil {
+		t.Fatalf("query final predecessor state: %v", err)
+	}
+	if finalState != "lost" {
+		t.Fatalf("expected the exhausted chain's last row to be marked 'lost', got %q", finalState)
+	}
+
+	// No row anywhere in the chain should show an attempt number outside
+	// [1, maxUnhealthyRecoveryAttempts] — the core invariant.
+	for i, id := range chain {
+		var attempt int
+		if err := db.Get(&attempt, `SELECT recovery_attempt FROM agent_runtimes WHERE id=$1`, id); err != nil {
+			t.Fatalf("query chain[%d] attempt: %v", i, err)
+		}
+		if attempt < 1 || attempt > maxUnhealthyRecoveryAttempts {
+			t.Fatalf("chain[%d] (id=%s): attempt=%d violates 1<=attempt<=%d", i, id, attempt, maxUnhealthyRecoveryAttempts)
+		}
+	}
+}
+
+// TestExecuteReturningID_ConcurrentCreates_CapacityAndReplicaIndexSafe is the
+// direct regression test for the production evidence of 12 agent_runtimes
+// rows created within ~400ms, all sharing replica_index=0 on the same node,
+// for a model configured with desired_replicas=1, max_surge=1 (so at most 2
+// non-terminal rows should ever coexist). It fires several concurrent
+// creation attempts at the same fresh model and asserts both invariants
+// (ClaimSlot's capacity bound and collision-free replica_index) hold despite
+// the race — this is exactly the fix being verified: the replica_index
+// computation now happens inside the same advisory-lock scope ClaimSlot
+// acquires, instead of before the transaction began.
+//
+// Each goroutine targets a DIFFERENT node (allocatePort's underlying
+// allocate_node_port() DB function serializes ALL port allocations for one
+// node behind a single session-level pg_advisory_lock — a pre-existing
+// mechanism, unrelated to this round's fix — so contending on the SAME node
+// would test port-lease queuing rather than the model-level capacity/
+// replica_index invariant this test targets). ClaimSlot's advisory lock is
+// keyed by MODEL, not node, so this still fully exercises real concurrent
+// contention on the actual invariant under test.
+func TestExecuteReturningID_ConcurrentCreates_CapacityAndReplicaIndexSafe(t *testing.T) {
+	db := setupReconcilerTestDB(t)
+	f := seedReconcilerFixture(t, db, "always_on")
+	ctx := context.Background()
+	status := ReplicaStatus{ModelID: f.modelID, ModelName: "concurrent-test", DesiredReplicas: 1, MaxSurge: 1}
+
+	const concurrency = 6
+	nodeIDs := make([]string, concurrency)
+	nodeIDs[0] = f.nodeID
+	for i := 1; i < concurrency; i++ {
+		if err := db.Get(&nodeIDs[i], `INSERT INTO nodes (hostname, ip_address) VALUES ($1, '10.5.0.20') RETURNING id::text`,
+			fmt.Sprintf("concurrent-node-%d-%s", i, uuid.New().String()[:6])); err != nil {
+			t.Fatalf("seed extra node %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(nodeID string) {
+			defer wg.Done()
+			action := ReconcileAction{
+				ModelID:    f.modelID,
+				ModelName:  "concurrent-test",
+				Action:     "start_replica",
+				TargetNode: nodeID,
+				ReplicaIdx: 0, // deliberately identical pre-lock estimate for every goroutine
+				Reason:     "concurrency test",
+			}
+			_, _, _ = f.r.executeReturningID(ctx, status, action)
+		}(nodeIDs[i])
+	}
+	wg.Wait()
+
+	var nonTerminal int
+	if err := db.Get(&nonTerminal, `
+		SELECT COUNT(*) FROM agent_runtimes
+		WHERE model_id=$1
+		  AND state NOT IN ('stopped','deleted','archived','unloaded','lost','draining','failed','unhealthy')`,
+		f.modelID); err != nil {
+		t.Fatalf("count non-terminal: %v", err)
+	}
+	if nonTerminal > status.DesiredReplicas+status.MaxSurge {
+		t.Fatalf("capacity violated: %d non-terminal rows for desired=%d+surge=%d", nonTerminal, status.DesiredReplicas, status.MaxSurge)
+	}
+
+	var replicaIndexes []int
+	if err := db.Select(&replicaIndexes, `
+		SELECT replica_index FROM agent_runtimes
+		WHERE model_id=$1
+		  AND state NOT IN ('stopped','deleted','archived','unloaded','lost','draining','failed','unhealthy')`,
+		f.modelID); err != nil {
+		t.Fatalf("query replica_index values: %v", err)
+	}
+	seen := make(map[int]bool, len(replicaIndexes))
+	for _, idx := range replicaIndexes {
+		if seen[idx] {
+			t.Fatalf("replica_index collision among non-terminal rows: index %d used more than once (indexes=%v)", idx, replicaIndexes)
+		}
+		seen[idx] = true
 	}
 }
 
