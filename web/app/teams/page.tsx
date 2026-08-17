@@ -47,7 +47,13 @@ function ModelAccessPanel({ team }: { team: Team }) {
       qc.invalidateQueries({ queryKey: ['team-models', team.id] })
       setModelInput('')
     },
-    onError: (e: any) => toast({ title: 'Grant failed', description: e.message, variant: 'destructive' }),
+    onError: (e: any) => {
+      toast({ title: 'Grant failed', description: e.message, variant: 'destructive' })
+      // A failure can still be a partial DB-committed/Redis-not-synced state
+      // (see internal/admin/handlers/team.go's AddModelPermission) — refetch
+      // so the panel doesn't keep showing stale pre-attempt state.
+      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
+    },
   })
 
   const revoke = useMutation({
@@ -56,7 +62,10 @@ function ModelAccessPanel({ team }: { team: Team }) {
       toast({ title: 'Access revoked', description: `${team.name} ✕ ${name}` })
       qc.invalidateQueries({ queryKey: ['team-models', team.id] })
     },
-    onError: (e: any) => toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' }),
+    onError: (e: any) => {
+      toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' })
+      qc.invalidateQueries({ queryKey: ['team-models', team.id] })
+    },
   })
 
   // Label a granted model as cloud or local

@@ -292,31 +292,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	// ── 1b. Project override via X-Nexus-Project header ──────────────────
-	// Allows callers to specify which project this request belongs to,
-	// overriding the API key's project scope.
-	// Project is looked up within the authenticated org (not team) so that
-	// org-level projects are reachable regardless of which team the key belongs to.
-	if projectHdr := c.GetHeader("X-Nexus-Project"); projectHdr != "" && h.db != nil {
-		var projRow struct {
-			ID             string `db:"id"`
-			Name           string `db:"name"`
-			PriorityWeight int    `db:"priority_weight"`
-		}
-		lookupErr := h.db.GetContext(c.Request.Context(), &projRow, `
-			SELECT id::text, name, priority_weight
-			FROM projects
-			WHERE (name = $1 OR id::text = $1)
-			  AND organization_id = $2
-			  AND status = 'active'
-			LIMIT 1`, projectHdr, claims.OrgID)
-		if lookupErr == nil {
-			overriddenClaims := *claims
-			overriddenClaims.ProjectID = projRow.ID
-			overriddenClaims.ProjectName = projRow.Name
-			overriddenClaims.ProjectPriorityWeight = projRow.PriorityWeight
-			claims = &overriddenClaims
-		}
-	}
+	claims = h.applyProjectHeaderOverride(c, claims)
 
 	// ── 2. Gateway policy (temperature cap, tool restrictions, etc.) ───────
 	inputEst := estimateTokens(req.Messages)
@@ -1723,6 +1699,88 @@ func sanitizeForBackend(req models.InferenceRequest, backendType runtime.Backend
 		req.Effort = nil
 		return req
 	}
+}
+
+// teamProjectOverride is the result of resolveTeamProjectOverride.
+// applyProjectHeaderOverride implements the X-Nexus-Project header override:
+// it allows a TEAM-ONLY key (no project_id of its own) to attribute a
+// request to one of its OWN team's projects for priority/quota purposes.
+//
+// SECURITY (forensic audit, project-authorization round): this used to look
+// up the target project org-wide, with no check that the caller's key had
+// any relationship to it at all. Once project scope started gating model
+// access too (internal/policy Option A), that made this header a direct
+// authorization bypass — a key restricted via its own project's model grants
+// could simply name a different, unconfigured (passthrough) project in the
+// same org and inherit full team access.
+//
+// Fixed scoping, in order of precedence:
+//   - A key that is ALREADY project-scoped (api_keys.project_id set) is
+//     explicitly associated with exactly that one project and no other — the
+//     header is ignored entirely for such a key. A project-scoped key's
+//     restriction must never be escapable by a request header.
+//   - A team-only key (no project_id) may select among projects EXPLICITLY
+//     belonging to its own team (projects.team_id = claims.TeamID) — never
+//     org-wide, never a different team's project.
+//
+// Extracted into its own method (production security re-audit) so this guard
+// itself — not just resolveTeamProjectOverride's DB lookup — has direct,
+// end-to-end test coverage independent of the full ChatCompletions pipeline;
+// see internal/proxy/project_override_test.go.
+func (h *Handler) applyProjectHeaderOverride(c *gin.Context, claims *auth.TeamClaims) *auth.TeamClaims {
+	if claims.ProjectID != "" {
+		return claims
+	}
+	projectHdr := c.GetHeader("X-Nexus-Project")
+	if projectHdr == "" || h.db == nil {
+		return claims
+	}
+	proj, ok := resolveTeamProjectOverride(c.Request.Context(), h.db, claims.TeamID, claims.OrgID, projectHdr)
+	if !ok {
+		return claims
+	}
+	overriddenClaims := *claims
+	overriddenClaims.ProjectID = proj.ID
+	overriddenClaims.ProjectName = proj.Name
+	overriddenClaims.ProjectPriorityWeight = proj.PriorityWeight
+	return &overriddenClaims
+}
+
+type teamProjectOverride struct {
+	ID             string `db:"id"`
+	Name           string `db:"name"`
+	PriorityWeight int    `db:"priority_weight"`
+}
+
+// resolveTeamProjectOverride looks up a project a TEAM-ONLY key (no
+// project_id of its own) may attribute a request to via the X-Nexus-Project
+// header, for priority/quota purposes only.
+//
+// SECURITY: the project MUST belong to the caller's own team (teamID) — not
+// merely the same organization. A caller must never be able to name a
+// project it has no real relationship to; a project scoped org-wide (the
+// original behavior) let any key in an org pick any other team's project,
+// which — once project scope started gating model access too (Option A in
+// internal/policy) — became a direct authorization bypass: a key restricted
+// via its own project's grants could simply name an unconfigured (legacy
+// passthrough) project belonging to a different team and inherit that
+// team's full model access. Callers with claims.ProjectID already set must
+// never reach this function at all (see handler.go call site) — such a key
+// is explicitly associated with exactly one project and no other.
+func resolveTeamProjectOverride(ctx context.Context, db *sqlx.DB, teamID, orgID, projectHdr string) (teamProjectOverride, bool) {
+	var proj teamProjectOverride
+	err := db.GetContext(ctx, &proj, `
+		SELECT id::text AS id, name, priority_weight
+		FROM projects
+		WHERE (name = $1 OR id::text = $1)
+		  AND team_id = $2
+		  AND organization_id = $3
+		  AND status = 'active'
+		LIMIT 1`, projectHdr, teamID, orgID)
+	if err != nil {
+		return teamProjectOverride{}, false
+	}
+	return proj, true
 }
 
 func estimateTokens(messages []models.Message) int {

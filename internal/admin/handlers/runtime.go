@@ -2046,14 +2046,15 @@ func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, engine *po
 	// sql.ErrNoRows instead of restoring the same snapshot twice.
 	var snapID string
 	var teamIDsJSON string
+	var projectIDsJSON string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id::text, team_ids::text
+		SELECT id::text, team_ids::text, project_ids::text
 		FROM model_permission_snapshots
 		WHERE model_name = $1 AND restored = FALSE
 		ORDER BY deleted_at DESC
 		LIMIT 1
 		FOR UPDATE`, modelName,
-	).Scan(&snapID, &teamIDsJSON)
+	).Scan(&snapID, &teamIDsJSON, &projectIDsJSON)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// No unconsumed snapshot — first-ever deployment of this name, or
@@ -2075,8 +2076,30 @@ func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, engine *po
 
 	// Re-insert one team_model_permissions row per team, inside the tx. Any
 	// failure aborts the whole restore rather than silently skipping that
-	// team — a partial restore is exactly the kind of DB/Redis divergence
-	// risk this fix exists to eliminate.
+	// team.
+	//
+	// SECURITY/CONSISTENCY (forensic audit, production-readiness round):
+	// this used to call engine.SetModelAllowed (a real Redis network call)
+	// from WITHIN this still-open transaction, before commit — with a
+	// doc-comment claiming "Postgres and Redis either both change together
+	// or neither does". That claim was false whenever a snapshot covered
+	// more than one team/project: if an EARLIER team's Redis write already
+	// succeeded and a LATER one then failed, the deferred rollback undid
+	// every Postgres INSERT in this function, but the earlier team's
+	// already-executed Redis SAdd was never compensated — Postgres ends up
+	// saying "no grant", Redis says "this team can access it".
+	//
+	// Fixed: ALL Postgres writes (team + project INSERTs, and marking the
+	// snapshot restored) now happen and COMMIT as one all-or-nothing unit,
+	// with zero Redis calls inside the transaction. Redis synchronization
+	// happens strictly AFTER commit, below. This makes rollback-leaves-
+	// stray-Redis-state structurally impossible (there is nothing to roll
+	// back by the time Redis is ever touched) — at the cost of accepting a
+	// different, already-detectable failure mode: Postgres commits but a
+	// post-commit Redis sync call fails. That residual case is exactly what
+	// the reconciliation mechanism (ReconcilePermissions) exists to find and
+	// fix — see internal/admin/handlers/reconcile.go — rather than trying
+	// (and previously failing) to prevent it via in-transaction Redis calls.
 	var restoredTeamIDs []string
 	for _, teamID := range teamIDs {
 		teamID = strings.TrimSpace(teamID)
@@ -2094,28 +2117,37 @@ func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, engine *po
 		restoredTeamIDs = append(restoredTeamIDs, teamID)
 	}
 
-	// Synchronize the SAME teams into the live enforcement set via the one
-	// canonical function that writes it. A failure here rolls back the whole
-	// transaction — the INSERTs above are undone — so Postgres never ends up
-	// saying a grant exists when the gateway can't see it.
-	if len(restoredTeamIDs) > 0 {
-		if engine == nil {
-			return nil, fmt.Errorf("restore permissions: no policy engine configured — cannot synchronize gateway enforcement, refusing to report a partial restore as successful")
+	// Same restore for project-level grants (migration 058), same
+	// all-or-nothing guarantee, same transaction.
+	var projectIDs []string
+	if jsonErr := json.Unmarshal([]byte(projectIDsJSON), &projectIDs); jsonErr != nil {
+		log.Warn("permission snapshot found but project_ids is unparseable — continuing with team restore only",
+			zap.String("snapshot_id", snapID),
+			zap.String("model_name", modelName),
+			zap.Error(jsonErr),
+		)
+		projectIDs = nil
+	}
+	var restoredProjectIDs []string
+	for _, projectID := range projectIDs {
+		projectID = strings.TrimSpace(projectID)
+		if projectID == "" {
+			continue
 		}
-		for _, teamID := range restoredTeamIDs {
-			if syncErr := engine.SetModelAllowed(ctx, teamID, modelName); syncErr != nil {
-				return nil, fmt.Errorf("restore permissions: sync team %s to gateway enforcement: %w", teamID, syncErr)
-			}
+		if _, insertErr := tx.ExecContext(ctx, `
+			INSERT INTO project_model_permissions (project_id, model_id)
+			VALUES ($1::uuid, $2::uuid)
+			ON CONFLICT DO NOTHING`,
+			projectID, newModelID,
+		); insertErr != nil {
+			return nil, fmt.Errorf("restore permissions: insert project_model_permissions (project %s): %w", projectID, insertErr)
 		}
+		restoredProjectIDs = append(restoredProjectIDs, projectID)
 	}
 
-	// Mark snapshot as consumed, in the SAME transaction — error is no longer
-	// discarded; a failure here rolls back the INSERTs and Redis writes above
-	// (Redis SAdd is not itself transactional, but since we only reach this
-	// point after every SetModelAllowed call already succeeded, the only way
-	// this UPDATE can fail is an unrelated DB-level error, and rolling back
-	// the Postgres side leaves the snapshot re-attemptable rather than
-	// wrongly marked restored).
+	// Mark snapshot as consumed, in the SAME transaction as the INSERTs
+	// above — this is the last Postgres statement before commit; nothing
+	// after this point can partially apply.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE model_permission_snapshots
 		SET restored = TRUE, restored_at = NOW()
@@ -2129,13 +2161,55 @@ func restorePermissionsFromSnapshot(ctx context.Context, db *sqlx.DB, engine *po
 	}
 	committed = true
 
+	// ── Post-commit: synchronize Redis ────────────────────────────────────
+	// Postgres is now durably the source of truth regardless of what happens
+	// below. A failure here is reported to the caller (so it's logged, not
+	// silently swallowed) but does NOT undo the commit above — the
+	// permission genuinely exists and the next ReconcilePermissions sweep
+	// (internal/admin/handlers/reconcile.go) will detect and repair the
+	// Redis-side gap on its own, without needing another redeploy.
+	var syncErrs []error
 	if len(restoredTeamIDs) > 0 {
-		log.Info("restored team permissions from a previous deletion of this model name — "+
-			"verify these teams are actually expected to have access before assuming this is routine",
+		if engine == nil {
+			syncErrs = append(syncErrs, fmt.Errorf("no policy engine configured — %d team grant(s) committed to Postgres but not synced to Redis", len(restoredTeamIDs)))
+		} else {
+			for _, teamID := range restoredTeamIDs {
+				if syncErr := engine.SetModelAllowed(ctx, teamID, modelName); syncErr != nil {
+					syncErrs = append(syncErrs, fmt.Errorf("sync team %s to gateway enforcement: %w", teamID, syncErr))
+				}
+			}
+		}
+	}
+	if len(restoredProjectIDs) > 0 {
+		if engine == nil {
+			syncErrs = append(syncErrs, fmt.Errorf("no policy engine configured — %d project grant(s) committed to Postgres but not synced to Redis", len(restoredProjectIDs)))
+		} else {
+			for _, projectID := range restoredProjectIDs {
+				if syncErr := engine.SetProjectModelAllowed(ctx, projectID, modelName); syncErr != nil {
+					syncErrs = append(syncErrs, fmt.Errorf("sync project %s to gateway enforcement: %w", projectID, syncErr))
+				}
+			}
+		}
+	}
+
+	if len(restoredTeamIDs) > 0 || len(restoredProjectIDs) > 0 {
+		log.Info("restored team/project permissions from a previous deletion of this model name — "+
+			"verify these are actually expected to have access before assuming this is routine",
 			zap.String("model_name", modelName),
 			zap.String("new_model_id", newModelID),
 			zap.Strings("restored_team_ids", restoredTeamIDs),
+			zap.Strings("restored_project_ids", restoredProjectIDs),
 		)
+	}
+
+	if len(syncErrs) > 0 {
+		log.Error("permissions committed to Postgres but Redis synchronization failed for some entries — "+
+			"gateway enforcement is temporarily out of sync; the periodic reconciliation sweep will repair this",
+			zap.String("model_name", modelName),
+			zap.Errors("sync_errors", syncErrs),
+		)
+		return restoredTeamIDs, fmt.Errorf("restore permissions: committed to database but %d Redis sync error(s) occurred (will self-heal via reconciliation): %w",
+			len(syncErrs), errors.Join(syncErrs...))
 	}
 
 	return restoredTeamIDs, nil

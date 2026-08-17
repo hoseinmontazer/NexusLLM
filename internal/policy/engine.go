@@ -250,6 +250,65 @@ func (e *Engine) ClearProjectProviderAccess(ctx context.Context, projectID strin
 // ProviderAccessEntry is the exported type used by the gateway seed function.
 type ProviderAccessEntry = providerAccessEntry
 
+// ─── Project Model ACL (Public/managed models) ───────────────────────────────
+//
+// This is a DIFFERENT mechanism from the provider ACL above: it restricts
+// which regular (Public/managed) models — e.g. models deployed via
+// DeployModel, the ones team_model_permissions already governs — a
+// project-scoped token may call, on top of its team's grant (Option A:
+// team AND project). It was added because, before this, req.ProjectID had
+// zero effect on Public-model authorization: a project-scoped token got
+// exactly the same access as a plain team token for the same team.
+//
+// Backward compatibility is critical: this table/feature is new, so on
+// deploy every existing project has zero rows in project_model_permissions.
+// projectModelsConfiguredKey distinguishes "this project has never been
+// touched by the new feature" (full passthrough to the team's access,
+// preserving every existing project-scoped token's current behavior)
+// from "this project has explicit grants, possibly zero right now"
+// (Option A enforced — an empty set means deny-all, not passthrough). The
+// marker is set on the FIRST grant or revoke call for a project and is
+// never cleared, so revoking every model down to zero correctly means
+// "deny all," not "revert to legacy passthrough."
+func projectModelsKey(projectID string) string {
+	return projectPrefix + projectID + ":models"
+}
+
+func projectModelsConfiguredKey(projectID string) string {
+	return projectPrefix + projectID + ":models:configured"
+}
+
+// SetProjectModelAllowed grants a project explicit access to a Public model
+// and marks the project as being in restricted (Option A) mode from now on.
+func (e *Engine) SetProjectModelAllowed(ctx context.Context, projectID, model string) error {
+	pipe := e.rdb.Pipeline()
+	pipe.SAdd(ctx, projectModelsKey(projectID), model)
+	pipe.Set(ctx, projectModelsConfiguredKey(projectID), "1", 0)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RemoveProjectModelAllowed revokes a project's access to a Public model.
+// Also marks the project as configured — revoking the LAST model must leave
+// the project in "deny all Public models" mode, not fall back to legacy
+// team-passthrough.
+func (e *Engine) RemoveProjectModelAllowed(ctx context.Context, projectID, model string) error {
+	pipe := e.rdb.Pipeline()
+	pipe.SRem(ctx, projectModelsKey(projectID), model)
+	pipe.Set(ctx, projectModelsConfiguredKey(projectID), "1", 0)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// ClearProjectModelAccess removes all Public-model grants AND the configured
+// marker for a project, reverting it to legacy team-passthrough. Intended
+// for project deletion, not for "revoke all models" (use
+// RemoveProjectModelAllowed per-model for that, which correctly stays in
+// deny-all mode).
+func (e *Engine) ClearProjectModelAccess(ctx context.Context, projectID string) error {
+	return e.rdb.Del(ctx, projectModelsKey(projectID), projectModelsConfiguredKey(projectID)).Err()
+}
+
 // ─── Evaluate ────────────────────────────────────────────────────────────────
 
 // Evaluate runs the two-layer policy check for an inference request.
@@ -276,8 +335,13 @@ func (e *Engine) Evaluate(
 	// Two parallel authorization paths:
 	//
 	// A. Public Model (managed / hybrid): model must be in the TEAM's explicit
-	//    grant set (nexus:team:<TeamID>:models). This is the canonical,
-	//    per-team ACL and is the primary enforcement mechanism.
+	//    grant set (nexus:team:<TeamID>:models) — the canonical per-team ACL —
+	//    AND, when the request is project-scoped, also in that PROJECT's
+	//    explicit grant set (nexus:project:<ProjectID>:models). This is
+	//    Option A / upper-bound semantics: a project can only narrow its
+	//    team's access, never widen it. See projectModelsConfiguredKey's doc
+	//    comment for the backward-compatibility rule that governs projects
+	//    which have never been given an explicit model grant.
 	//
 	//    IMPORTANT: the org-level set (nexus:org:<OrgID>:models) is intentionally
 	//    NOT used for per-request ACL decisions. It aggregates grants from ALL
@@ -292,13 +356,34 @@ func (e *Engine) Evaluate(
 	//    and evaluates the prefix allow/deny rules.
 	//
 	// Either path passing is sufficient — OR semantics.
-	// For the legacy team-only path (no ProjectID), only path A applies.
-	modelAllowed := false
+	// For the legacy team-only path (no ProjectID), only path A applies, and
+	// only the team half of it (no project to narrow against).
+	teamAllowed := false
 	if req.TeamID != "" {
 		// Primary ACL path: team-level explicit grant (nexus:team:<id>:models).
 		// This is the only set that reflects what this specific team was granted.
 		ok, _ := e.rdb.SIsMember(ctx, teamModelsPrefix+req.TeamID+":models", req.Model).Result()
-		modelAllowed = ok
+		teamAllowed = ok
+	}
+	modelAllowed := false
+	switch {
+	case !teamAllowed:
+		modelAllowed = false
+	case req.ProjectID == "":
+		// Legacy team-only key: no project to narrow against.
+		modelAllowed = true
+	default:
+		configured, _ := e.rdb.Exists(ctx, projectModelsConfiguredKey(req.ProjectID)).Result()
+		if configured == 0 {
+			// This project has never been given an explicit Public-model grant —
+			// full passthrough to the team's access, preserving every existing
+			// project-scoped token's current behavior (see doc comment above
+			// projectModelsConfiguredKey).
+			modelAllowed = true
+		} else {
+			ok, _ := e.rdb.SIsMember(ctx, projectModelsKey(req.ProjectID), req.Model).Result()
+			modelAllowed = ok
+		}
 	}
 	// Path B: project-level provider ACL (catalog / hybrid virtual models).
 	// Only checked when a project is in scope — virtual models have no meaning
@@ -667,6 +752,20 @@ func (e *Engine) SetModelAllowed(ctx context.Context, teamID, model string) erro
 // RemoveModelAllowed removes a model from a team's allowed-models set (legacy).
 func (e *Engine) RemoveModelAllowed(ctx context.Context, teamID, model string) error {
 	return e.rdb.SRem(ctx, teamModelsPrefix+teamID+":models", model).Err()
+}
+
+// TeamModelSet returns the current live (Redis-side) allowed-model set for a
+// team. Used by the permission reconciliation sweep to diff against
+// Postgres's team_model_permissions — never used on the request hot path.
+func (e *Engine) TeamModelSet(ctx context.Context, teamID string) ([]string, error) {
+	return e.rdb.SMembers(ctx, teamModelsPrefix+teamID+":models").Result()
+}
+
+// ProjectModelSet returns the current live (Redis-side) allowed-model set for
+// a project. Used by the permission reconciliation sweep to diff against
+// Postgres's project_model_permissions — never used on the request hot path.
+func (e *Engine) ProjectModelSet(ctx context.Context, projectID string) ([]string, error) {
+	return e.rdb.SMembers(ctx, projectModelsKey(projectID)).Result()
 }
 
 // ─── Infrastructure capacity ──────────────────────────────────────────────────

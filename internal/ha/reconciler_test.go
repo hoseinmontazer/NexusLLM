@@ -344,7 +344,7 @@ func (f reconcilerFixture) countRowsForModel(t *testing.T) int {
 // previously missing (unlike the sibling plan() under-replication path).
 func TestHandleUnhealthyReplica_RespectsCooldown_DoesNotSpawnImmediately(t *testing.T) {
 	db := setupReconcilerTestDB(t)
-	f := seedReconcilerFixture(t, db, "lazy_load")
+	f := seedReconcilerFixture(t, db, "always_on")
 	runtimeID := f.seedUnhealthyRuntime(t, time.Now(), 0) // just became unhealthy — updated_at is "now"
 
 	f.r.rollingReplacementSweep(context.Background())
@@ -368,7 +368,7 @@ func TestHandleUnhealthyReplica_RespectsCooldown_DoesNotSpawnImmediately(t *test
 // accumulating thousands of rows with no such limit.
 func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 	db := setupReconcilerTestDB(t)
-	f := seedReconcilerFixture(t, db, "lazy_load")
+	f := seedReconcilerFixture(t, db, "always_on")
 	runtimeID := f.seedUnhealthyRuntime(t, time.Now(), 0)
 
 	ctx := context.Background()
@@ -446,7 +446,7 @@ func TestHandleUnhealthyReplica_BoundedRetries_ThenTerminal(t *testing.T) {
 // draining exactly as before.
 func TestHandleUnhealthyReplica_HealthyReplacement_StillDrainsOldRuntime(t *testing.T) {
 	db := setupReconcilerTestDB(t)
-	f := seedReconcilerFixture(t, db, "lazy_load")
+	f := seedReconcilerFixture(t, db, "always_on")
 	runtimeID := f.seedUnhealthyRuntime(t, time.Now(), 0)
 	f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(0)+time.Second)
 
@@ -514,5 +514,31 @@ func TestNextReplicaIndex_PicksSmallestUnusedSlot(t *testing.T) {
 	}
 	if got := f.r.nextReplicaIndex(ctx, f.modelID); got != 2 {
 		t.Fatalf("expected a stopped row's index (2) to be reusable, got %d", got)
+	}
+}
+
+// TestStepUnhealthyReplicas_IgnoresLazyLoadModels is a direct regression test
+// for a production incident (gpt-oss-120b): the reconciler's rolling-
+// replacement path does unconstrained free-placement across nodes, which is
+// wrong for a lazy_load model whose files may only exist on one specific
+// node — it picked a node without the model's GGUF file and failed
+// instantly. The sibling under-replication path (loadReplicaStatuses)
+// already excludes lazy_load models for the same reason; this proves
+// stepUnhealthyReplicas now does too, leaving lazy_load recovery entirely to
+// the cold-start activator (which correctly respects node pinning).
+func TestStepUnhealthyReplicas_IgnoresLazyLoadModels(t *testing.T) {
+	db := setupReconcilerTestDB(t)
+	f := seedReconcilerFixture(t, db, "lazy_load")
+	runtimeID := f.seedUnhealthyRuntime(t, time.Now(), 0)
+	f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(0)+time.Second)
+
+	f.r.rollingReplacementSweep(context.Background())
+
+	state, replacedBy, attempt := f.rowState(t, runtimeID)
+	if state != "unhealthy" || replacedBy != nil || attempt != 0 {
+		t.Fatalf("expected a lazy_load model's unhealthy row to be left completely untouched by the reconciler, got state=%q replaced_by=%v attempt=%d", state, replacedBy, attempt)
+	}
+	if n := f.countRowsForModel(t); n != 1 {
+		t.Fatalf("expected no replacement spawned for a lazy_load model, got %d total rows", n)
 	}
 }

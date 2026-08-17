@@ -320,14 +320,22 @@ func (h *TeamHandler) AddModelPermission(c *gin.Context) {
 		return
 	}
 
-	// Look up model ID — use enabled column (migration 003)
+	// Look up model ID — current, non-deleted model only, newest first.
+	// A bare `WHERE name=$1` with no ORDER BY is non-deterministic when
+	// multiple historical rows share a name (soft-delete + redeploy under the
+	// same name creates a new model_id each time) — this previously let a
+	// grant attach to an old, deleted model_id. Enforcement itself is
+	// name-keyed in Redis so this didn't break live authorization, but it
+	// corrupted the bookkeeping table and any UI/snapshot logic reading it.
 	var modelID string
-	err := h.db.GetContext(c.Request.Context(), &modelID,
-		`SELECT id FROM models WHERE name = $1 AND enabled = TRUE`, input.ModelName)
+	err := h.db.GetContext(c.Request.Context(), &modelID, `
+		SELECT id FROM models
+		WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`, input.ModelName)
 	if err != nil {
-		// Fallback: model may not have enabled column yet (pre-003 schema)
+		// Fallback: model may not have enabled/lifecycle columns yet (pre-migration schema)
 		err = h.db.GetContext(c.Request.Context(), &modelID,
-			`SELECT id FROM models WHERE name = $1`, input.ModelName)
+			`SELECT id FROM models WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, input.ModelName)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "model not found: " + input.ModelName})
 			return
@@ -341,8 +349,16 @@ func (h *TeamHandler) AddModelPermission(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
+	markModelPermissionScopeConfigured(c.Request.Context(), h.db, "team", teamID)
 
-	_ = h.engine.SetModelAllowed(c.Request.Context(), teamID, input.ModelName)
+	// The Redis write is what the gateway actually enforces against — a
+	// silent failure here must not be reported to the caller as success.
+	if err := h.engine.SetModelAllowed(c.Request.Context(), teamID, input.ModelName); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "permission recorded in database but ACL sync failed — retry the grant: " + err.Error(),
+		})
+		return
+	}
 	h.syncPermissionChanges(c.Request.Context(), teamID, input.ModelName, true)
 	c.JSON(http.StatusOK, gin.H{"message": "model permission granted"})
 }
@@ -352,18 +368,70 @@ func (h *TeamHandler) RemoveModelPermission(c *gin.Context) {
 	teamID := c.Param("id")
 	modelName := c.Param("model")
 
+	// Same active-model lookup as AddModelPermission — deterministic,
+	// excludes deleted-lifecycle rows, newest first.
+	//
+	// SECURITY (production security re-audit, Critical Finding #1): a bare
+	// `WHERE name=$1` with no ORDER BY/lifecycle filter is ambiguous once a
+	// model has been through a delete+redeploy cycle (idx_models_name_active
+	// only enforces uniqueness among non-deleted rows, so a deleted row and
+	// the active redeployed row can share a name). Go's database/sql silently
+	// takes whichever row is returned first with no error, so this could
+	// resolve to a stale, deleted model_id — the subsequent DELETE would then
+	// silently affect zero rows (the real, active grant is keyed to a
+	// different model_id), while the admin still receives a 200 "removed"
+	// response. Worse, because Postgres still shows the real grant, the next
+	// reconciliation sweep would treat the (still-live) Redis entry as
+	// correct and leave it in place, or re-add it if it had been separately
+	// cleared — silently reverting the intended revoke.
 	var modelID string
-	if err := h.db.GetContext(c.Request.Context(), &modelID,
-		`SELECT id FROM models WHERE name = $1`, modelName); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
-		return
+	err := h.db.GetContext(c.Request.Context(), &modelID, `
+		SELECT id FROM models
+		WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`, modelName)
+	if err != nil {
+		// Fallback: model may not have enabled/lifecycle columns yet (pre-migration schema)
+		err = h.db.GetContext(c.Request.Context(), &modelID,
+			`SELECT id FROM models WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, modelName)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "model not found: " + modelName})
+			return
+		}
 	}
 
-	_, _ = h.db.ExecContext(c.Request.Context(),
-		`DELETE FROM team_model_permissions WHERE team_id = $1 AND model_id = $2`, teamID, modelID)
-	_ = h.engine.RemoveModelAllowed(c.Request.Context(), teamID, modelName)
+	// Both the DB write and the Redis sync must propagate their errors to the
+	// caller instead of being discarded — a silently-failed revoke that still
+	// returns 200 is exactly what let Critical Finding #1 go undetected.
+	if _, err := h.db.ExecContext(c.Request.Context(),
+		`DELETE FROM team_model_permissions WHERE team_id = $1 AND model_id = $2`, teamID, modelID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error: " + err.Error()})
+		return
+	}
+	markModelPermissionScopeConfigured(c.Request.Context(), h.db, "team", teamID)
+
+	if err := h.engine.RemoveModelAllowed(c.Request.Context(), teamID, modelName); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "permission removed in database but ACL sync failed — retry the revoke, or wait for reconciliation: " + err.Error(),
+		})
+		return
+	}
 	h.syncPermissionChanges(c.Request.Context(), teamID, modelName, false)
 	c.JSON(http.StatusOK, gin.H{"message": "model permission removed"})
+}
+
+// markModelPermissionScopeConfigured records that a team/project has had an
+// explicit grant or revoke performed on it, so ReconcilePermissions can find
+// and repair it even after it's been revoked down to zero rows in
+// team_model_permissions/project_model_permissions (see migration 059 and
+// reconcile.go). Best-effort: this table only widens reconciliation's scope
+// of what it inspects, it is never consulted by the live enforcement path
+// (Evaluate), so a transient failure here does not create a security gap —
+// it only means this particular scope keeps relying on the pre-existing
+// row-based scoping until the next successful grant/revoke call.
+func markModelPermissionScopeConfigured(ctx context.Context, db *sqlx.DB, scopeType, scopeID string) {
+	_, _ = db.ExecContext(ctx,
+		`INSERT INTO model_permission_scopes (scope_type, scope_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		scopeType, scopeID)
 }
 
 func (h *TeamHandler) syncPermissionChanges(ctx context.Context, teamID, modelName string, isAdd bool) {

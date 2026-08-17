@@ -103,6 +103,17 @@ export interface Model {
   upstream_api_key_set?: boolean  // true = key stored, never the key itself
 }
 
+// A project's Public-model grant, plus whether it's confirmed present in the
+// live Redis ACL (not just Postgres) — see ProjectHandler.ListProjectModels.
+// synced=false means the grant exists in the database but a Redis sync
+// (grant/revoke/redeploy-restore) hasn't landed yet — the periodic
+// reconciliation sweep will repair it, or POST /admin/v1/system/reconcile-permissions
+// can be called to force an immediate repair.
+export interface ProjectModelGrant {
+  name: string
+  synced: boolean
+}
+
 export interface RuntimeRequirements {
   id: string; model_id: string
   execution_type: string   // GPU | CPU | ANY
@@ -953,6 +964,17 @@ export const api = {
       req<{ data: PreemptionEvent[]; total: number; limit: number; offset: number }>('GET', `/projects/${id}/preemptions?limit=${limit}&offset=${offset}`),
     getQueue: (id: string) =>
       req<{ data: DeploymentQueueEntry[]; total: number }>('GET', `/projects/${id}/queue`),
+    // Project-level Public-model authorization (migration 058). Narrows the
+    // project's team model access — a model must be granted to BOTH the team
+    // and the project to be usable by a project-scoped token. A project with
+    // no grants here inherits its team's full access unchanged (legacy
+    // passthrough) until the first grant/revoke call.
+    listModels: (id: string) =>
+      req<{ models: ProjectModelGrant[] }>('GET', `/projects/${id}/models`),
+    addModel: (id: string, modelName: string) =>
+      req<{ message: string }>('POST', `/projects/${id}/models`, { model_name: modelName }),
+    removeModel: (id: string, model: string) =>
+      req<{ message: string }>('DELETE', `/projects/${id}/models/${model}`),
   },
 
   scheduler: {

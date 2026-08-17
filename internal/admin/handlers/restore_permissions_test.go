@@ -136,7 +136,8 @@ func applyMinimalSchema(db *sqlx.DB) error {
 			display_name VARCHAR(255) NOT NULL DEFAULT '',
 			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
 			lifecycle    VARCHAR(20) NOT NULL DEFAULT 'active'
-			             CHECK (lifecycle IN ('active','archived','deleted'))
+			             CHECK (lifecycle IN ('active','archived','deleted')),
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_models_name_active
 			ON models(name) WHERE lifecycle != 'deleted';
@@ -147,11 +148,31 @@ func applyMinimalSchema(db *sqlx.DB) error {
 			PRIMARY KEY (team_id, model_id)
 		);
 
+		CREATE TABLE IF NOT EXISTS projects (
+			id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			name    VARCHAR(255) NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS project_model_permissions (
+			project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+			model_id   UUID NOT NULL REFERENCES models(id)   ON DELETE RESTRICT,
+			PRIMARY KEY (project_id, model_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS model_permission_scopes (
+			scope_type    TEXT NOT NULL CHECK (scope_type IN ('team', 'project')),
+			scope_id      UUID NOT NULL,
+			configured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (scope_type, scope_id)
+		);
+
 		CREATE TABLE IF NOT EXISTS model_permission_snapshots (
 			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			model_name       VARCHAR(255) NOT NULL,
 			deleted_model_id UUID NOT NULL,
 			team_ids         JSONB NOT NULL DEFAULT '[]',
+			project_ids      JSONB NOT NULL DEFAULT '[]',
 			deleted_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			restored         BOOLEAN NOT NULL DEFAULT FALSE,
 			restored_at      TIMESTAMPTZ
@@ -160,7 +181,8 @@ func applyMinimalSchema(db *sqlx.DB) error {
 		CREATE OR REPLACE FUNCTION fn_snapshot_model_permissions()
 		RETURNS TRIGGER AS $$
 		DECLARE
-			v_team_ids JSONB;
+			v_team_ids    JSONB;
+			v_project_ids JSONB;
 		BEGIN
 			IF NEW.lifecycle = 'deleted' AND OLD.lifecycle != 'deleted' THEN
 				SELECT COALESCE(jsonb_agg(tmp.team_id::text), '[]'::jsonb)
@@ -168,8 +190,13 @@ func applyMinimalSchema(db *sqlx.DB) error {
 				FROM   team_model_permissions tmp
 				WHERE  tmp.model_id = OLD.id;
 
-				INSERT INTO model_permission_snapshots (model_name, deleted_model_id, team_ids)
-				VALUES (OLD.name, OLD.id, v_team_ids);
+				SELECT COALESCE(jsonb_agg(pmp.project_id::text), '[]'::jsonb)
+				INTO   v_project_ids
+				FROM   project_model_permissions pmp
+				WHERE  pmp.model_id = OLD.id;
+
+				INSERT INTO model_permission_snapshots (model_name, deleted_model_id, team_ids, project_ids)
+				VALUES (OLD.name, OLD.id, v_team_ids, v_project_ids);
 			END IF;
 			RETURN NEW;
 		END;
@@ -273,7 +300,18 @@ func TestRestorePermissions_SyncsToGatewayEnforcement(t *testing.T) {
 	}
 }
 
-func TestRestorePermissions_RedisFailureIsNotReportedAsSuccess(t *testing.T) {
+// TestRestorePermissions_RedisFailureCommitsDBButReportsError proves the
+// NEW, intentional post-commit-sync semantics (production-readiness audit):
+// Postgres is the durable source of truth and commits regardless of Redis
+// outcome — the OLD behavior (full rollback on any Redis failure) is what
+// let a stray Redis write survive a Postgres rollback whenever a snapshot
+// covered more than one team/project (see restorePermissionsFromSnapshot's
+// doc comment). Now: the DB commit always reflects reality, a Redis sync
+// failure is surfaced as an error (so it's logged, not swallowed) but does
+// NOT roll back the already-durable grant, and the snapshot is correctly
+// marked restored — a second call to this same function will NOT re-attempt
+// it (that's what ReconcilePermissions is for, tested separately).
+func TestRestorePermissions_RedisFailureCommitsDBButReportsError(t *testing.T) {
 	env := setupRestoreTestEnv(t)
 	modelName := "gpt-router-" + uuid.New().String()[:8]
 	teamID := seedDeletedModelWithSnapshot(t, env.db, modelName)
@@ -289,37 +327,51 @@ func TestRestorePermissions_RedisFailureIsNotReportedAsSuccess(t *testing.T) {
 
 	restored, err := restorePermissionsFromSnapshot(context.Background(), env.db, deadEngine, zap.NewNop(), modelName, newModelID)
 	if err == nil {
-		t.Fatalf("expected an error when Redis sync fails, got success with restored=%v", restored)
+		t.Fatalf("expected an error to be reported when Redis sync fails (so it's logged, not silently swallowed), got success with restored=%v", restored)
+	}
+	if len(restored) != 1 || restored[0] != teamID {
+		t.Fatalf("expected the (committed) restored team IDs to still be returned alongside the sync error, got %v", restored)
 	}
 
-	// DB must NOT show the permission as granted — full rollback, not a
-	// partial/divergent state.
+	// DB MUST show the permission as granted — Postgres already committed
+	// durably before Redis was ever touched. This is the deliberate fix:
+	// the old "full rollback on Redis failure" behavior is exactly what
+	// could strand an EARLIER team's already-successful Redis write when a
+	// LATER team's sync failed in the same call.
 	var dbCount int
 	if qErr := env.db.Get(&dbCount, `SELECT COUNT(*) FROM team_model_permissions WHERE team_id=$1::uuid AND model_id=$2::uuid`, teamID, newModelID); qErr != nil {
 		t.Fatalf("query team_model_permissions: %v", qErr)
 	}
-	if dbCount != 0 {
-		t.Fatalf("expected the failed restore to leave NO team_model_permissions row (full rollback), found %d", dbCount)
+	if dbCount != 1 {
+		t.Fatalf("expected the DB grant to be committed despite the Redis failure (post-commit sync semantics), found %d rows", dbCount)
 	}
 
-	// Snapshot must remain unconsumed and therefore recoverable by a retry
-	// once Redis is healthy again.
+	// The snapshot must be marked restored — Postgres's job is done; Redis
+	// catching up is the reconciliation sweep's job, not a re-run of this
+	// function.
 	var restoredFlag bool
 	if qErr := env.db.Get(&restoredFlag, `SELECT restored FROM model_permission_snapshots WHERE model_name=$1`, modelName); qErr != nil {
 		t.Fatalf("query snapshot: %v", qErr)
 	}
-	if restoredFlag {
-		t.Fatal("expected snapshot.restored to remain FALSE after a failed restore — it must stay recoverable, not silently consumed")
+	if !restoredFlag {
+		t.Fatal("expected snapshot.restored to be TRUE — the Postgres side of the restore is complete and must not be re-attempted")
 	}
 
-	// Retry with a healthy engine must now succeed against the SAME snapshot.
+	// A second call against the same (now consumed) snapshot must be a no-op
+	// (finds no unconsumed row), NOT a retry mechanism — reconciliation is
+	// the correct path to fix the stranded Redis gap now, proven separately
+	// in TestReconcilePermissions_RepairsPostCommitRedisGap.
 	engine := policy.NewEngine(env.rdb)
-	restored, err = restorePermissionsFromSnapshot(context.Background(), env.db, engine, zap.NewNop(), modelName, newModelID)
-	if err != nil {
-		t.Fatalf("retry after Redis recovery should succeed, got: %v", err)
+	restored2, err2 := restorePermissionsFromSnapshot(context.Background(), env.db, engine, zap.NewNop(), modelName, newModelID)
+	if err2 != nil {
+		t.Fatalf("expected a no-op (nil, nil) for an already-consumed snapshot, got error: %v", err2)
 	}
-	if len(restored) != 1 {
-		t.Fatalf("expected retry to restore 1 team, got %v", restored)
+	if len(restored2) != 0 {
+		t.Fatalf("expected no re-restoration for an already-consumed snapshot, got %v", restored2)
+	}
+	member, mErr := env.rdb.SIsMember(context.Background(), "nexus:team:"+teamID+":models", modelName).Result()
+	if mErr != nil || member {
+		t.Fatalf("expected Redis to still be missing the grant after the no-op retry (proving reconciliation, not re-restoration, is what's needed): member=%v err=%v", member, mErr)
 	}
 }
 
@@ -404,4 +456,63 @@ func insertRedeployedModelAllowingDuplicateName(t *testing.T, db *sqlx.DB, model
 		t.Fatalf("insert racing model: %v", err)
 	}
 	return id
+}
+
+// TestRestorePermissions_RestoresProjectGrantsAlongsideTeamGrants proves
+// migration 058's extension to the snapshot mechanism: a project-level model
+// grant (internal/policy's Option A narrowing) must survive a model
+// soft-delete + redeploy under the same name exactly like team grants
+// already did, and must be synced to the project's own Redis ACL set.
+func TestRestorePermissions_RestoresProjectGrantsAlongsideTeamGrants(t *testing.T) {
+	env := setupRestoreTestEnv(t)
+	ctx := context.Background()
+	modelName := "embed-" + uuid.New().String()[:8]
+
+	teamID := seedDeletedModelWithSnapshot(t, env.db, modelName)
+	// seedDeletedModelWithSnapshot already soft-deleted the model — grant a
+	// project on the SAME (now-deleted) old model_id before redeploying, by
+	// re-deriving it from the snapshot row directly (schema has no other
+	// handle back to it at this point).
+	var oldModelID string
+	if err := env.db.Get(&oldModelID, `SELECT deleted_model_id::text FROM model_permission_snapshots WHERE model_name=$1`, modelName); err != nil {
+		t.Fatalf("query snapshot's deleted_model_id: %v", err)
+	}
+	var projectID string
+	if err := env.db.Get(&projectID, `INSERT INTO projects (team_id, name) VALUES ($1::uuid,$2) RETURNING id::text`, teamID, "proj-"+modelName); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	if _, err := env.db.Exec(`INSERT INTO project_model_permissions (project_id, model_id) VALUES ($1::uuid,$2::uuid)`, projectID, oldModelID); err != nil {
+		t.Fatalf("seed project grant on old model_id: %v", err)
+	}
+	// Re-snapshot: the trigger already fired before the project grant existed,
+	// so refresh it exactly as a real re-delete would (simulates the grant
+	// having existed at the moment of deletion).
+	if _, err := env.db.Exec(`DELETE FROM model_permission_snapshots WHERE model_name=$1`, modelName); err != nil {
+		t.Fatalf("clear stale snapshot: %v", err)
+	}
+	if _, err := env.db.Exec(`UPDATE models SET lifecycle='active' WHERE id=$1::uuid`, oldModelID); err != nil {
+		t.Fatalf("flip back to active: %v", err)
+	}
+	if _, err := env.db.Exec(`UPDATE models SET lifecycle='deleted' WHERE id=$1::uuid`, oldModelID); err != nil {
+		t.Fatalf("re-delete (trigger fire with project grant present): %v", err)
+	}
+
+	newModelID := insertRedeployedModel(t, env.db, modelName)
+	engine := policy.NewEngine(env.rdb)
+	if _, err := restorePermissionsFromSnapshot(ctx, env.db, engine, zap.NewNop(), modelName, newModelID); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+
+	var dbCount int
+	if err := env.db.Get(&dbCount, `SELECT COUNT(*) FROM project_model_permissions WHERE project_id=$1::uuid AND model_id=$2::uuid`, projectID, newModelID); err != nil {
+		t.Fatalf("query project_model_permissions: %v", err)
+	}
+	if dbCount != 1 {
+		t.Fatalf("expected the project grant to be restored against the NEW model_id, got %d rows", dbCount)
+	}
+
+	member, err := env.rdb.SIsMember(ctx, "nexus:project:"+projectID+":models", modelName).Result()
+	if err != nil || !member {
+		t.Fatalf("expected the project's Redis ACL set to contain %q after restore, member=%v err=%v", modelName, member, err)
+	}
 }

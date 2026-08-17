@@ -177,6 +177,36 @@ func main() {
 	go projectMetrics.Start(usageCtx)
 	log.Info("project metrics collector started")
 
+	// ── Permission reconciliation sweep ───────────────────────────────────────
+	// PostgreSQL (team_model_permissions / project_model_permissions) is the
+	// source of truth; Redis is a derived cache the gateway enforces against.
+	// A transient Redis failure during an otherwise-successful grant/revoke/
+	// restore leaves the two stores diverged with no automatic self-heal —
+	// this sweep detects and repairs that drift periodically, independent of
+	// the on-demand POST /admin/v1/system/reconcile-permissions endpoint.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-usageCtx.Done():
+				return
+			case <-ticker.C:
+				report := handlers.ReconcilePermissions(usageCtx, db, policyEngine, log)
+				if report.TeamRepairs > 0 || report.ProjectRepairs > 0 || len(report.Errors) > 0 {
+					log.Warn("permission reconciliation sweep found and repaired drift",
+						zap.Int("teams_checked", report.TeamsChecked),
+						zap.Int("projects_checked", report.ProjectsChecked),
+						zap.Int("team_repairs", report.TeamRepairs),
+						zap.Int("project_repairs", report.ProjectRepairs),
+						zap.Strings("errors", report.Errors),
+					)
+				}
+			}
+		}
+	}()
+	log.Info("permission reconciliation sweep started")
+
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	orgH := handlers.NewOrgHandler(db)
 	teamH := handlers.NewTeamHandler(db, rdb, policyEngine)
@@ -194,7 +224,8 @@ func main() {
 	taskH := handlers.NewTaskHandler(taskMgr)
 	requireH := handlers.NewRequirementsHandler(db)
 	lazyH := handlers.NewLazyRuntimeHandler(db)
-	projectH := handlers.NewProjectHandler(db)
+	projectH := handlers.NewProjectHandler(db, rdb, policyEngine)
+	reconcileH := handlers.NewReconciliationHandler(db, policyEngine, log)
 	haH := handlers.NewHAHandler(db)
 	ppH2 := handlers.NewProjectPolicyHandler(db, rdb, policyEngine, usageTracker)
 	factory2 := runtime.NewFactory(&http.Client{Timeout: 10 * time.Second})
@@ -409,6 +440,15 @@ func main() {
 	a.GET("/projects/:id/usage", projectH.GetUsage)
 	a.GET("/projects/:id/preemptions", projectH.GetPreemptions)
 	a.GET("/projects/:id/queue", projectH.GetQueue)
+	// On-demand permission reconciliation (forensic audit, production-
+	// readiness round) — repairs Postgres/Redis drift immediately, in
+	// addition to the periodic background sweep started above.
+	a.POST("/system/reconcile-permissions", reconcileH.ReconcileNow)
+	// Project-level Public-model authorization (migration 058) — narrows the
+	// project's team's model access (Option A); see internal/policy/engine.go.
+	a.GET("/projects/:id/models", projectH.ListProjectModels)
+	a.POST("/projects/:id/models", projectH.AddProjectModelPermission)
+	a.DELETE("/projects/:id/models/:model", projectH.RemoveProjectModelPermission)
 	// Project policy, quota and usage analytics (migration 023)
 	a.GET("/projects/:id/policy", ppH2.GetPolicy)
 	a.PUT("/projects/:id/policy", ppH2.UpdatePolicy)

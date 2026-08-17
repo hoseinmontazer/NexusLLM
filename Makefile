@@ -205,7 +205,9 @@ MIGRATIONS := \
     054_billing_core_tables.sql \
     055_billing_hardening.sql \
     056_usage_events_idempotency.sql \
-    057_runtime_replica_status_lifecycle_guard.sql
+    057_runtime_replica_status_lifecycle_guard.sql \
+    058_project_model_permissions.sql \
+    059_model_permission_scopes.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

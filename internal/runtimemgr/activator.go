@@ -200,16 +200,39 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 		}
 		// Registry stale — fall through to wait.
 
-	case StateUnhealthy, StateDraining:
-		// Rolling replacement is in progress.
-		// Don't spawn another container — the reconciler is already handling it.
-		// Just wait for the replacement to become READY.
-		a.log.Info("model runtime is unhealthy/draining — rolling replacement in progress, waiting",
+	case StateDraining:
+		// Rolling replacement is in progress (always_on models only — the HA
+		// reconciler owns this transition and only ever touches always_on
+		// runtimes). Don't spawn another container — just wait for the
+		// replacement to become READY.
+		a.log.Info("model runtime is draining — rolling replacement in progress, waiting",
 			zap.String("model", modelName),
-			zap.String("state", string(state)),
 		)
 		// Fall through to waitForReady — it will pick up the replacement replica
 		// once the reconciler promotes it to 'ready'.
+
+	case StateUnhealthy:
+		// The HA reconciler's rolling-replacement path only manages
+		// workload_policy='always_on' models (it does unconstrained
+		// free-placement across nodes, which is wrong for a lazy_load model
+		// whose files may only exist on one specific node — see
+		// stepUnhealthyReplicas). For an always_on model, defer to it and
+		// just wait. For a lazy_load model, nothing else will ever retry
+		// this, so re-enqueue directly here — loadConfig above already
+		// resolved the correct (potentially pinned) node.
+		if cfg.WorkloadPolicy == "always_on" {
+			a.log.Info("model runtime is unhealthy — rolling replacement in progress, waiting",
+				zap.String("model", modelName),
+			)
+			// Fall through to waitForReady.
+		} else {
+			a.log.Warn("lazy_load model runtime is unhealthy — re-enqueueing directly (reconciler does not manage lazy_load models)",
+				zap.String("model", modelName),
+			)
+			if err := a.enqueueStartModel(ctx, cfg); err != nil && err != replicaguard.ErrAtCapacity {
+				return nil, err
+			}
+		}
 
 	case StateCreated, StateLoadingModel, StateStarting, StateValidating, StateDownloading, StateWaitingReady:
 		// A START_MODEL task is already in flight.

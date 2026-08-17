@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy, type CatalogProvider, type ProjectProviderAccess } from '@/lib/api'
+import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy, type CatalogProvider, type ProjectProviderAccess, type Model } from '@/lib/api'
 import { PriorityBadge, PriorityBar, EffectivePriorityCard, weightLabel } from '@/components/projects/PriorityBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -14,7 +14,7 @@ import {
   ArrowLeft, Shield, Zap, Activity, AlertTriangle,
   Server, BarChart2, Clock, DollarSign, Layers, Gauge,
   Settings2, TrendingUp, Percent, Globe, CheckCircle2,
-  Loader2, Trash2, Plus,
+  Loader2, Trash2, Plus, ShieldCheck, Cpu, X,
 } from 'lucide-react'
 
 // ── Policy & Quota panel ──────────────────────────────────────────────────────
@@ -608,6 +608,187 @@ function RuntimesTable({ projectId }: { projectId: string }) {
   )
 }
 
+// ── Model Access panel (Public/managed models) ───────────────────────────────
+// Grants this PROJECT access to regular deployed models — narrower than, and
+// independent from, Provider Access above (which governs external catalog
+// models only). Effective access is team AND project (Option A): a model
+// must be granted to both this project's team AND this project to be usable
+// by a token scoped to this project. A project with no grants here inherits
+// its team's full model access unchanged until the first grant/revoke here.
+function ProjectModelAccessPanel({ projectId, teamId }: { projectId: string; teamId?: string | null }) {
+  const qc = useQueryClient()
+  const [modelInput, setModelInput] = useState('')
+
+  const { data: modelsData, isLoading } = useQuery({
+    queryKey: ['project-models', projectId],
+    queryFn: () => api.projects.listModels(projectId),
+  })
+  const { data: teamModelsData } = useQuery({
+    queryKey: ['team-models', teamId],
+    queryFn: () => api.teams.listModels(teamId as string),
+    enabled: !!teamId,
+  })
+  const { data: allModels } = useQuery({
+    queryKey: ['models'],
+    queryFn: () => api.models.list(),
+  })
+
+  const allModelList: Model[] = allModels?.data ?? []
+  const grantedModels = modelsData?.models ?? []
+  const grantedNames = new Set(grantedModels.map(g => g.name))
+  const unsyncedCount = grantedModels.filter(g => !g.synced).length
+  const teamGrantedModels = new Set(teamModelsData?.models ?? [])
+  const isConfigured = grantedModels.length > 0
+  const ungranted = allModelList.filter(m => !grantedNames.has(m.name))
+
+  // Failed mutations must still invalidate/refetch — otherwise a grant that
+  // partially applied (DB committed, Redis sync failed) leaves the cached
+  // list stale until some unrelated refetch happens, hiding exactly the
+  // divergence the `synced` flag exists to surface.
+  const grant = useMutation({
+    mutationFn: (name: string) => api.projects.addModel(projectId, name),
+    onSuccess: (_, name) => {
+      toast({ title: 'Access granted', description: `Project → ${name}` })
+      qc.invalidateQueries({ queryKey: ['project-models', projectId] })
+      setModelInput('')
+    },
+    onError: (e: any) => {
+      toast({ title: 'Grant failed', description: e.message, variant: 'destructive' })
+      qc.invalidateQueries({ queryKey: ['project-models', projectId] })
+    },
+  })
+
+  const revoke = useMutation({
+    mutationFn: (name: string) => api.projects.removeModel(projectId, name),
+    onSuccess: (_, name) => {
+      toast({ title: 'Access revoked', description: `Project ✕ ${name}` })
+      qc.invalidateQueries({ queryKey: ['project-models', projectId] })
+    },
+    onError: (e: any) => {
+      toast({ title: 'Revoke failed', description: e.message, variant: 'destructive' })
+      qc.invalidateQueries({ queryKey: ['project-models', projectId] })
+    },
+  })
+
+  return (
+    <Card>
+      <CardHeader><CardTitle className="text-base flex items-center gap-2">
+        <ShieldCheck className="w-4 h-4" />Model Access
+      </CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Narrows this project's team model access — a model must be granted to both
+          the team <em>and</em> this project to be usable by a token scoped to this project.
+        </p>
+
+        {isLoading ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : !isConfigured ? (
+          <p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded px-2 py-1.5">
+            No project-specific grants yet — this project currently inherits its team's
+            full model access unchanged. Granting a model below switches this project
+            into restricted mode.
+          </p>
+        ) : (
+          <>
+            {unsyncedCount > 0 && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+                ⚠️ {unsyncedCount} grant{unsyncedCount > 1 ? 's' : ''} not yet active — recorded but not
+                confirmed in the live enforcement cache. This self-heals within a few minutes, or trigger
+                an immediate repair via <code>POST /admin/v1/system/reconcile-permissions</code>.
+              </p>
+            )}
+            <div className="flex flex-wrap gap-1.5">
+              {grantedModels.map(g => (
+                <span key={g.name}
+                  className={`inline-flex items-center gap-1 text-xs border rounded-full pl-2 pr-1 py-0.5 ${
+                    g.synced
+                      ? 'bg-green-50 text-green-700 border-green-200'
+                      : 'bg-amber-50 text-amber-700 border-amber-200'
+                  }`}
+                  title={g.synced ? undefined : 'Recorded but not yet confirmed in the live enforcement cache'}
+                >
+                  <Cpu className="w-2.5 h-2.5 shrink-0" />
+                  {g.name}
+                  {!g.synced && <span className="text-[10px]">⏳</span>}
+                  <button
+                    onClick={() => revoke.mutate(g.name)}
+                    disabled={revoke.isPending}
+                    className="ml-0.5 hover:text-red-600 transition-colors rounded-full p-0.5 hover:bg-red-50"
+                    title={`Revoke ${g.name}`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div className="flex gap-2">
+          <div className="flex-1 relative">
+            <Input
+              value={modelInput}
+              onChange={e => setModelInput(e.target.value)}
+              placeholder="model name…"
+              className="text-sm h-8"
+              list={`project-model-list-${projectId}`}
+            />
+            <datalist id={`project-model-list-${projectId}`}>
+              {ungranted.map(m => <option key={m.name} value={m.name} />)}
+            </datalist>
+          </div>
+          <Button
+            size="sm"
+            className="h-8 shrink-0"
+            disabled={!modelInput.trim() || grant.isPending}
+            onClick={() => modelInput.trim() && grant.mutate(modelInput.trim())}
+          >
+            <Plus className="w-3.5 h-3.5 mr-1" />Grant
+          </Button>
+        </div>
+
+        {ungranted.length > 0 && teamId && (
+          <p className="text-[10px] text-muted-foreground flex items-center gap-2">
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-gray-300 border border-gray-400 inline-block" />
+              gray = not yet granted to this project's team — would be a no-op
+            </span>
+          </p>
+        )}
+        {ungranted.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {ungranted.slice(0, 12).map(m => (
+              <button
+                key={m.name}
+                onClick={() => grant.mutate(m.name)}
+                disabled={grant.isPending}
+                className={`text-[10px] px-2 py-0.5 rounded border border-dashed transition-colors ${
+                  teamId && !teamGrantedModels.has(m.name)
+                    ? 'border-gray-200 text-gray-400 hover:border-amber-400 hover:text-amber-700 hover:bg-amber-50'
+                    : 'border-gray-300 text-muted-foreground hover:border-blue-400 hover:text-blue-700 hover:bg-blue-50'
+                }`}
+                title={
+                  teamId && !teamGrantedModels.has(m.name)
+                    ? 'Not yet granted to this project\'s team — granting here alone will not be enough'
+                    : m.display_name !== m.name ? m.display_name : undefined
+                }
+              >
+                + {m.name}
+              </button>
+            ))}
+            {ungranted.length > 12 && (
+              <span className="text-[10px] text-muted-foreground self-center">
+                +{ungranted.length - 12} more — type in the field above
+              </span>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 // ── Provider Access panel (catalog / hybrid mode) ────────────────────────────
 // Lets admins grant this project access to one or more catalog/hybrid-mode
 // providers. Each grant optionally restricts callable models via glob prefixes.
@@ -1031,7 +1212,7 @@ export default function ProjectDetailPage() {
   const params  = useParams<{ id: string }>()
   const router  = useRouter()
   const id      = params.id
-  const [activeTab, setActiveTab] = useState<'usage' | 'policy' | 'config' | 'runtimes' | 'providers'>('usage')
+  const [activeTab, setActiveTab] = useState<'usage' | 'policy' | 'config' | 'runtimes' | 'providers' | 'models'>('usage')
 
   // ── All hooks must be declared before any conditional returns ──────────────
   const { data: project, isLoading, error } = useQuery({
@@ -1146,6 +1327,7 @@ export default function ProjectDetailPage() {
             { key: 'config',    label: 'Configuration' },
             { key: 'runtimes',  label: 'Runtimes & Queue' },
             { key: 'providers', label: 'Provider Access' },
+            { key: 'models',    label: 'Model Access' },
           ] as const).map(t => (
             <button key={t.key}
               onClick={() => setActiveTab(t.key)}
@@ -1226,6 +1408,7 @@ export default function ProjectDetailPage() {
         )}
 
         {activeTab === 'providers' && <ProviderAccessPanel projectId={id} />}
+        {activeTab === 'models' && <ProjectModelAccessPanel projectId={id} teamId={project.team_id} />}
       </div>
     </div>
   )

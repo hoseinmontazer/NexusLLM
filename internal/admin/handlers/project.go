@@ -12,17 +12,21 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/project"
+	"github.com/redis/go-redis/v9"
 )
 
 // ProjectHandler handles all project admin operations.
 type ProjectHandler struct {
-	db *sqlx.DB
+	db     *sqlx.DB
+	rdb    *redis.Client
+	engine *policy.Engine
 }
 
 // NewProjectHandler constructs a ProjectHandler.
-func NewProjectHandler(db *sqlx.DB) *ProjectHandler {
-	return &ProjectHandler{db: db}
+func NewProjectHandler(db *sqlx.DB, rdb *redis.Client, engine *policy.Engine) *ProjectHandler {
+	return &ProjectHandler{db: db, rdb: rdb, engine: engine}
 }
 
 // ─── Create ──────────────────────────────────────────────────────────────────

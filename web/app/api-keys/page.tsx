@@ -26,6 +26,35 @@ interface ApiKeyRow {
   project_priority_weight?: number
 }
 
+// Shows whether a key's effective model access is currently narrowed by its
+// project (restricted mode) or inherits the team's full access unchanged
+// (passthrough — either no project scope at all, or a project that has
+// never been given an explicit model grant). See internal/policy/engine.go
+// Evaluate's Option A semantics.
+function ModelAccessModeBadge({ teamId, projectId }: { teamId: string; projectId?: string }) {
+  const { data: teamModels } = useQuery({
+    queryKey: ['team-models', teamId],
+    queryFn: () => api.teams.listModels(teamId),
+    enabled: !projectId, // only needed for the no-project case
+  })
+  const { data: projectModels, isLoading } = useQuery({
+    queryKey: ['project-models', projectId],
+    queryFn: () => api.projects.listModels(projectId as string),
+    enabled: !!projectId,
+  })
+
+  if (!projectId) {
+    const count = teamModels?.models?.length ?? 0
+    return <span className="text-xs text-muted-foreground">Team access ({count})</span>
+  }
+  if (isLoading) return <span className="text-xs text-muted-foreground">…</span>
+  const grants = projectModels?.models ?? []
+  if (grants.length === 0) {
+    return <span className="text-xs text-blue-700" title="This project has no model-specific grants yet">Team access (passthrough)</span>
+  }
+  return <span className="text-xs text-green-700" title={grants.map(g => g.name).join(', ')}>Restricted ({grants.length})</span>
+}
+
 export default function ApiKeysPage() {
   const qc = useQueryClient()
 
@@ -94,6 +123,25 @@ export default function ApiKeysPage() {
   const projectList       = projectsData?.data ?? []
   const keyList: ApiKeyRow[] = (keys?.data ?? []) as ApiKeyRow[]
   const selectedProjectObj  = projectList.find(p => p.id === selectedProject)
+
+  // What models will the about-to-be-created key actually be able to call?
+  // Effective access is team AND project (Option A) — see
+  // internal/policy/engine.go. A project with zero grants inherits its
+  // team's full access unchanged (legacy passthrough); the FIRST grant/
+  // revoke switches it into restricted mode.
+  const { data: teamModelsForKey } = useQuery({
+    queryKey: ['team-models', selectedTeam],
+    queryFn: () => api.teams.listModels(selectedTeam),
+    enabled: !!selectedTeam,
+  })
+  const { data: projectModelsForKey } = useQuery({
+    queryKey: ['project-models', selectedProject],
+    queryFn: () => api.projects.listModels(selectedProject),
+    enabled: !!selectedProject,
+  })
+  const teamModelCount = teamModelsForKey?.models?.length ?? 0
+  const projectGrants = projectModelsForKey?.models ?? []
+  const projectIsRestricted = projectGrants.length > 0
 
   const canCreate = !!keyName && !!selectedTeam
 
@@ -200,6 +248,23 @@ export default function ApiKeysPage() {
                     Without a project scope, requests will use team-level defaults. Assign to a project for precise scheduling.
                   </p>
                 )}
+
+                {/* Model access this key will actually have — see this
+                    project's "Model Access" tab to grant/revoke. */}
+                {selectedTeam && (
+                  <p className={`text-xs mt-2 rounded px-2 py-1.5 border ${
+                    selectedProject && projectIsRestricted
+                      ? 'bg-green-50 text-green-800 border-green-200'
+                      : 'bg-blue-50 text-blue-800 border-blue-200'
+                  }`}>
+                    {selectedProject
+                      ? projectIsRestricted
+                        ? <>Model access: restricted to <strong>{projectGrants.length}</strong> model{projectGrants.length === 1 ? '' : 's'} explicitly granted to this project ({projectGrants.map(g => g.name).join(', ') || '—'}).</>
+                        : <>Model access: this project has no model-specific grants yet, so this key will inherit the <strong>full team access</strong> ({teamModelCount} model{teamModelCount === 1 ? '' : 's'}) unchanged. Use the project&apos;s &quot;Model Access&quot; tab to restrict it.</>
+                      : <>Model access: this key will use the <strong>team&apos;s full access</strong> ({teamModelCount} model{teamModelCount === 1 ? '' : 's'}) — select a project above to potentially narrow it.</>
+                    }
+                  </p>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -248,6 +313,7 @@ export default function ApiKeysPage() {
                         <th className="text-left pb-2 font-medium">Key Name</th>
                         <th className="text-left pb-2 font-medium">Prefix</th>
                         <th className="text-left pb-2 font-medium">Project Scope</th>
+                        <th className="text-left pb-2 font-medium">Model Access</th>
                         <th className="text-left pb-2 font-medium">Priority</th>
                         <th className="text-left pb-2 font-medium">Last Used</th>
                         <th className="text-left pb-2 font-medium">Expires</th>
@@ -269,6 +335,9 @@ export default function ApiKeysPage() {
                             ) : (
                               <span className="text-xs text-muted-foreground italic">Team default</span>
                             )}
+                          </td>
+                          <td className="py-2">
+                            <ModelAccessModeBadge teamId={k.team_id} projectId={k.project_id} />
                           </td>
                           <td className="py-2">
                             {k.project_priority_weight != null && k.project_priority_weight > 0 ? (

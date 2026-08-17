@@ -888,9 +888,19 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 		FROM agent_runtimes ar
 		JOIN models m ON m.id = ar.model_id
 		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
+		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
 		WHERE ar.state = 'unhealthy'
 		  AND m.enabled = TRUE
-		  AND COALESCE(m.lifecycle,'active') != 'deleted'`)
+		  AND COALESCE(m.lifecycle,'active') != 'deleted'
+		  -- lazy_load models are managed by the cold-start activator, which
+		  -- correctly respects model_endpoints.node_id pinning. This
+		  -- reconciler path does unconstrained free-placement (selectNode has
+		  -- no concept of "this model's files only exist on one node") — for
+		  -- a node-local GGUF deployment that picks the wrong node and fails
+		  -- instantly. loadReplicaStatuses (the sibling under-replication
+		  -- path) already excludes lazy_load for the same reason (see its own
+		  -- comment); this path never had the matching exclusion.
+		  AND COALESCE(mrc.workload_policy,'lazy_load') = 'always_on'`)
 
 	for _, row := range rows {
 		r.handleUnhealthyReplica(ctx, row.ID, row.ModelID, row.ModelName,
