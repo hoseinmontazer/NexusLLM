@@ -5,12 +5,21 @@
 
 # ── Stage 1: install dependencies ────────────────────────────────────────────
 FROM node:20-alpine AS deps
+# Next.js's SWC compiler ships a native binary; on Alpine (musl libc) npm can
+# still resolve the glibc-linked @next/swc-linux-x64-gnu variant instead of
+# the musl one, which then fails to load at build time with "Error loading
+# shared library ld-linux-x86-64.so.2: No such file or directory". This
+# compat shim is the standard fix (same as Next.js's own official Docker
+# example) — it doesn't change which binary npm picks, it just makes the
+# glibc-linked one loadable on musl.
+RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --legacy-peer-deps
 
 # ── Stage 2: build the Next.js app ───────────────────────────────────────────
 FROM node:20-alpine AS builder
+RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
 COPY --from=deps /app/node_modules ./node_modules
