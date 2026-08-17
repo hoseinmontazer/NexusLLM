@@ -193,6 +193,72 @@ func TestBuildDockerArgs_TEIExistingLocalPath(t *testing.T) {
 	}
 }
 
+// TestBuildDockerArgs_VLLMGPU_SetsShmSize is the regression test for the
+// gpt-oss-120b-vllm multi-GPU startup crash: "RuntimeError: Insufficient
+// space in /dev/shm: 160 MiB required, 64 MiB free". vLLM's tensor-parallel
+// worker subprocesses communicate over POSIX shared memory, and Docker's
+// default 64MB /dev/shm is nowhere near enough — vLLM's own docs recommend
+// enlarging it (or --ipc=host) for GPU deployments.
+func TestBuildDockerArgs_VLLMGPU_SetsShmSize(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName:    "nexus-gpt-oss-120b-r0-abc123",
+		Backend:        "vllm",
+		Image:          "vllm/vllm-openai:latest",
+		BindPort:       8200,
+		TensorParallel: 2,
+		ExecutionMode:  "gpu",
+		GPUDevices:     []int{0, 1},
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if !hasFlagValue(args, "--shm-size", "4g") {
+		t.Fatalf("expected --shm-size to be set for a GPU vLLM deploy, got args: %v", args)
+	}
+}
+
+// TestBuildDockerArgs_VLLMCPU_NoShmSize proves the --shm-size override is
+// scoped to GPU deployments only — a CPU-mode vLLM deploy (execution_mode
+// explicitly "cpu") should not get it.
+func TestBuildDockerArgs_VLLMCPU_NoShmSize(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName:   "nexus-vllm-cpu-r0-abc123",
+		Backend:       "vllm",
+		Image:         "vllm/vllm-openai:latest",
+		BindPort:      8200,
+		ExecutionMode: "cpu",
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if hasFlag(args, "--shm-size") {
+		t.Fatalf("expected no --shm-size for a CPU-mode vLLM deploy, got args: %v", args)
+	}
+}
+
+// TestBuildDockerArgs_LlamaCppGPU_NoShmSize proves the --shm-size override is
+// scoped to vllm/tgi — llamacpp does not use multiprocess tensor-parallel
+// workers the same way and has never hit this /dev/shm limit in practice.
+func TestBuildDockerArgs_LlamaCppGPU_NoShmSize(t *testing.T) {
+	e := &Executor{log: zap.NewNop()}
+	p := startModelPayload{
+		RuntimeName:   "nexus-llamacpp-r0-abc123",
+		Backend:       "llamacpp",
+		Image:         "ghcr.io/ggerganov/llama.cpp:server",
+		BindPort:      8300,
+		ExecutionMode: "gpu",
+		GPUDevices:    []int{0},
+	}
+
+	args := e.buildDockerArgs(p)
+
+	if hasFlag(args, "--shm-size") {
+		t.Fatalf("expected no --shm-size for llamacpp, got args: %v", args)
+	}
+}
+
 // TestResolveModelsVolumeMount_NoLocalPathReturnsEmpty proves the resolver
 // correctly no-ops for a plain HF-repo deployment (nothing to mount).
 func TestResolveModelsVolumeMount_NoLocalPathReturnsEmpty(t *testing.T) {

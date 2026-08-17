@@ -1532,6 +1532,18 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		args = append(args, "--runtime", "runc")
 	}
 
+	// vLLM (and TGI) fork worker subprocesses that communicate over POSIX
+	// shared memory, sized proportionally to tensor-parallel degree and
+	// model size. Docker's default /dev/shm is only 64MB, which is nowhere
+	// near enough for multi-GPU tensor-parallel serving — vLLM's own docs
+	// recommend enlarging it (or using --ipc=host) for exactly this reason.
+	// Without this, startup crashes with "Insufficient space in /dev/shm"
+	// once tensor_parallel_size > 1, and Docker's default restart policy
+	// silently retries on top of it rather than surfacing a clear failure.
+	if wantsGPU && (p.Backend == "vllm" || p.Backend == "tgi") {
+		args = append(args, "--shm-size", "4g")
+	}
+
 	// CPU affinity.
 	if p.CPUSetCPUs != "" {
 		args = append(args, "--cpuset-cpus", p.CPUSetCPUs)
