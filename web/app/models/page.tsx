@@ -242,6 +242,7 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
   const [hfRepo, setHfRepo] = useState('')
   const [hfFile, setHfFile] = useState('')
   const [localPath, setLocalPath] = useState('')
+  const [modelsVolume, setModelsVolume] = useState('')
   const [ctxSize, setCtxSize] = useState('4096')
   const [gpuLayers, setGpuLayers] = useState('-1')
   const [cpuLimit, setCpuLimit] = useState('')
@@ -347,12 +348,19 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
         ...(isLLamaCpp ? {
           llamacpp_hf_repo:      hfRepo || undefined,
           llamacpp_hf_file:      hfFile || undefined,
-          llamacpp_model_path:   localPath || undefined,
           llamacpp_ctx_size:     parseInt(ctxSize) || 4096,
           llamacpp_n_gpu_layers: parseInt(gpuLayers) ?? -1,
           supports_thinking:     supportsThinking,
           thinking_enabled:      supportsThinking ? thinkingEnabled : false,
           min_thinking_tokens:   supportsThinking ? 500 : undefined,
+        } : {}),
+        // Existing local model path — backend-agnostic (vllm, tei, llamacpp
+        // all resolve this the same way, see internal/nodeagent's
+        // resolveModelsVolumeMount). Sent whenever a local path is set,
+        // regardless of which backend was chosen above.
+        ...(localPath ? {
+          llamacpp_model_path:   localPath,
+          llamacpp_models_volume: modelsVolume || undefined,
         } : {}),
         // Generic extra args / env (STT, TTS, OCR, Embedding, etc.)
         ...(isGeneric && extraArgs.trim() ? {
@@ -511,6 +519,16 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
                   placeholder="/models/model.gguf" className="mt-1" />
               </div>
             </div>
+            {localPath && (
+              <div>
+                <Label>Models volume <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                <Input value={modelsVolume} onChange={e => setModelsVolume(e.target.value)}
+                  placeholder="nexus_models" className="mt-1 font-mono text-xs" />
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Docker volume that already contains the path above. Defaults to <code>nexus_models</code> if left blank.
+                </p>
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-3 gap-3">
             <div>
@@ -572,10 +590,32 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
               placeholder={VLLM_IMAGE} className="mt-1 font-mono text-xs" />
             <p className="text-xs text-muted-foreground mt-0.5">Default: <code>{VLLM_IMAGE}</code></p>
           </div>
-          <div>
-            <Label>HuggingFace model ID *</Label>
-            <Input value={hfModelId} onChange={e => setHfModelId(e.target.value)}
-              placeholder="sentence-transformers/all-MiniLM-L6-v2" className="mt-1" />
+          <div className="rounded-md border p-3 space-y-3">
+            <p className="text-xs font-medium text-muted-foreground">Model source — HF download <span className="font-normal">(or use existing local path below)</span></p>
+            <div>
+              <Label>HuggingFace model ID</Label>
+              <Input value={hfModelId} onChange={e => setHfModelId(e.target.value)}
+                placeholder="meta-llama/Meta-Llama-3-8B-Instruct" className="mt-1" />
+              <p className="text-xs text-muted-foreground mt-0.5">Downloaded by vLLM itself at container startup. Leave blank if using a local path.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label>Local model path</Label>
+                <Input value={localPath} onChange={e => setLocalPath(e.target.value)}
+                  placeholder="/models/gpt-oss-120b-vllm" className="mt-1 font-mono text-xs" />
+                <p className="text-xs text-muted-foreground mt-0.5">Existing directory already mounted in the volume — no download.</p>
+              </div>
+              {localPath && (
+                <div>
+                  <Label>Models volume <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                  <Input value={modelsVolume} onChange={e => setModelsVolume(e.target.value)}
+                    placeholder="nexus_models" className="mt-1 font-mono text-xs" />
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Docker volume containing the path above. Defaults to <code>nexus_models</code> if left blank.
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -889,10 +929,10 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
               <span className="font-mono text-xs">{hfRepo} / {hfFile || '*Q4_K_M.gguf'}</span>
             </div>
           )}
-          {isLLamaCpp && localPath && (
+          {localPath && (
             <div className="px-4 py-3 flex justify-between">
               <span className="text-muted-foreground">Local path</span>
-              <span className="font-mono text-xs">{localPath}</span>
+              <span className="font-mono text-xs">{localPath} <span className="text-muted-foreground">({modelsVolume || 'nexus_models'})</span></span>
             </div>
           )}
           {isLLamaCpp && supportsThinking && (
