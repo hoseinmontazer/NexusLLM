@@ -362,8 +362,12 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
           llamacpp_model_path:   localPath,
           llamacpp_models_volume: modelsVolume || undefined,
         } : {}),
-        // Generic extra args / env (STT, TTS, OCR, Embedding, etc.)
-        ...(isGeneric && extraArgs.trim() ? {
+        // Extra args / env — every backend supports these. Both launch paths
+        // (internal/controller/docker_driver.go buildVLLMArgs and
+        // internal/nodeagent/executor.go) end with append(args, ExtraArgs...),
+        // and neither has a structured field for backend flags such as vLLM's
+        // --enable-auto-tool-choice, so this is the only way to set them.
+        ...(extraArgs.trim() ? {
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
         } : {}),
         ...(Object.keys(envVars).length > 0 ? { env: envVars } : {}),
@@ -681,12 +685,6 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
             </div>
           </div>
           <div>
-            <Label>Extra args <span className="text-muted-foreground font-normal">(space-separated, appended to entrypoint)</span></Label>
-            <Input value={extraArgs} onChange={e => setExtraArgs(e.target.value)}
-              placeholder="--model whisper-large-v3 --language en"
-              className="mt-1 font-mono text-xs" />
-          </div>
-          <div>
             <Label>HF token <span className="text-muted-foreground font-normal">(gated models)</span></Label>
             <Input type="password" value={hfToken} onChange={e => setHfToken(e.target.value)} placeholder="hf_…" className="mt-1" />
           </div>
@@ -699,6 +697,26 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
           </div>
         </div>
       )}
+      {/* Extra args — appended verbatim to the container command for EVERY
+          backend, not just the generic ones. vLLM's tool-calling flags have no
+          structured field, so this is where they go. */}
+      <div>
+        <Label>Extra args <span className="text-muted-foreground font-normal">(space-separated, appended to the container command)</span></Label>
+        <Input value={extraArgs} onChange={e => setExtraArgs(e.target.value)}
+          placeholder={
+            isVllm ? '--enable-auto-tool-choice --tool-call-parser hermes'
+              : isLLamaCpp ? '--no-warmup --rope-scale 2'
+              : '--model whisper-large-v3 --language en'
+          }
+          className="mt-1 font-mono text-xs" />
+        {isVllm && (
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Tool calling requires <code className="bg-gray-100 px-1 rounded">--enable-auto-tool-choice</code> and{' '}
+            <code className="bg-gray-100 px-1 rounded">--tool-call-parser &lt;parser&gt;</code>. Without them vLLM rejects{' '}
+            <code className="bg-gray-100 px-1 rounded">tool_choice: &quot;auto&quot;</code> with a 400.
+          </p>
+        )}
+      </div>
       {/* Capabilities — which API endpoints this model supports.
           Pre-selected from the model type; operator can adjust before deploying.
           These are the exact identifiers stored in models.capabilities and enforced by the gateway. */}

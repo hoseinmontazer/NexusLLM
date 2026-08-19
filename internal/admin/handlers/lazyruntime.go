@@ -50,7 +50,15 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 
 		// GPU placement — which GPU device indices to assign to this model.
 		// e.g. [0] for first GPU, [0,1] for two GPUs, [] for CPU-only.
-		GPUDevices []int `json:"gpu_devices"`
+		//
+		// Pointer-typed so an omitted key preserves the stored value. This used
+		// to be a plain []int written straight to gpu_devices = EXCLUDED.*, so
+		// any PUT that didn't mention GPUs (e.g. saving only extra_args from the
+		// model detail page) silently blanked the assignment. On the next
+		// container start buildDockerArgs then saw len(GPUDevices)==0, omitted
+		// --gpus, and the GPU model crash-looped with "Failed to infer device
+		// type" / "No CUDA runtime is found".
+		GPUDevices *[]int `json:"gpu_devices"`
 
 		// Node assignment — which node this model should run on.
 		// If set, overrides the node_id inferred from model_endpoints.
@@ -67,14 +75,15 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		//   ["-thk","0"]           — disable Qwen3 thinking mode
 		//   ["--rope-scale","2"]   — extend context via RoPE scaling
 		//   ["--no-warmup"]        — skip warmup inference on startup
-		ExtraArgs []string `json:"extra_args"`
+		// Pointer-typed for the same preserve-on-omit reason as GPUDevices.
+		ExtraArgs *[]string `json:"extra_args"`
 
 		// Env vars passed to the container at startup via -e KEY=VALUE.
 		// Useful for CPU-native services like faster-whisper:
 		//   {"WHISPER__MODEL":"Systran/faster-whisper-large-v3","UVICORN_PORT":"8100"}
 		// The agent always overrides PORT after port scanning, so use the
 		// service-specific var (e.g. UVICORN_PORT) to request a preferred port.
-		Env map[string]string `json:"env"`
+		Env *map[string]string `json:"env"`
 
 		// Idle behaviour (0 = use cluster default)
 		IdleTimeoutSecs *int `json:"idle_timeout_secs"`
@@ -84,28 +93,29 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		return
 	}
 
-	// Encode gpu_devices as JSON array for storage.
-	gpuDevicesJSON := "[]"
-	if len(input.GPUDevices) > 0 {
-		if b, err := json.Marshal(input.GPUDevices); err == nil {
-			gpuDevicesJSON = string(b)
+	// Encode the JSONB fields. nil (→ SQL NULL) means "caller omitted this key,
+	// keep whatever is stored"; the statement below COALESCEs NULL back to the
+	// existing row on conflict, and to the column default on insert. An
+	// explicitly-sent empty array/object still round-trips as [] / {}.
+	jsonbOrNil := func(v interface{}) interface{} {
+		if v == nil {
+			return nil
 		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return string(b)
 	}
-
-	// Encode extra_args as JSON array for storage.
-	extraArgsJSON := "[]"
-	if len(input.ExtraArgs) > 0 {
-		if b, err := json.Marshal(input.ExtraArgs); err == nil {
-			extraArgsJSON = string(b)
-		}
+	var gpuDevicesJSON, extraArgsJSON, envJSON interface{}
+	if input.GPUDevices != nil {
+		gpuDevicesJSON = jsonbOrNil(*input.GPUDevices)
 	}
-
-	// Encode env as JSON object for storage.
-	envJSON := "{}"
-	if len(input.Env) > 0 {
-		if b, err := json.Marshal(input.Env); err == nil {
-			envJSON = string(b)
-		}
+	if input.ExtraArgs != nil {
+		extraArgsJSON = jsonbOrNil(*input.ExtraArgs)
+	}
+	if input.Env != nil {
+		envJSON = jsonbOrNil(*input.Env)
 	}
 
 	// Upsert into model_runtime_configs.
@@ -119,8 +129,9 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		VALUES (gen_random_uuid(), $1,
 		        $2, $3, $4, $5,
 		        $6, $7, COALESCE($8, 0), $9, $10,
-		        $11::jsonb, $12::uuid,
-		        $13, $14, $15::jsonb, $16::jsonb, NOW())
+		        COALESCE($11::jsonb, '[]'::jsonb), $12::uuid,
+		        $13, COALESCE(NULLIF($14::text,''), 'auto'),
+		        COALESCE($15::jsonb, '[]'::jsonb), COALESCE($16::jsonb, '{}'::jsonb), NOW())
 		ON CONFLICT (model_id) DO UPDATE SET
 		  gguf_path         = COALESCE(EXCLUDED.gguf_path,         model_runtime_configs.gguf_path),
 		  hf_repo           = COALESCE(EXCLUDED.hf_repo,           model_runtime_configs.hf_repo),
@@ -131,19 +142,19 @@ func (h *LazyRuntimeHandler) SetLazyConfig(c *gin.Context) {
 		  cpu_threads       = COALESCE(EXCLUDED.cpu_threads,        model_runtime_configs.cpu_threads, 0),
 		  memory_limit      = EXCLUDED.memory_limit,
 		  models_volume     = EXCLUDED.models_volume,
-		  gpu_devices       = EXCLUDED.gpu_devices,
+		  gpu_devices       = COALESCE($11::jsonb, model_runtime_configs.gpu_devices),
 		  node_id           = COALESCE(EXCLUDED.node_id,           model_runtime_configs.node_id),
 		  idle_timeout_secs = EXCLUDED.idle_timeout_secs,
-		  execution_mode    = COALESCE(NULLIF(EXCLUDED.execution_mode,''), model_runtime_configs.execution_mode, 'auto'),
-		  extra_args        = EXCLUDED.extra_args,
-		  env               = EXCLUDED.env,
+		  execution_mode    = COALESCE(NULLIF($14::text,''), model_runtime_configs.execution_mode, 'auto'),
+		  extra_args        = COALESCE($15::jsonb, model_runtime_configs.extra_args),
+		  env               = COALESCE($16::jsonb, model_runtime_configs.env),
 		  updated_at        = NOW()`,
 		modelID,
 		nilableStr(input.GGUFPath), nilableStr(input.HFRepo), nilableStr(input.HFFile), nilableStr(input.HFToken),
 		input.CtxSize, input.NGPULayers, input.CPUThreads, nilableStr(input.MemLimit), nilableStr(input.Volume),
 		gpuDevicesJSON, nilableStr(input.NodeID),
 		input.IdleTimeoutSecs,
-		orDefault(input.ExecutionMode, "auto"),
+		nilableStr(input.ExecutionMode),
 		extraArgsJSON,
 		envJSON,
 	)

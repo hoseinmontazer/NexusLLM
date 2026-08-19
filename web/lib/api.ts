@@ -277,6 +277,8 @@ export interface LazyConfig {
   idle_timeout_secs?: number
   execution_mode?: string
   node_id?: string
+  gpu_devices?: number[] | null
+  env?: Record<string, string> | null
   extra_args?: string[] | null
   updated_at: string
 }

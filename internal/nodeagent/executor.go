@@ -1441,8 +1441,16 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		//      vars and only accept --port as a flag (Infinity, TEI-cpu, EasyOCR).
 		//      Only injected when BindPort > 0 and the operator has not already
 		//      supplied --port in ExtraArgs (to avoid duplicates).
+		//
+		//      Skipped for backends whose own case in the command switch below
+		//      already emits "--port <BindPort>" (vllm, tgi, tei). Injecting here
+		//      as well appended a SECOND identical --port after ExtraArgs, e.g.
+		//      "serve --model … --port 43169 … --port 43169". argparse takes the
+		//      last value so the duplicate was harmless, but it made deployed
+		//      command lines confusing to audit.
 		args = append(args, "--network", "host")
-		if p.BindPort > 0 {
+		emitsOwnPort := p.Backend == "vllm" || p.Backend == "tgi" || p.Backend == "tei"
+		if p.BindPort > 0 && !emitsOwnPort {
 			hasPortFlag := false
 			for _, a := range p.ExtraArgs {
 				if a == "--port" || a == "-p" || strings.HasPrefix(a, "--port=") {
