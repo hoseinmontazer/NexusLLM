@@ -1582,6 +1582,23 @@ func normalizeToolCallArguments(resp *models.ChatCompletionResponse) {
 // Always writes a 503 response to c and returns. The caller must return
 // immediately after this call.
 func (h *Handler) handleColdStart(c *gin.Context, modelName string) {
+	// ── Manually-deployed models ─────────────────────────────────────────────
+	// The operator owns the container of a model registered with
+	// deployment_mode='manual' (migration 061). There is nothing for NexusLLM
+	// to start: report the endpoint as unhealthy and let the operator bring the
+	// container up. Starting one here would either duplicate the operator's
+	// container on another port or, when the names collide, replace it.
+	if h.activator.IsManuallyDeployed(c.Request.Context(), modelName) {
+		h.log.Warn("request for manually-deployed model with no healthy endpoint",
+			zap.String("model", modelName),
+		)
+		abortErr(c, http.StatusServiceUnavailable, "manual_runtime_unhealthy",
+			fmt.Sprintf("model %q is deployed manually (deployment_mode=manual) and has no healthy endpoint — "+
+				"NexusLLM does not manage its container; start it on the host and it will be routable again "+
+				"as soon as the health check passes", modelName))
+		return
+	}
+
 	if h.startTracker != nil {
 		// Goroutine-dedup path: at most one background EnsureRunning per model.
 		if !h.startTracker.IsStarting(modelName) {

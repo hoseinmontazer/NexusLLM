@@ -76,8 +76,47 @@ func llamacppHealthStartPeriod(nGPULayers, ctxSize int) string {
 	}
 }
 
-// pruneExitedNexusContainers removes any stopped/exited containers whose
-// names start with "nexus-". These accumulate when:
+// operatorOwnedContainer reports whether a container with this name exists and
+// belongs to the operator rather than to NexusLLM, plus a short description of
+// what identified it for the log/error message.
+//
+// A container is NexusLLM's when it carries nexus.managed=true (stamped by
+// buildDockerArgs). It is positively identified as the operator's when it lacks
+// that label AND carries a marker of another orchestrator — today a
+// docker-compose project label, which is how these hosts are actually used
+// (`docker compose up` of a vLLM service). Anything else — no labels at all,
+// e.g. a container created by an older NexusLLM before the label existed — is
+// reported as not operator-owned, so existing recovery behavior is unchanged.
+func (e *Executor) operatorOwnedContainer(ctx context.Context, name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	out, err := exec.CommandContext(ctx, "docker", "inspect", name,
+		"--format", `{{index .Config.Labels "nexus.managed"}}|{{index .Config.Labels "com.docker.compose.project"}}`,
+	).Output()
+	if err != nil {
+		// No such container (the common case) or docker unreachable — nothing
+		// to protect either way.
+		return "", false
+	}
+	fields := strings.SplitN(strings.TrimSpace(string(out)), "|", 2)
+	nexusManaged := fields[0]
+	composeProject := ""
+	if len(fields) > 1 {
+		composeProject = fields[1]
+	}
+	if nexusManaged == "true" {
+		return "", false
+	}
+	if composeProject != "" && composeProject != "<no value>" {
+		return "docker compose project " + composeProject, true
+	}
+	return "", false
+}
+
+// pruneExitedNexusContainers removes stopped/exited containers that NexusLLM
+// itself created — those carrying the nexus.managed=true label. These
+// accumulate when:
 //   - The control plane retries a failed start (each retry does docker rm -f
 //     the current named container, but old containers from renamed/suffixed
 //     attempts or crashed runs linger in Exited state).
@@ -85,10 +124,21 @@ func llamacppHealthStartPeriod(nGPULayers, ctxSize int) string {
 //     control plane cleans it up.
 //
 // This is a best-effort cleanup — errors are logged but never fatal.
+//
+// The label filter is the safety boundary: operators run their own containers
+// on these hosts (a plain `docker compose up` of a vLLM image, often named
+// nexus-something because it serves a model registered in NexusLLM). A
+// name-prefix filter alone would delete those the moment they exited, which is
+// exactly what a manual deployment (models.deployment_mode='manual') asks
+// NexusLLM not to do. Containers created before the label existed are simply
+// skipped — leaving an exited container behind is harmless, deleting someone
+// else's is not.
 func (e *Executor) pruneExitedNexusContainers(ctx context.Context) {
-	// List all exited containers whose name starts with "nexus-".
+	// List exited containers that NexusLLM created (label) and that follow our
+	// naming convention (name) — both must hold.
 	out, err := exec.CommandContext(ctx, "docker", "ps", "-a",
 		"--filter", "status=exited",
+		"--filter", "label=nexus.managed=true",
 		"--filter", "name=nexus-",
 		"--format", "{{.ID}} {{.Names}}",
 	).Output()
@@ -945,6 +995,24 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 		}
 	}
 
+	// Never remove a container the operator deployed. A manually-deployed model
+	// (models.deployment_mode='manual') is normally never dispatched here at
+	// all, but a name collision — an operator's compose container occupying the
+	// name this runtime wants — would otherwise be resolved by destroying it.
+	// Fail the task instead and let the operator rename one of the two.
+	if owner, ok := e.operatorOwnedContainer(ctx, p.RuntimeName); ok {
+		e.log.Error("refusing to remove operator-owned container",
+			zap.String("name", p.RuntimeName),
+			zap.String("owner", owner),
+		)
+		return TaskResult{
+			Success: false, RuntimeID: p.RuntimeID, RuntimeState: "failed",
+			Error: fmt.Sprintf("container %q already exists and was not created by NexusLLM (%s) — "+
+				"refusing to remove it; rename that container or register the model with "+
+				"deployment_mode=manual so NexusLLM only routes to it", p.RuntimeName, owner),
+		}
+	}
+
 	// Remove any stale container with this name, then start fresh.
 	// This covers: first deploy, re-deploy, crash recovery, idle restart.
 	if out, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", p.RuntimeName).CombinedOutput(); rmErr != nil {
@@ -962,6 +1030,13 @@ func (e *Executor) startModel(ctx context.Context, task RemoteTask) TaskResult {
 	// (nexus-model-r0-abc123). Without this, both containers run simultaneously.
 	for _, staleName := range p.StaleContainerNames {
 		if staleName == "" || staleName == p.RuntimeName {
+			continue
+		}
+		if owner, ok := e.operatorOwnedContainer(ctx, staleName); ok {
+			e.log.Warn("skipping stale-container cleanup — container is operator-owned",
+				zap.String("stale_name", staleName),
+				zap.String("owner", owner),
+			)
 			continue
 		}
 		if out, rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", staleName).CombinedOutput(); rmErr != nil {
@@ -1390,6 +1465,18 @@ func (e *Executor) downloadFromHF(ctx context.Context, p *startModelPayload, hos
 
 func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 	args := []string{"run", "-d", "--name", p.RuntimeName, "--restart", "unless-stopped"}
+
+	// Ownership labels. Everything NexusLLM creates is stamped with
+	// nexus.managed=true; cleanup paths (pruneExitedNexusContainers,
+	// removeStaleContainer) act only on labelled containers, so a container an
+	// operator started themselves — even one named "nexus-*" — is never
+	// removed by the agent. Model/runtime labels make `docker ps --filter` and
+	// post-mortem inspection possible without a DB lookup.
+	args = append(args,
+		"--label", "nexus.managed=true",
+		"--label", "nexus.model="+p.ModelName,
+		"--label", "nexus.runtime_id="+p.RuntimeID,
+	)
 
 	switch p.Backend {
 	case "llamacpp":

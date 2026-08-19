@@ -65,6 +65,7 @@ type runtimeRow struct {
 	ModelID        string  `db:"model_id"`
 	ModelEnabled   bool    `db:"model_enabled"`
 	ModelLifecycle string  `db:"model_lifecycle"`
+	DeploymentMode string  `db:"deployment_mode"`
 }
 
 // loadRuntime fetches the best runtime row for an endpoint.
@@ -104,7 +105,8 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 			me.id::text                                           AS endpoint_id,
 			m.id::text                                            AS model_id,
 			m.enabled                                             AS model_enabled,
-			COALESCE(m.lifecycle,'active')                        AS model_lifecycle
+			COALESCE(m.lifecycle,'active')                        AS model_lifecycle,
+			COALESCE(m.deployment_mode,'managed')                 AS deployment_mode
 		FROM model_endpoints me
 		JOIN models m ON m.id = me.model_id
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = me.model_id
@@ -129,6 +131,20 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 	// model an admin had soft-deleted.
 	if !modelguard.Eligible(row.ModelEnabled, row.ModelLifecycle) {
 		c.JSON(http.StatusConflict, gin.H{"error": "model has been deleted or disabled — redeploy it instead of starting/restarting"})
+		return nil, false
+	}
+	// A manually-deployed model's container belongs to the operator (migration
+	// 061). Start would create a second container on another port — or, when
+	// the container names collide, replace the operator's container; Stop and
+	// Restart would tear down something NexusLLM cannot bring back. Refuse all
+	// of them here, the one place every lifecycle handler passes through.
+	if !modelguard.ManagedByNexus(row.DeploymentMode) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "model is registered with deployment_mode=manual — NexusLLM does not manage its container lifecycle; " +
+				"start/stop it on the host, or switch it to managed with PUT /admin/v1/models/:id/deployment-mode",
+			"deployment_mode": row.DeploymentMode,
+			"model":           row.ModelName,
+		})
 		return nil, false
 	}
 	if row.NodeID == "" {

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/controller"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/nodeaddr"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/project"
@@ -107,6 +108,14 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		HFToken        string   `json:"hf_token"`
 
 		StartNow *bool `json:"start_now"`
+
+		// DeploymentMode — who owns the container (migration 061).
+		//   "managed" (default) — NexusLLM starts/stops/recovers it
+		//   "manual"            — the operator already deployed it themselves
+		//                         (docker compose, systemd, another host); the
+		//                         model is registered and routed, but no
+		//                         container is ever started or stopped for it
+		DeploymentMode string `json:"deployment_mode"`
 
 		// Legacy auto-place fields (kept for backward compat)
 		AutoPlace      bool  `json:"auto_place"`
@@ -241,6 +250,28 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		startNow = *input.StartNow
 	}
 
+	// A manual deployment declares that the container already exists and is
+	// the operator's to manage: register and route it, but never dispatch a
+	// START_MODEL for it. host and port must point at the running container.
+	if input.DeploymentMode == "" {
+		input.DeploymentMode = modelguard.ModeManaged
+	}
+	if input.DeploymentMode != modelguard.ModeManaged && input.DeploymentMode != modelguard.ModeManual {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "deployment_mode must be 'managed' or 'manual'",
+		})
+		return
+	}
+	if input.DeploymentMode == modelguard.ModeManual {
+		if input.Host == "" || input.Port == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "deployment_mode=manual requires host and port of the already-running container",
+			})
+			return
+		}
+		startNow = false
+	}
+
 	// Use HF model ID as the served model name if provided, else use name
 	modelID := input.HFModelID
 	if modelID == "" {
@@ -297,16 +328,23 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type, service_type,
 		   max_context, max_output, enabled, tags, capabilities,
-		   supports_thinking, thinking_enabled, min_thinking_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11,$12,$13)`,
+		   supports_thinking, thinking_enabled, min_thinking_tokens,
+		   deployment_mode)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11,$12,$13,$14)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
 		capabilitiesJSON,
 		input.SupportsThinking, input.ThinkingEnabled, minThinkTok,
+		input.DeploymentMode,
 	)
 	if err != nil {
-		// May fail if migration 027 hasn't run — retry without thinking columns.
+		// May fail if migration 027 (thinking columns) or 061
+		// (deployment_mode) hasn't run — retry without the optional columns.
+		if input.DeploymentMode == modelguard.ModeManual {
+			h.log.Warn("deployment_mode could not be stored — model will be treated as NexusLLM-managed; apply migration 061",
+				zap.String("model", input.Name), zap.Error(err))
+		}
 		_, err = h.db.ExecContext(c.Request.Context(), `
 			INSERT INTO models
 			  (id, name, display_name, provider, backend_type, service_type,
@@ -711,12 +749,13 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	_ = h.registry.Reload(c.Request.Context())
 
 	resp := gin.H{
-		"model_id":    mID,
-		"model_name":  input.Name,
-		"endpoint_id": epID,
-		"host":        input.Host,
-		"port":        input.Port,
-		"started":     shouldStart && containerID != "",
+		"model_id":        mID,
+		"model_name":      input.Name,
+		"endpoint_id":     epID,
+		"host":            input.Host,
+		"port":            input.Port,
+		"deployment_mode": input.DeploymentMode,
+		"started":         shouldStart && containerID != "",
 		"status": func() string {
 			if shouldStart && containerID != "" {
 				return "loading"
@@ -729,6 +768,12 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 		"note": func() string {
 			if shouldStart && containerID != "" {
 				return ""
+			}
+			if input.DeploymentMode == modelguard.ModeManual {
+				return "Registered as a manual deployment — NexusLLM routes to " +
+					fmt.Sprintf("%s:%d", input.Host, input.Port) +
+					" and health-checks it, but never starts, stops or recreates its container. " +
+					"Bring the container up yourself; it becomes routable as soon as the health check passes."
 			}
 			if !shouldStart {
 				return "Model registered. Use POST /admin/v1/models/:id/start?endpoint_id=" + epID + " to start the container."
@@ -770,9 +815,23 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 		UpstreamAPIKey  string `json:"upstream_api_key"`
 		UpstreamBaseURL string `json:"upstream_base_url"`
 		UpstreamProxy   string `json:"upstream_proxy"`
+
+		// DeploymentMode — defaults to "manual" on this route: it registers a
+		// model that is already running somewhere NexusLLM did not put it, and
+		// this handler never creates a container or a runtime config. Pass
+		// "managed" only to hand the container lifecycle to NexusLLM after
+		// supplying a runtime config (PUT /admin/v1/models/:id/runtime-config).
+		DeploymentMode string `json:"deployment_mode"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.DeploymentMode == "" {
+		input.DeploymentMode = modelguard.ModeManual
+	}
+	if input.DeploymentMode != modelguard.ModeManaged && input.DeploymentMode != modelguard.ModeManual {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deployment_mode must be 'managed' or 'manual'"})
 		return
 	}
 	if input.MaxContext == 0 {
@@ -794,12 +853,13 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 	_, err := h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO models
 		  (id, name, display_name, provider, backend_type, service_type,
-		   max_context, max_output, enabled, tags, capabilities)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb)`,
+		   max_context, max_output, enabled, tags, capabilities, deployment_mode)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10::jsonb,$11)`,
 		mID, input.Name, input.DisplayName, input.Provider, input.BackendType, input.ServiceType,
 		input.MaxContext, input.MaxOutput,
 		tagsJSON(input.Tags),
 		capabilitiesJSON,
+		input.DeploymentMode,
 	)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "model name already exists: " + err.Error()})
@@ -832,12 +892,19 @@ func (h *RuntimeHandler) RegisterModel(c *gin.Context) {
 
 	_ = h.registry.Reload(c.Request.Context())
 	c.JSON(http.StatusCreated, gin.H{
-		"model_id":      mID,
-		"model_name":    input.Name,
-		"endpoint_id":   epID,
-		"capabilities":  capabilitiesJSON,
-		"upstream_auth": input.UpstreamAPIKey != "",
-		"note":          "registered as external model — NexusLLM will not manage its container lifecycle",
+		"model_id":        mID,
+		"model_name":      input.Name,
+		"endpoint_id":     epID,
+		"capabilities":    capabilitiesJSON,
+		"upstream_auth":   input.UpstreamAPIKey != "",
+		"deployment_mode": input.DeploymentMode,
+		"note": func() string {
+			if input.DeploymentMode == modelguard.ModeManual {
+				return "registered as a manual deployment — NexusLLM routes to it and health-checks it, " +
+					"but never starts, stops or recreates its container"
+			}
+			return "registered without a runtime config — add one before starting it through NexusLLM"
+		}(),
 	})
 }
 
@@ -1712,8 +1779,20 @@ func (h *RuntimeHandler) GetModelHealth(c *gin.Context) {
 	if rows == nil {
 		rows = make([]epRow, 0)
 	}
+	// deployment_mode tells the caller how to read an unhealthy endpoint: for a
+	// managed model NexusLLM will bring it back itself, for a manual one the
+	// operator has to start the container.
+	deploymentMode := modelguard.ModeManaged
+	_ = h.db.GetContext(c.Request.Context(), &deploymentMode,
+		`SELECT COALESCE(deployment_mode,'managed') FROM models WHERE id = $1`, modelID)
 	// Return 200 with empty endpoints list instead of 404
-	c.JSON(http.StatusOK, gin.H{"model_id": modelID, "endpoints": rows, "count": len(rows)})
+	c.JSON(http.StatusOK, gin.H{
+		"model_id":                   modelID,
+		"endpoints":                  rows,
+		"count":                      len(rows),
+		"deployment_mode":            deploymentMode,
+		"lifecycle_managed_by_nexus": modelguard.ManagedByNexus(deploymentMode),
+	})
 }
 
 func (h *RuntimeHandler) ListModels(c *gin.Context) {
@@ -1733,6 +1812,7 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		MaxOutput         int    `db:"max_output"          json:"max_output"`
 		Enabled           bool   `db:"enabled"             json:"enabled"`
 		Lifecycle         string `db:"lifecycle"           json:"lifecycle"`
+		DeploymentMode    string `db:"deployment_mode"     json:"deployment_mode"`
 		EndpointCnt       int    `db:"endpoint_cnt"        json:"endpoint_count"`
 		HealthyCnt        int    `db:"healthy_cnt"         json:"healthy_count"`
 		SupportsThinking  bool   `db:"supports_thinking"   json:"supports_thinking"`
@@ -1752,6 +1832,7 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		       COALESCE(m.service_type, 'CHAT') AS service_type,
 		       m.max_context, m.max_output, m.enabled,
 		       COALESCE(m.lifecycle,'active') AS lifecycle,
+		       COALESCE(m.deployment_mode,'managed') AS deployment_mode,
 		       COUNT(me.id) AS endpoint_cnt,
 		       COUNT(me.id) FILTER (WHERE me.health_status='healthy') AS healthy_cnt,
 		       COALESCE(m.supports_thinking, FALSE)  AS supports_thinking,
@@ -1780,6 +1861,87 @@ func (h *RuntimeHandler) ListModels(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
+}
+
+// SetDeploymentMode handles PUT /admin/v1/models/:id/deployment-mode
+//
+// Switches who owns the model's container (models.deployment_mode, migration
+// 061). This is the escape hatch for a model that was registered one way and
+// is really run the other way — typically a model NexusLLM was trying to
+// cold-start while the operator was already running the container themselves
+// with docker compose.
+//
+//	{"deployment_mode": "manual"}   — hands the container back to the operator:
+//	    no cold start, no idle eviction, no HA replacement, no preemption, and
+//	    admin start/stop/restart return 409. Health checks keep running, so a
+//	    container that is down simply shows as unhealthy.
+//	{"deployment_mode": "managed"}  — hands the container lifecycle to NexusLLM
+//	    again. Requires a runtime config (image + node) to be startable.
+//
+// Switching to manual deliberately leaves any runtime rows and the container
+// itself alone: NexusLLM stops managing the container, it does not stop it.
+// Stop it with the admin stop endpoint BEFORE switching if that is what you
+// want, otherwise NexusLLM keeps routing to whatever is listening there.
+func (h *RuntimeHandler) SetDeploymentMode(c *gin.Context) {
+	modelID := c.Param("id")
+	var input struct {
+		DeploymentMode string `json:"deployment_mode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.DeploymentMode != modelguard.ModeManaged && input.DeploymentMode != modelguard.ModeManual {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deployment_mode must be 'managed' or 'manual'"})
+		return
+	}
+
+	var modelName string
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`UPDATE models SET deployment_mode = $1, updated_at = NOW() WHERE id = $2 RETURNING name`,
+		input.DeploymentMode, modelID,
+	).Scan(&modelName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Count what is still running under NexusLLM's control, so the operator
+	// knows whether a container is still up after handing ownership over.
+	var liveRuntimes int
+	_ = h.db.GetContext(c.Request.Context(), &liveRuntimes, `
+		SELECT COUNT(*) FROM agent_runtimes
+		WHERE model_id = $1 AND state IN ('ready','active','warm','idle','loading_model','starting','pending')`,
+		modelID)
+
+	h.log.Info("model deployment mode changed",
+		zap.String("model", modelName),
+		zap.String("deployment_mode", input.DeploymentMode),
+		zap.Int("live_runtimes", liveRuntimes),
+	)
+
+	resp := gin.H{
+		"model_id":        modelID,
+		"model_name":      modelName,
+		"deployment_mode": input.DeploymentMode,
+	}
+	if input.DeploymentMode == modelguard.ModeManual {
+		resp["note"] = "NexusLLM no longer manages this container: no cold start, idle eviction, HA replacement " +
+			"or preemption. It still routes to the endpoint and health-checks it."
+		if liveRuntimes > 0 {
+			resp["warning"] = fmt.Sprintf(
+				"%d runtime(s) NexusLLM started for this model are still running — they are now unmanaged; "+
+					"stop them on the host if you did not mean to keep them", liveRuntimes)
+		}
+	} else {
+		resp["note"] = "NexusLLM manages this container again — it may be cold-started, idle-evicted and replaced. " +
+			"Make sure no container you started yourself is still bound to the endpoint's port."
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // SetThinkingMode handles PUT /admin/v1/models/:id/thinking

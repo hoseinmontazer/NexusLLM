@@ -172,6 +172,20 @@ function LifecycleBadge({ lifecycle }: { lifecycle: string }) {
   )
 }
 
+// Shown when the operator — not NexusLLM — owns the container (migration 061).
+// It explains why an unhealthy endpoint of this model is never auto-restarted.
+function DeploymentModeBadge({ mode }: { mode?: string }) {
+  if (mode !== 'manual') return null
+  return (
+    <span
+      className="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-amber-100 text-amber-800"
+      title="Manual deployment — you own this container. NexusLLM routes to it and health-checks it, but never starts, stops or recreates it."
+    >
+      🔧 MANUAL
+    </span>
+  )
+}
+
 function HealthPill({ healthy, total }: { healthy: number; total: number }) {
   if (total === 0)
     return <span className="text-xs text-muted-foreground">no endpoints</span>
@@ -1399,7 +1413,7 @@ function RegisterExternalModelForm({ onDone }: { onDone: () => void }) {
 
 // ── Endpoint row (expandable health detail) ───────────────────────────────────
 
-function EndpointRow({ modelId, ep }: { modelId: string; ep: Endpoint }) {
+function EndpointRow({ modelId, ep, manual }: { modelId: string; ep: Endpoint; manual?: boolean }) {
   const qc = useQueryClient()
 
   const start = useMutation({
@@ -1440,15 +1454,26 @@ function EndpointRow({ modelId, ep }: { modelId: string; ep: Endpoint }) {
             <span className="font-mono text-muted-foreground">container {ep.container_id.slice(0, 12)}</span>
           )}
           <span className="flex items-center gap-1 ml-auto">
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={start.isPending} onClick={() => start.mutate()}>
-              <Play className="w-3 h-3" />start
-            </Button>
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={stop.isPending} onClick={() => stop.mutate()}>
-              <Square className="w-3 h-3" />stop
-            </Button>
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={restart.isPending} onClick={() => restart.mutate()}>
-              <RotateCw className="w-3 h-3" />restart
-            </Button>
+            {/* Container controls are the operator's on a manual deployment —
+                the API rejects them with 409, so don't offer them here. Health
+                reset stays: it only clears NexusLLM's own failure counters. */}
+            {manual ? (
+              <span className="text-amber-700">
+                start / stop this container yourself — NexusLLM does not manage it
+              </span>
+            ) : (
+              <>
+                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={start.isPending} onClick={() => start.mutate()}>
+                  <Play className="w-3 h-3" />start
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={stop.isPending} onClick={() => stop.mutate()}>
+                  <Square className="w-3 h-3" />stop
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={restart.isPending} onClick={() => restart.mutate()}>
+                  <RotateCw className="w-3 h-3" />restart
+                </Button>
+              </>
+            )}
             <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={reset.isPending} onClick={() => reset.mutate()}>
               <Stethoscope className="w-3 h-3" />reset health
             </Button>
@@ -1508,6 +1533,19 @@ function ModelRow({ m, defaultOpen }: { m: Model; defaultOpen?: boolean }) {
     onSuccess: () => { toast({ title: 'Model deleted', description: m.name }); qc.invalidateQueries({ queryKey: ['models'] }) },
     onError: (e: any) => toast({ title: 'Delete failed', description: e.message, variant: 'destructive' }),
   })
+  // Hand the container lifecycle over to the operator, or take it back.
+  const isManual = m.deployment_mode === 'manual'
+  const setDeploymentMode = useMutation({
+    mutationFn: () => api.models.setDeploymentMode(m.id, isManual ? 'managed' : 'manual'),
+    onSuccess: (r) => {
+      toast({
+        title: r.deployment_mode === 'manual' ? 'Container handed to you' : 'Container managed by NexusLLM',
+        description: r.warning || r.note,
+      })
+      qc.invalidateQueries({ queryKey: ['models'] })
+    },
+    onError: (e: any) => toast({ title: 'Could not change deployment mode', description: e.message, variant: 'destructive' }),
+  })
 
   const isArchived = m.lifecycle === 'archived'
 
@@ -1527,6 +1565,7 @@ function ModelRow({ m, defaultOpen }: { m: Model; defaultOpen?: boolean }) {
           <div className="flex items-center gap-2">
             <span className="font-medium">{m.display_name || m.name}</span>
             <LifecycleBadge lifecycle={m.lifecycle} />
+            <DeploymentModeBadge mode={m.deployment_mode} />
             {/* Universal type badge — shown for every model type */}
             <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${TYPE_COLORS[m.service_type] ?? 'bg-gray-100 text-gray-600'}`}>
               {MODEL_TYPES.find(t => t.value === m.service_type)?.icon ?? '🔧'} {m.service_type}
@@ -1625,18 +1664,35 @@ function ModelRow({ m, defaultOpen }: { m: Model; defaultOpen?: boolean }) {
                 <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
                   Endpoints {isFetching && <Loader2 className="inline w-3 h-3 ml-1 animate-spin" />}
                 </span>
-                {endpoints.length > 0 && (
-                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => qc.invalidateQueries({ queryKey: ['model-health', m.id] })}>
-                    <RefreshCw className="w-3 h-3 mr-1" />refresh
+                <span className="flex items-center gap-1">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-xs"
+                    disabled={setDeploymentMode.isPending}
+                    title={isManual
+                      ? 'Let NexusLLM start, stop and recover this container again'
+                      : 'You deployed this container yourself — stop NexusLLM from starting, stopping or recreating it'}
+                    onClick={() => setDeploymentMode.mutate()}
+                  >
+                    <Settings className="w-3 h-3 mr-1" />
+                    {isManual ? 'hand back to NexusLLM' : 'mark as manual deployment'}
                   </Button>
-                )}
+                  {endpoints.length > 0 && (
+                    <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => qc.invalidateQueries({ queryKey: ['model-health', m.id] })}>
+                      <RefreshCw className="w-3 h-3 mr-1" />refresh
+                    </Button>
+                  )}
+                </span>
               </div>
               {endpoints.length === 0 ? (
                 <p className="text-xs text-muted-foreground py-3 text-center">No endpoints registered for this model.</p>
               ) : (
                 <table className="w-full text-sm">
                   <tbody className="divide-y">
-                    {endpoints.map(ep => <EndpointRow key={ep.id} modelId={m.id} ep={ep} />)}
+                    {endpoints.map(ep => (
+                      <EndpointRow key={ep.id} modelId={m.id} ep={ep} manual={m.deployment_mode === 'manual'} />
+                    ))}
                   </tbody>
                 </table>
               )}

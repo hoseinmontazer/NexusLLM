@@ -117,7 +117,8 @@ func setupReconcilerTestDB(t *testing.T) *sqlx.DB {
 			enabled           BOOLEAN NOT NULL DEFAULT TRUE,
 			lifecycle         VARCHAR(30) NOT NULL DEFAULT 'active',
 			supports_thinking BOOLEAN NOT NULL DEFAULT FALSE,
-			thinking_enabled  BOOLEAN NOT NULL DEFAULT FALSE
+			thinking_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
+			deployment_mode   VARCHAR(10) NOT NULL DEFAULT 'managed'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_endpoints (

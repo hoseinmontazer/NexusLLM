@@ -28,6 +28,16 @@ type Activator interface {
 
 	// Status returns the current runtime state of a model.
 	Status(ctx context.Context, modelName string) (*ModelStatus, error)
+
+	// IsManuallyDeployed reports whether the operator — not NexusLLM — owns
+	// this model's container (models.deployment_mode = 'manual').
+	//
+	// Callers use it to answer a request for an unreachable model with a plain
+	// "endpoint is not healthy" instead of starting a cold start that would
+	// duplicate or clobber an operator-managed container. Unknown models and
+	// lookup failures report false, so the answer for anything NexusLLM does
+	// manage is unchanged.
+	IsManuallyDeployed(ctx context.Context, modelName string) bool
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +50,12 @@ var (
 	ErrColdStartTimeout      = errStr("model did not become healthy within timeout")
 	ErrInsufficientResources = errStr("node has insufficient resources to load model")
 	ErrDownloadFailed        = errStr("model download/conversion failed")
+
+	// ErrManualDeployment — the model is registered with
+	// models.deployment_mode='manual', so its container belongs to the
+	// operator. No start was attempted; the caller should surface the
+	// endpoint's health as-is.
+	ErrManualDeployment = errStr("model is manually deployed — NexusLLM does not manage its container lifecycle")
 )
 
 type errStr string

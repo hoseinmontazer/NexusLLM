@@ -177,14 +177,28 @@ func (m *Monitor) handleNodeOffline(ctx context.Context, nodeID, hostname string
 	//    - Set health_status = 'down' so the gateway watcher removes them from routing
 	//    - Set is_enabled = FALSE so the registry stops including them on Reload
 	//    - Set lifecycle_state = 'failed' to reflect the node is down
+	//
+	// Endpoints of manually-deployed models (deployment_mode='manual') keep
+	// is_enabled: a node going offline means its node agent stopped reporting,
+	// which says nothing about a container the operator runs, and nothing would
+	// ever re-enable the endpoint afterwards (that only happens on a start
+	// NexusLLM performs). They are marked down and keep being probed, so they
+	// return to service by themselves once reachable again.
 	res2, _ := m.db.ExecContext(ctx, `
-		UPDATE model_endpoints
+		UPDATE model_endpoints me
 		SET health_status   = 'down',
 		    lifecycle_state  = 'failed',
-		    is_enabled       = FALSE,
+		    is_enabled       = CASE
+		        WHEN EXISTS (
+		            SELECT 1 FROM models m
+		            WHERE m.id = me.model_id
+		              AND COALESCE(m.deployment_mode,'managed') = 'manual'
+		        ) THEN me.is_enabled
+		        ELSE FALSE
+		    END,
 		    updated_at       = NOW()
-		WHERE node_id = $1
-		  AND (health_status != 'down' OR is_enabled = TRUE)`,
+		WHERE me.node_id = $1
+		  AND (me.health_status != 'down' OR me.is_enabled = TRUE)`,
 		nodeID)
 	if n, _ := res2.RowsAffected(); n > 0 {
 		m.log.Info("endpoints taken offline",

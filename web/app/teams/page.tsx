@@ -2,14 +2,14 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type Team, type Model } from '@/lib/api'
+import { api, type Team, type Model, type Policy } from '@/lib/api'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toaster'
-import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, FolderKanban, X, ShieldCheck, Globe, Cpu } from 'lucide-react'
+import { Plus, ChevronDown, ChevronUp, Pencil, Trash2, FolderKanban, X, ShieldCheck, Globe, Cpu, Settings2 } from 'lucide-react'
 import Link from 'next/link'
 
 // ── Model access grant panel ──────────────────────────────────────────────────
@@ -197,6 +197,110 @@ function ModelAccessPanel({ team }: { team: Team }) {
   )
 }
 
+// ── Team policy panel (rate limits & per-request context cap) ─────────────────
+//
+// These are the limits the gateway enforces for API keys that carry a team but
+// no project (the legacy team-scoped path, internal/policy/engine.go). The one
+// that bites in practice is max_context_tokens: it defaults to 8192, while
+// agent clients (Kilo Code, Cline, Continue) send system prompts far larger
+// than that and get 403 context_length_exceeded no matter how much context the
+// model itself supports.
+function TeamPolicyPanel({ team }: { team: Team }) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState<Partial<Policy>>({})
+
+  const { data: policy, isLoading, error } = useQuery({
+    queryKey: ['team-policy', team.id],
+    queryFn: () => api.teams.getPolicy(team.id),
+  })
+
+  const mut = useMutation({
+    mutationFn: () => api.teams.updatePolicy(team.id, form),
+    onSuccess: () => {
+      toast({ title: 'Policy updated', description: `${team.name} — applies to new requests immediately` })
+      setForm({})
+      qc.invalidateQueries({ queryKey: ['team-policy', team.id] })
+    },
+    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const set = (k: keyof Policy) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value
+    setForm(prev => {
+      const next = { ...prev }
+      if (v === '') delete next[k]
+      else (next as any)[k] = Number(v)
+      return next
+    })
+  }
+
+  const header = (
+    <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+      <Settings2 className="w-3.5 h-3.5" />Rate Limits &amp; Context Cap
+      <span className="font-normal normal-case text-muted-foreground ml-1">
+        — enforced for team-scoped API keys · 0 = unlimited
+      </span>
+    </div>
+  )
+
+  if (isLoading) return <div className="space-y-2">{header}<p className="text-xs text-muted-foreground">Loading…</p></div>
+  if (error || !policy) {
+    return (
+      <div className="space-y-2">
+        {header}
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+          No policy row for this team yet — the gateway applies its built-in defaults
+          (rpm 100 · tpd 1,000,000 · max concurrent 10 · max context 8,192).
+        </p>
+      </div>
+    )
+  }
+
+  const fields = [
+    { key: 'max_context_tokens', label: 'Max Context Tokens', desc: 'Largest prompt a single request may send. Raise this for coding agents (Kilo Code, Cline) — they exceed 8,192 easily.' },
+    { key: 'rpm',                label: 'RPM Limit',          desc: 'Requests per minute across the team.' },
+    { key: 'tpd',                label: 'TPD Limit',          desc: 'Tokens per day across the team.' },
+    { key: 'max_concurrent',     label: 'Max Concurrent',     desc: 'Requests in flight at once.' },
+  ] as const
+
+  return (
+    <div className="space-y-3">
+      {header}
+      {policy.max_context_tokens > 0 && policy.max_context_tokens <= 8192 && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+          ⚠️ Max context is {policy.max_context_tokens.toLocaleString()} tokens. Requests with a larger prompt are
+          rejected with <code>context_length_exceeded</code> (403) before they reach the model.
+        </p>
+      )}
+      <div className="grid grid-cols-2 gap-3">
+        {fields.map(({ key, label, desc }) => (
+          <div key={key}>
+            <Label className="text-xs">{label}</Label>
+            <Input
+              type="number" min={0} step={1}
+              placeholder={String(policy[key])}
+              value={form[key] ?? ''}
+              onChange={set(key)}
+              className="mt-1"
+            />
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Current: {policy[key].toLocaleString()} · {desc}
+            </p>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={() => mut.mutate()} disabled={mut.isPending || Object.keys(form).length === 0}>
+          {mut.isPending ? 'Saving…' : 'Update Limits'}
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          Leave a field blank to keep it. Saved values are pushed to the gateway immediately — no restart.
+        </span>
+      </div>
+    </div>
+  )
+}
+
 // ── Edit team form ─────────────────────────────────────────────────────────────
 function EditTeamForm({ team, onDone }: { team: Team; onDone: () => void }) {
   const qc = useQueryClient()
@@ -284,7 +388,7 @@ function TeamCard({ team }: { team: Team }) {
               <div>
                 <div className="flex items-center gap-2">
                   <p className="font-semibold">{team.name}</p>
-                  <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">RBAC only</span>
+                  <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">RBAC + key limits</span>
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">{team.slug}</p>
               </div>
@@ -308,6 +412,11 @@ function TeamCard({ team }: { team: Team }) {
               <div className="mt-3 border-t pt-3 space-y-4">
                 {/* Model access — grant/revoke */}
                 <ModelAccessPanel team={team} />
+
+                {/* Rate limits and the per-request context cap */}
+                <div className="border-t pt-3">
+                  <TeamPolicyPanel team={team} />
+                </div>
 
                 {/* Project assignments (read-only view) */}
                 <div>
@@ -371,7 +480,9 @@ function CreateTeamForm({ onDone }: { onDone: () => void }) {
       <div><Label>Team name *</Label><Input value={form.name} onChange={set('name')} required /></div>
       <div><Label>Slug *</Label><Input value={form.slug} onChange={set('slug')} placeholder="my-team" required /></div>
       <p className="text-xs text-muted-foreground">
-        Teams are for RBAC and membership grouping only. Rate limits, quotas and priority are configured per Project.
+        Teams group membership and model access. API keys scoped to a project use that project&apos;s
+        limits and priority; keys scoped only to a team use the team&apos;s own limits, editable after
+        creation under Rate Limits &amp; Context Cap.
       </p>
       <Button type="submit" disabled={mut.isPending} className="w-full">
         {mut.isPending ? 'Creating…' : 'Create Team'}

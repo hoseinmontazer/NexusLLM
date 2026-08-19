@@ -56,6 +56,7 @@ Full documentation is in the [`docs/`](docs/README.md) folder:
 | [Configuration](docs/17-configuration.md) | All environment variables, Prometheus metrics |
 | [Troubleshooting](docs/18-troubleshooting.md) | Common errors and fixes |
 | [Node Agent Architecture](docs/19-node-agent-architecture.md) | Task system, auth, sequence diagrams |
+| [Manual Deployments](docs/30-manual-deployments.md) | Register containers you run yourself — NexusLLM routes and health-checks, never starts or stops them |
 
 ---
 

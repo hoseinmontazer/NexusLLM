@@ -35,3 +35,4 @@
 27. [Cloud Model Access — Operational Guide](27-cloud-model-quickstart.md)
 28. [Provider Exposure Modes](28-provider-exposure-modes.md)
 29. [Self-Service Developer Portal & User Management](29-self-service-developer-portal.md)
+30. [Manual Deployments — Containers You Run Yourself](30-manual-deployments.md)

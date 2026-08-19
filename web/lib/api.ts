@@ -87,6 +87,12 @@ export interface Model {
   max_context: number; max_output: number
   enabled: boolean; endpoint_count: number; healthy_count: number
   lifecycle: string  // active | archived | deleted
+  // Who owns the container (migration 061):
+  //   "managed" — NexusLLM starts/stops/recovers it
+  //   "manual"  — the operator deployed it themselves; NexusLLM only routes to
+  //               it and health-checks it, so an unhealthy endpoint stays
+  //               unhealthy until the operator starts the container
+  deployment_mode?: string
   tags?: string
   // Universal capabilities — what API endpoints this model supports
   capabilities?: string[]   // e.g. ["chat","completion"] or ["transcription"]
@@ -783,6 +789,14 @@ export const api = {
       req<LazyConfig>('GET', `/models/${id}/lazy-config`),
     setLazyConfig: (id: string, b: Partial<LazyConfig>) =>
       req<{ message: string }>('PUT', `/models/${id}/lazy-config`, b),
+    setDeploymentMode: (id: string, deployment_mode: 'managed' | 'manual') =>
+      req<{
+        model_id: string
+        model_name: string
+        deployment_mode: string
+        note?: string
+        warning?: string
+      }>('PUT', `/models/${id}/deployment-mode`, { deployment_mode }),
     setThinkingMode: (id: string, b: {
       supports_thinking?: boolean
       thinking_enabled?: boolean

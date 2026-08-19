@@ -43,6 +43,7 @@ type fakeActivator struct {
 	ensureCalledN int64         // atomic: how many times EnsureRunning was entered
 	unblockCh     chan struct{} // close to make EnsureRunning return success
 	readyErr      error         // returned when unblockCh closes
+	manual        bool          // model is operator-deployed (deployment_mode=manual)
 }
 
 func newFakeActivator() *fakeActivator {
@@ -62,6 +63,7 @@ func (f *fakeActivator) RecordActivity(_ context.Context, _ string) {}
 func (f *fakeActivator) Status(_ context.Context, _ string) (*runtimemgr.ModelStatus, error) {
 	return nil, nil
 }
+func (f *fakeActivator) IsManuallyDeployed(_ context.Context, _ string) bool { return f.manual }
 
 // ─── Helper: invoke handleColdStart via a minimal Gin context ─────────────────
 
@@ -319,5 +321,48 @@ func waitForDone(t *testing.T, tracker *runtimemgr.StartTracker, model string, d
 			t.Fatalf("goroutine for %q did not finish within %s", model, deadline)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ─── C8: Manually-deployed model — 503, no cold start attempted ──────────────
+//
+// A model registered with deployment_mode='manual' has a container the
+// operator owns. A request for it while its endpoint is unhealthy must report
+// the unhealthy endpoint and MUST NOT launch a startup goroutine, which would
+// duplicate or clobber the operator's container.
+
+func TestC8_ManualDeployment_503_NoStartAttempted(t *testing.T) {
+	act := newFakeActivator()
+	act.manual = true
+	tracker := runtimemgr.NewStartTracker()
+	h := minHandler(act, tracker)
+
+	c, rec := ginContext(t)
+	h.handleColdStart(c, "qwen-manual")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503; got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if body.Error.Code != "manual_runtime_unhealthy" {
+		t.Errorf("expected error code manual_runtime_unhealthy; got %q (body=%s)",
+			body.Error.Code, rec.Body.String())
+	}
+
+	// Nothing may have been started, now or in the background.
+	time.Sleep(100 * time.Millisecond)
+	if n := atomic.LoadInt64(&act.ensureCalledN); n != 0 {
+		t.Errorf("EnsureRunning must not be called for a manual deployment; called %d times", n)
+	}
+	if tracker.IsStarting("qwen-manual") {
+		t.Error("no start slot may be claimed for a manual deployment")
 	}
 }

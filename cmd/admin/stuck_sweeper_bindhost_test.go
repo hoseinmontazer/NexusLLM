@@ -70,7 +70,8 @@ func setupStuckSweeperTestDB(t *testing.T) *sqlx.DB {
 			name         VARCHAR(255) NOT NULL UNIQUE,
 			backend_type VARCHAR(50) NOT NULL DEFAULT 'openai_compat',
 			enabled      BOOLEAN NOT NULL DEFAULT TRUE,
-			lifecycle    VARCHAR(30) NOT NULL DEFAULT 'active'
+			lifecycle    VARCHAR(30) NOT NULL DEFAULT 'active',
+			deployment_mode VARCHAR(10) NOT NULL DEFAULT 'managed'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_endpoints (

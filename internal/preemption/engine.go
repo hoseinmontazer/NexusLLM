@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/project"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
@@ -196,8 +197,13 @@ func (e *Engine) selectEvictionCandidate(ctx context.Context, nodeID string) *ca
 		FROM agent_runtimes ar
 		LEFT JOIN projects p ON p.id = ar.project_id
 		LEFT JOIN project_configurations pc ON pc.project_id = p.id
+		LEFT JOIN models m ON m.id = ar.model_id
 		WHERE ar.node_id = $1
 		  AND ar.state IN ('ready','active','warm','idle')
+		  -- Manually-deployed models are never eviction candidates: their
+		  -- containers belong to the operator and NexusLLM could not restart
+		  -- them afterwards.
+		  AND `+modelguard.SQLManagedCondition+`
 		  AND COALESCE(pc.always_running, FALSE) = FALSE
 		  AND COALESCE(pc.protected, FALSE) = FALSE
 		  AND COALESCE(p.preemptible, TRUE) = TRUE

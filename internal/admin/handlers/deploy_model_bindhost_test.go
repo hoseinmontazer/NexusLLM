@@ -89,7 +89,8 @@ func setupDeployModelTestDB(t *testing.T) *sqlx.DB {
 			capabilities      JSONB NOT NULL DEFAULT '[]',
 			supports_thinking BOOLEAN NOT NULL DEFAULT FALSE,
 			thinking_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
-			min_thinking_tokens INTEGER NOT NULL DEFAULT 500
+			min_thinking_tokens INTEGER NOT NULL DEFAULT 500,
+			deployment_mode   VARCHAR(10) NOT NULL DEFAULT 'managed'
 		);
 
 		CREATE TABLE IF NOT EXISTS model_versions (

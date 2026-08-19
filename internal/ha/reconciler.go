@@ -907,6 +907,9 @@ func (r *Reconciler) loadReplicaStatuses(ctx context.Context) ([]ReplicaStatus, 
 	// workloads. Recovering a lazy_load model after idle eviction would cause
 	// the container to be restarted immediately after every timeout, defeating
 	// the purpose of idle eviction.
+	// Manually-deployed models are excluded too: their containers belong to
+	// the operator, so "under-replicated" is not something this reconciler may
+	// fix by starting a replica (modelguard.SQLManagedCondition).
 	err := r.db.SelectContext(ctx, &rows, `
 		SELECT rrs.model_id, rrs.model_name, rrs.desired_replicas, rrs.min_available,
 		       rrs.placement_policy, rrs.auto_recover,
@@ -917,8 +920,10 @@ func (r *Reconciler) loadReplicaStatuses(ctx context.Context) ([]ReplicaStatus, 
 		       rrs.lost_replicas, rrs.node_count, rrs.ha_status
 		FROM runtime_replica_status rrs
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = rrs.model_id
+		LEFT JOIN models m ON m.id = rrs.model_id
 		WHERE rrs.desired_replicas > 0
-		  AND COALESCE(mrc.workload_policy, 'lazy_load') = 'always_on'`)
+		  AND COALESCE(mrc.workload_policy, 'lazy_load') = 'always_on'
+		  AND `+modelguard.SQLManagedCondition)
 	return rows, err
 }
 
@@ -1043,6 +1048,7 @@ func (r *Reconciler) stepUnhealthyReplicas(ctx context.Context) {
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
 		WHERE ar.state = 'unhealthy'
 		  AND `+modelguard.SQLCondition+`
+		  AND `+modelguard.SQLManagedCondition+`
 		  -- lazy_load models are managed by the cold-start activator, which
 		  -- correctly respects model_endpoints.node_id pinning. This
 		  -- reconciler path does unconstrained free-placement (selectNode has
@@ -1318,7 +1324,8 @@ func (r *Reconciler) stepDrainingReplicas(ctx context.Context) {
 		JOIN models m ON m.id = ar.model_id
 		LEFT JOIN model_replica_specs rs ON rs.model_id = ar.model_id
 		WHERE ar.state = 'draining'
-		  AND m.enabled = TRUE`)
+		  AND m.enabled = TRUE
+		  AND `+modelguard.SQLManagedCondition)
 
 	for _, row := range rows {
 		drainTimeout := time.Duration(row.DrainTimeoutS) * time.Second

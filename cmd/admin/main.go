@@ -437,7 +437,8 @@ func main() {
 	a.GET("/models/:id/lazy-config", lazyH.GetLazyConfig)
 	a.GET("/models/:id/runtime-status", lazyH.GetRuntimeStatus)
 	a.PUT("/models/:id/thinking", runtimeH.SetThinkingMode)
-	a.PUT("/models/:id/capabilities", runtimeH.UpdateCapabilities) // model capability validation
+	a.PUT("/models/:id/deployment-mode", runtimeH.SetDeploymentMode) // managed (NexusLLM-owned) vs manual (operator-owned) container
+	a.PUT("/models/:id/capabilities", runtimeH.UpdateCapabilities)   // model capability validation
 
 	// ── Projects ──────────────────────────────────────────────────────────────
 	a.POST("/projects", projectH.CreateProject)
@@ -718,7 +719,10 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		      -- Download/pending: double the threshold to allow slow connections
 		      (ar.state IN ('downloading','pending') AND ar.updated_at < NOW() - ($2 || ' seconds')::interval)
 		  )
-		  AND `+modelguard.SQLCondition,
+		  AND `+modelguard.SQLCondition+`
+		  -- Never recover a manually-deployed model: NexusLLM does not own its
+		  -- container, so there is nothing here to re-enqueue.
+		  AND `+modelguard.SQLManagedCondition,
 		int(threshold.Seconds()),
 		int((threshold * 2).Seconds()),
 	)
@@ -833,6 +837,7 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 			      AND me.lifecycle_state NOT IN ('deleted')
 			LEFT JOIN model_runtime_configs mrc ON mrc.model_id = m.id
 			WHERE m.id = $1 AND `+modelguard.SQLCondition+`
+			  AND `+modelguard.SQLManagedCondition+`
 			ORDER BY me.priority ASC
 			LIMIT 1`, row.ModelID)
 

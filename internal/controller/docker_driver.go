@@ -475,6 +475,17 @@ func (d *dockerDriver) buildLlamaCppArgs(spec RuntimeSpec) []string {
 // injected via the Backend interface, ensuring the legacy Docker controller
 // path behaves identically to the node agent path.
 func (d *dockerDriver) applyCommonResourceArgs(args []string, spec RuntimeSpec) []string {
+	// ── Ownership labels ─────────────────────────────────────────────────────
+	// Stamp every container NexusLLM creates, so cleanup paths (the node
+	// agent's exited-container prune and stale-name removal) can tell ours from
+	// one an operator started themselves with docker compose. Keep these in
+	// sync with internal/nodeagent/executor.go buildDockerArgs.
+	args = append(args,
+		"--label", "nexus.managed=true",
+		"--label", "nexus.model="+spec.ServedModelName,
+		"--label", "nexus.endpoint_id="+spec.EndpointID,
+	)
+
 	// ── Inject backend-specific port environment variables ──────────────────
 	// Obtain PORT, HTTP_PORT, UVICORN_PORT (or nil) from the Backend interface.
 	// This ensures cpu_native and openai_compat backends receive the correct

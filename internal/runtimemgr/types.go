@@ -152,6 +152,14 @@ type ModelConfig struct {
 	//   "always_on" — start on deploy, never idle-evict, restart on crash (services)
 	WorkloadPolicy string
 
+	// DeploymentMode is read from models.deployment_mode (migration 061) and
+	// says who owns the container.
+	//   "managed" — NexusLLM starts, stops and recovers the container (default)
+	//   "manual"  — the operator deployed it themselves; NexusLLM only routes
+	//               and health-checks. No start is ever enqueued for it.
+	// Checked with modelguard.ManagedByNexus.
+	DeploymentMode string
+
 	// ── llamacpp model source (first non-empty wins) ──────────────────────
 	GGUFPath string // container path: "/models/gemma-2-2b-it-Q4_K_M.gguf"
 	HFRepo   string // "bartowski/gemma-2-2b-it-GGUF"

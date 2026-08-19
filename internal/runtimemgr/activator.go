@@ -31,6 +31,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -152,6 +153,17 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 	if err != nil {
 		// sql.ErrNoRows means the model doesn't exist in the catalog at all.
 		return nil, fmt.Errorf("%w: %s", ErrModelNotFound, err.Error())
+	}
+	// The operator owns manually-deployed containers. NexusLLM must not start,
+	// recreate or otherwise touch them — a cold-start request for one is
+	// answered with a plain "not healthy" so the operator brings it up
+	// themselves (migration 061, internal/modelguard).
+	if !modelguard.ManagedByNexus(cfg.DeploymentMode) {
+		a.log.Info("cold-start skipped — model is manually deployed",
+			zap.String("model", modelName),
+			zap.String("deployment_mode", cfg.DeploymentMode),
+		)
+		return nil, fmt.Errorf("%w: %s", ErrManualDeployment, modelName)
 	}
 	if cfg.NodeID == "" {
 		// The model exists in the catalog but has no node assignment.
@@ -316,6 +328,36 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IsManuallyDeployed — deployment ownership lookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+// IsManuallyDeployed reports whether the operator owns this model's container
+// (models.deployment_mode='manual', migration 061).
+//
+// It is a single indexed-primary-key-free but name-filtered lookup on models,
+// cheap enough for the proxy's cold-start branch, which is already off the hot
+// path (it only runs when no healthy endpoint could be resolved).
+//
+// Every failure mode answers false — unknown model, missing column (migration
+// 061 not applied), DB error — so a model NexusLLM does manage is never left
+// unstarted because of a failed lookup.
+func (a *RuntimeActivator) IsManuallyDeployed(ctx context.Context, modelName string) bool {
+	var mode string
+	err := a.db.GetContext(ctx, &mode,
+		`SELECT COALESCE(deployment_mode,'managed') FROM models WHERE name = $1`, modelName)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			a.log.Warn("deployment_mode lookup failed — treating model as NexusLLM-managed",
+				zap.String("model", modelName),
+				zap.Error(err),
+			)
+		}
+		return false
+	}
+	return !modelguard.ManagedByNexus(mode)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // StartModel — public API used by admin handler, idle manager, recovery watchdog
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -332,6 +374,9 @@ func (a *RuntimeActivator) StartModel(ctx context.Context, modelName string) err
 	cfg, err := a.loadConfig(ctx, modelName)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrModelNotFound, err.Error())
+	}
+	if !modelguard.ManagedByNexus(cfg.DeploymentMode) {
+		return fmt.Errorf("%w: %s", ErrManualDeployment, modelName)
 	}
 	if cfg.NodeID == "" {
 		return fmt.Errorf(
@@ -363,6 +408,13 @@ func (a *RuntimeActivator) StartModel(ctx context.Context, modelName string) err
 //	CREATED → VALIDATING → DOWNLOADING → STARTING →
 //	LOADING_MODEL → WAITING_READY → READY
 func (a *RuntimeActivator) enqueueStartModel(ctx context.Context, cfg *ModelConfig) error {
+	// Last line of defence for manual deployments: every caller above already
+	// checks, but this is the one function that actually creates a container,
+	// so it refuses on its own rather than trusting its callers.
+	if !modelguard.ManagedByNexus(cfg.DeploymentMode) {
+		return fmt.Errorf("%w: %s", ErrManualDeployment, cfg.ModelName)
+	}
+
 	runtimeID := uuid.New().String()
 	containerName := "nexus-" + cfg.ModelName
 
@@ -1032,13 +1084,14 @@ func (a *RuntimeActivator) isNodeOnline(ctx context.Context, nodeID string) bool
 func (a *RuntimeActivator) loadConfig(ctx context.Context, modelName string) (*ModelConfig, error) {
 	cfg, err := a.loadConfigQuery(ctx, modelName, true)
 	if err != nil && isUndefinedColumnError(err) {
-		// Migration 014 (execution_mode column) not yet applied.
-		// Retry without that column and default to "auto".
-		a.log.Warn("execution_mode column missing — migration 014 not applied; defaulting to 'auto'",
+		// Migration 014 (execution_mode) or 061 (deployment_mode) not yet
+		// applied. Retry without the optional columns and use their defaults.
+		a.log.Warn("optional column missing — migration 014 (execution_mode) or 061 (deployment_mode) not applied; defaulting to execution_mode='auto', deployment_mode='managed'",
 			zap.String("model", modelName))
 		cfg, err = a.loadConfigQuery(ctx, modelName, false)
 		if cfg != nil {
 			cfg.ExecutionMode = "auto"
+			cfg.DeploymentMode = modelguard.ModeManaged
 		}
 	}
 	return cfg, err
@@ -1083,6 +1136,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		IdleTimeout    *int    `db:"idle_timeout_secs"`
 		ExecutionMode  string  `db:"execution_mode"`
 		WorkloadPolicy string  `db:"workload_policy"`
+		DeploymentMode string  `db:"deployment_mode"`
 		ExtraArgsJSON  string  `db:"extra_args_json"`
 		EnvJSON        string  `db:"env_json"`
 	}
@@ -1117,6 +1171,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		    mrc.idle_timeout_secs,
 		    %s                                             AS execution_mode,
 		    %s                                             AS workload_policy,
+		    %s                                             AS deployment_mode,
 		    %s                                             AS extra_args_json,
 		    %s                                             AS env_json
 		FROM models m
@@ -1139,15 +1194,19 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 
 	execModeExpr := `COALESCE(mrc.execution_mode, 'auto')`
 	policyExpr := `COALESCE(mrc.workload_policy, 'lazy_load')`
+	// models.deployment_mode arrives with migration 061; the same
+	// undefined-column retry that covers migration 014 covers it.
+	deployModeExpr := `COALESCE(m.deployment_mode, 'managed')`
 	extraArgsExpr := `COALESCE(mrc.extra_args::text, '[]')`
 	envExpr := `COALESCE(mrc.env::text, '{}')`
 	if !withExecutionMode {
 		execModeExpr = `'auto'`
 		policyExpr = `'lazy_load'`
+		deployModeExpr = `'managed'`
 		extraArgsExpr = `'[]'`
 		envExpr = `'{}'`
 	}
-	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr, extraArgsExpr, envExpr)
+	q := fmt.Sprintf(baseQuery, execModeExpr, policyExpr, deployModeExpr, extraArgsExpr, envExpr)
 
 	err := a.db.GetContext(ctx, &row, q, modelName)
 	if err != nil {
@@ -1197,6 +1256,7 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 		NUMANode:       row.NUMANode,
 		ExecutionMode:  row.ExecutionMode,
 		WorkloadPolicy: row.WorkloadPolicy,
+		DeploymentMode: row.DeploymentMode,
 		ExtraArgs:      extraArgs,
 		Env:            env,
 	}

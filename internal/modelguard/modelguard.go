@@ -28,3 +28,36 @@ func Eligible(enabled bool, lifecycle string) bool {
 // query MUST use this exact condition (with its own models-table alias
 // substituted for "m") so this predicate cannot drift out of sync with Eligible.
 const SQLCondition = "m.enabled = TRUE AND COALESCE(m.lifecycle,'active') != 'deleted'"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deployment ownership — models.deployment_mode (migration 061)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Deployment modes stored in models.deployment_mode.
+const (
+	// ModeManaged — NexusLLM owns the container lifecycle: it may create,
+	// recreate, stop, evict and preempt the runtime.
+	ModeManaged = "managed"
+
+	// ModeManual — the operator deployed the model themselves (docker compose,
+	// systemd, another orchestrator, a host with no node agent). NexusLLM
+	// routes to it, enforces policy and probes health, but never touches the
+	// container. A manual model whose container is down is simply reported
+	// unhealthy — nothing tries to bring it up.
+	ModeManual = "manual"
+)
+
+// ManagedByNexus reports whether NexusLLM owns the container lifecycle for a
+// model in this deployment mode. An empty or unrecognised value means
+// "managed" so a missing migration 061 or a NULL column never silently
+// disables lifecycle management for models that rely on it.
+func ManagedByNexus(deploymentMode string) bool {
+	return deploymentMode != ModeManual
+}
+
+// SQLManagedCondition is the literal SQL fragment equivalent to
+// ManagedByNexus, for queries that select candidate models for an automatic
+// lifecycle action (runtime creation, idle eviction, HA replacement,
+// preemption, stuck-runtime recovery) rather than fetching the mode into Go
+// first. Use it with the models-table alias "m", alongside SQLCondition.
+const SQLManagedCondition = "COALESCE(m.deployment_mode,'managed') != 'manual'"

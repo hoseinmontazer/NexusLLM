@@ -288,11 +288,30 @@ func (w *Watcher) checkOne(ctx context.Context, modelName string, ep *Endpoint) 
 
 		if loadingCount == 0 {
 			// Runtime is not in a loading state — genuinely down.
+			//
+			// is_enabled=FALSE takes the endpoint out of the registry, which
+			// also stops it being probed — nothing re-enables it except a
+			// successful start (Activator.enableEndpoint) or an admin. That is
+			// right for a managed model, whose container NexusLLM will restart,
+			// and wrong for a manually-deployed one (deployment_mode='manual'):
+			// its container comes back when the operator starts it, and if the
+			// endpoint were disabled the recovery would never be noticed.
+			// Manual endpoints therefore stay enabled and keep being probed —
+			// health_status='down' alone already stops routing to them.
 			if endpointMEID != "" {
 				_, _ = w.db.ExecContext(ctx, `
-					UPDATE model_endpoints
-					SET health_status = 'down', is_enabled = FALSE, updated_at = NOW()
-					WHERE id = $1 AND is_enabled = TRUE`, endpointMEID)
+					UPDATE model_endpoints me
+					SET health_status = 'down',
+					    is_enabled = CASE
+					        WHEN EXISTS (
+					            SELECT 1 FROM models m
+					            WHERE m.id = me.model_id
+					              AND COALESCE(m.deployment_mode,'managed') = 'manual'
+					        ) THEN me.is_enabled
+					        ELSE FALSE
+					    END,
+					    updated_at = NOW()
+					WHERE me.id = $1 AND me.is_enabled = TRUE`, endpointMEID)
 			}
 
 			// Transition runtime to 'unhealthy'.

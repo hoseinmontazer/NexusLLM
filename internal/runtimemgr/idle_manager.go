@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/nexusllm/nexusllm/internal/modelguard"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"go.uber.org/zap"
 )
@@ -71,6 +72,7 @@ type idleRow struct {
 	Protected      bool       `db:"protected"`
 	MinReplicas    int        `db:"minimum_replicas"`
 	WorkloadPolicy string     `db:"workload_policy"`
+	DeploymentMode string     `db:"deployment_mode"`
 }
 
 func (m *IdleManager) evict(ctx context.Context) {
@@ -87,7 +89,8 @@ func (m *IdleManager) evict(ctx context.Context) {
 		       COALESCE(pc.always_running, FALSE)  AS always_running,
 		       COALESCE(pc.protected, FALSE)        AS protected,
 		       COALESCE(pc.minimum_replicas, 0)     AS minimum_replicas,
-		       COALESCE(ar.workload_policy, 'lazy_load') AS workload_policy
+		       COALESCE(ar.workload_policy, 'lazy_load') AS workload_policy,
+		       COALESCE(mo.deployment_mode, 'managed')   AS deployment_mode
 		FROM agent_runtimes ar
 		JOIN models mo ON mo.id = ar.model_id
 		LEFT JOIN model_runtime_configs mrc ON mrc.model_id = ar.model_id
@@ -129,6 +132,15 @@ func (m *IdleManager) evict(ctx context.Context) {
 			zap.String("timeout_source", timeoutSource),
 			zap.Any("idle_timeout_secs_raw", row.IdleTimeout),
 		)
+
+		// Deployment ownership: a manually-deployed model's container belongs
+		// to the operator. Stopping it would take down something NexusLLM
+		// cannot bring back up. (A manual model normally has no
+		// agent_runtimes row at all — this guards the case where one was left
+		// behind by an earlier managed deployment of the same model.)
+		if !modelguard.ManagedByNexus(row.DeploymentMode) {
+			continue
+		}
 
 		// Workload policy protection: never evict always_on services
 		if row.WorkloadPolicy == "always_on" {
@@ -325,6 +337,9 @@ func (m *IdleManager) restoreAlwaysRunning(ctx context.Context) {
 			JOIN models mo ON mo.id = ar.model_id
 			WHERE ar.project_id = $1
 			  AND ar.state NOT IN ('ready','active','warm','idle','stopping','deleted')
+			  -- Never restore a manually-deployed model: NexusLLM does not own
+			  -- its container (modelguard.SQLManagedCondition, alias mo).
+			  AND COALESCE(mo.deployment_mode,'managed') != 'manual'
 			LIMIT $2`, p.ProjectID, deficit)
 
 		for _, mdl := range models {
