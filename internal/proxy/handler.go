@@ -1104,27 +1104,34 @@ func (h *Handler) syncChat(
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	// ── Thinking token accounting + content stripping ───────────────────
-	// For models that support thinking, the upstream (vLLM / llama.cpp) may
-	// embed <think>...</think> reasoning traces directly in the content field
-	// even when the client requested thinking=disabled or effort=low.
-	// We always:
-	//   1. Count the thinking tokens for billing/metrics.
-	//   2. Strip the <think> blocks from the content before returning to the
-	//      client, so the response is clean regardless of backend behaviour.
+	// vLLM and llama.cpp may embed <think>...</think> reasoning traces
+	// directly in the content field even when thinking=disabled or
+	// effort=low, and even when supports_thinking is not set in the DB
+	// (the model flag may simply be misconfigured or not yet migrated).
+	//
+	// Strategy: always inspect the actual content for <think> tags and
+	// strip them unconditionally. For models with SupportsThinking=true we
+	// additionally record billing metrics and check for empty-content retry.
 	contentEmpty := false
-	if thinkingCaps.SupportsThinking && len(chatResp.Choices) > 0 {
+	if len(chatResp.Choices) > 0 {
 		msg := chatResp.Choices[0].Message
 		if msg != nil {
 			if s, ok := msg.Content.(string); ok {
 				thinkTok, _ := thinking.EstimateThinkingTokens(s)
 				if thinkTok > 0 {
-					middleware.ThinkingTokensTotal.WithLabelValues(
-						claims.TeamID, claims.ProjectID, req.Model).Add(float64(thinkTok))
-					chatResp.Usage.ThinkingTokens = thinkTok
+					if thinkingCaps.SupportsThinking {
+						middleware.ThinkingTokensTotal.WithLabelValues(
+							claims.TeamID, claims.ProjectID, req.Model).Add(float64(thinkTok))
+						chatResp.Usage.ThinkingTokens = thinkTok
+					}
+					// Strip regardless of SupportsThinking — the model leaked
+					// reasoning traces into content, clean them up for the client.
+					stripped := thinking.StripThinkBlocks(s)
+					msg.Content = stripped
+					if thinkingCaps.SupportsThinking {
+						contentEmpty = thinking.IsEmptyVisible(s)
+					}
 				}
-				contentEmpty = thinking.IsEmptyVisible(s)
-				// Strip <think> blocks so clients never see raw reasoning traces.
-				msg.Content = thinking.StripThinkBlocks(s)
 			}
 		}
 	}
