@@ -16,6 +16,7 @@ package thinking
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/models"
@@ -226,6 +227,14 @@ func IsEmptyVisible(completionContent string) bool {
 		}
 	}
 	return true
+}
+
+// StripThinkBlocks removes all <think>...</think> sections from s and returns
+// the remaining visible text with leading/trailing whitespace trimmed.
+// It is exported so callers (e.g. the proxy handler) can clean up the
+// content field before returning a response to the client.
+func StripThinkBlocks(s string) string {
+	return strings.TrimSpace(stripThinkBlocks(s))
 }
 
 func stripThinkBlocks(s string) string {

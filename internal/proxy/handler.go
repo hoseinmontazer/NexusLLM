@@ -1103,9 +1103,14 @@ func (h *Handler) syncChat(
 
 	latencyMs := int(time.Since(start).Milliseconds())
 
-	// ── Thinking token accounting ────────────────────────────────────────
-	// Detect and record thinking tokens. Also check for empty visible content
-	// so the caller can trigger a retry with thinking disabled.
+	// ── Thinking token accounting + content stripping ───────────────────
+	// For models that support thinking, the upstream (vLLM / llama.cpp) may
+	// embed <think>...</think> reasoning traces directly in the content field
+	// even when the client requested thinking=disabled or effort=low.
+	// We always:
+	//   1. Count the thinking tokens for billing/metrics.
+	//   2. Strip the <think> blocks from the content before returning to the
+	//      client, so the response is clean regardless of backend behaviour.
 	contentEmpty := false
 	if thinkingCaps.SupportsThinking && len(chatResp.Choices) > 0 {
 		msg := chatResp.Choices[0].Message
@@ -1118,6 +1123,8 @@ func (h *Handler) syncChat(
 					chatResp.Usage.ThinkingTokens = thinkTok
 				}
 				contentEmpty = thinking.IsEmptyVisible(s)
+				// Strip <think> blocks so clients never see raw reasoning traces.
+				msg.Content = thinking.StripThinkBlocks(s)
 			}
 		}
 	}
