@@ -521,6 +521,14 @@ virtualDispatch:
 		} else {
 			thinkingOn = thinking.ResolveMode(&req, thinkingCaps) // always false when !SupportsThinking
 			_ = thinkingOn
+			// Even when supports_thinking is not set in the DB, the model may
+			// still emit inline reasoning (e.g. Qwen3 on vLLM). If the client
+			// explicitly requested effort=low or thinking=disabled, inject the
+			// no-think system prompt directive so the model suppresses it.
+			if thinking.ClientRequestedNoThinking(&sanitized) {
+				injected := thinking.InjectNoThinkDirectiveOnly(sanitized)
+				chatReq.Req = &injected
+			}
 		}
 	}
 

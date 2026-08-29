@@ -158,6 +158,10 @@ func InjectThinkingControl(req models.InferenceRequest, thinkingOn bool, caps Mo
 			req.Thinking = models.ThinkingEnabled(budget)
 		} else {
 			req.Thinking = models.ThinkingDisabled()
+			// vLLM's thinking.type=disabled is not reliably honoured by all
+			// Qwen3 checkpoints — the model still emits inline reasoning prose.
+			// Inject a system prompt directive as a belt-and-suspenders guard.
+			injectNoThinkDirective(&req)
 		}
 
 	default:
@@ -170,7 +174,32 @@ func InjectThinkingControl(req models.InferenceRequest, thinkingOn bool, caps Mo
 	return req
 }
 
-// injectNoThinkDirective prepends a system message asking the model not to
+// ClientRequestedNoThinking returns true when the request explicitly asks for
+// no reasoning output — via effort=low, reasoning_effort=low, or
+// thinking.type=disabled. Used to decide whether to inject the no-think
+// system prompt directive even on models not flagged as SupportsThinking.
+func ClientRequestedNoThinking(req *models.InferenceRequest) bool {
+	if req.Thinking != nil && req.Thinking.Type == "disabled" {
+		return true
+	}
+	effort := ""
+	if req.Effort != nil {
+		effort = *req.Effort
+	} else if req.ReasoningEffort != nil {
+		effort = *req.ReasoningEffort
+	}
+	return effort == "low"
+}
+
+// InjectNoThinkDirectiveOnly prepends the no-think system prompt directive
+// without touching any other thinking control fields. Use this for models
+// where SupportsThinking is false but the client still wants reasoning suppressed.
+func InjectNoThinkDirectiveOnly(req models.InferenceRequest) models.InferenceRequest {
+	injectNoThinkDirective(&req)
+	return req
+}
+
+
 // produce internal reasoning. Used for backends that have no native flag.
 func injectNoThinkDirective(req *models.InferenceRequest) {
 	directive := models.Message{
