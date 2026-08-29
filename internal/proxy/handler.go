@@ -525,7 +525,9 @@ virtualDispatch:
 			// still emit inline reasoning (e.g. Qwen3 on vLLM). If the client
 			// explicitly requested effort=low or thinking=disabled, inject the
 			// no-think system prompt directive so the model suppresses it.
-			if thinking.ClientRequestedNoThinking(&sanitized) {
+			// NOTE: check against original req — sanitizeForBackend already
+			// cleared req.Effort/req.ReasoningEffort from the sanitized copy.
+			if thinking.ClientRequestedNoThinking(&req) {
 				injected := thinking.InjectNoThinkDirectiveOnly(sanitized)
 				chatReq.Req = &injected
 			}
