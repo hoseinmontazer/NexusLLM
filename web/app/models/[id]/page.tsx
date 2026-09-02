@@ -636,6 +636,100 @@ function LazyConfigTab({ modelId }: { modelId: string }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PRICING TAB — $-per-token rate used to compute usage.cost on responses
+// ─────────────────────────────────────────────────────────────────────────────
+function PricingTab({ modelId }: { modelId: string }) {
+  const qc = useQueryClient()
+
+  const { data: pricing, isLoading, isError } = useQuery({
+    queryKey: ['model-pricing', modelId],
+    queryFn: () => api.models.getPricing(modelId),
+    retry: false,
+  })
+
+  const [initialized, setInitialized]   = useState(false)
+  const [inputRate, setInputRate]       = useState('0')
+  const [outputRate, setOutputRate]     = useState('0')
+  const [cachedRate, setCachedRate]     = useState('0')
+  const [currency, setCurrency]         = useState('USD')
+
+  if (pricing && !initialized) {
+    setInitialized(true)
+    setInputRate(pricing.input_per_token)
+    setOutputRate(pricing.output_per_token)
+    setCachedRate(pricing.cached_per_token)
+    setCurrency(pricing.currency)
+  }
+
+  const save = useMutation({
+    mutationFn: () => api.models.setPricing(modelId, {
+      input_per_token: parseFloat(inputRate) || 0,
+      output_per_token: parseFloat(outputRate) || 0,
+      cached_per_token: parseFloat(cachedRate) || 0,
+      currency,
+    }),
+    onSuccess: () => {
+      toast({ title: 'Pricing saved', description: 'usage.cost will now appear on this model’s responses' })
+      qc.invalidateQueries({ queryKey: ['model-pricing', modelId] })
+    },
+    onError: (e: any) => toast({ title: 'Save failed', description: e.message, variant: 'destructive' }),
+  })
+
+  if (isLoading) return <p className="text-sm text-muted-foreground py-4">Loading…</p>
+
+  return (
+    <div className="space-y-5">
+      {pricing ? (
+        <div className="p-3 bg-green-50 border border-green-100 rounded text-xs text-green-800">
+          Pricing configured — responses for this model include a computed <span className="font-mono">usage.cost</span>.
+          Active since {new Date(pricing.effective_from).toLocaleString()}.
+        </div>
+      ) : isError ? (
+        <div className="p-3 bg-yellow-50 border border-yellow-100 rounded text-xs text-yellow-800">
+          No pricing configured. Responses for this model won&apos;t include <span className="font-mono">usage.cost</span> until a rate is set below.
+          Cloud-provider models (OpenRouter, etc.) don&apos;t need this — they already report their own real cost.
+        </div>
+      ) : null}
+
+      <div>
+        <p className="text-xs font-semibold text-muted-foreground uppercase mb-3">Per-Token Rate</p>
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <Label className="text-xs">Input $/token</Label>
+            <Input type="number" step="0.0000000001" min="0" value={inputRate}
+              onChange={e => setInputRate(e.target.value)} className="mt-1 font-mono text-xs" />
+          </div>
+          <div>
+            <Label className="text-xs">Output $/token</Label>
+            <Input type="number" step="0.0000000001" min="0" value={outputRate}
+              onChange={e => setOutputRate(e.target.value)} className="mt-1 font-mono text-xs" />
+          </div>
+          <div>
+            <Label className="text-xs">Cached input $/token</Label>
+            <Input type="number" step="0.0000000001" min="0" value={cachedRate}
+              onChange={e => setCachedRate(e.target.value)} className="mt-1 font-mono text-xs" />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground mt-2">
+          Example: $0.50 per 1M tokens = <span className="font-mono">0.0000005</span>.
+          Saving replaces the active rate — the previous one is kept (versioned) for past usage records.
+        </p>
+      </div>
+
+      <div>
+        <Label className="text-xs">Currency</Label>
+        <Input value={currency} onChange={e => setCurrency(e.target.value.toUpperCase())}
+          maxLength={3} className="mt-1 w-24 font-mono text-xs" />
+      </div>
+
+      <Button onClick={() => save.mutate()} disabled={save.isPending} className="w-full">
+        {save.isPending ? 'Saving…' : 'Save Pricing'}
+      </Button>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THINKING TAB — reasoning mode capability flags & deployment defaults
 // ─────────────────────────────────────────────────────────────────────────────
 function ThinkingTab({ modelId }: { modelId: string }) {
@@ -1021,7 +1115,7 @@ function CapabilitiesTab({ modelId }: { modelId: string }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN MODEL DETAIL PAGE
 // ─────────────────────────────────────────────────────────────────────────────
-type DetailTab = 'runtimes' | 'ha' | 'placement' | 'lazy_config' | 'thinking' | 'capabilities' | 'health' | 'upstream'
+type DetailTab = 'runtimes' | 'ha' | 'placement' | 'lazy_config' | 'pricing' | 'thinking' | 'capabilities' | 'health' | 'upstream'
 
 export default function ModelDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -1040,6 +1134,7 @@ export default function ModelDetailPage() {
     { key: 'ha',           label: 'HA Replicas' },
     { key: 'placement',    label: 'Placement' },
     { key: 'lazy_config',  label: 'Lazy Config' },
+    { key: 'pricing',      label: 'Pricing' },
     { key: 'thinking',     label: '🧠 Thinking' },
     { key: 'capabilities', label: '🔌 Capabilities' },
     { key: 'upstream',     label: '🌐 Upstream' },
@@ -1078,6 +1173,7 @@ export default function ModelDetailPage() {
           {tab === 'ha'           && <HATab modelId={id} />}
           {tab === 'placement'    && <PlacementTab modelId={id} />}
           {tab === 'lazy_config'  && <LazyConfigTab modelId={id} />}
+          {tab === 'pricing'      && <PricingTab modelId={id} />}
           {tab === 'thinking'     && <ThinkingTab modelId={id} />}
           {tab === 'capabilities' && <CapabilitiesTab modelId={id} />}
           {tab === 'upstream'     && <UpstreamTab modelId={id} />}

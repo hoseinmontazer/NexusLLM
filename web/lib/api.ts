@@ -289,6 +289,21 @@ export interface LazyConfig {
   updated_at: string
 }
 
+// Per-model $-per-token rate (model_pricing table, migration 054).
+// Once set, the gateway includes a computed usage.cost/usage.cost_details on
+// every chat completion response for this model — mirrors what cloud
+// providers like OpenRouter report natively for their own models.
+export interface ModelPricing {
+  id: string
+  model_id: string
+  input_per_token: string
+  output_per_token: string
+  cached_per_token: string
+  currency: string
+  effective_from: string
+  created_by: string
+}
+
 export interface RuntimeStatus {
   runtime_id: string
   node_id: string
@@ -821,6 +836,14 @@ export const api = {
       cpu_cores?: number; numa_node_pref?: number; ram_mb?: number
       preferred_runtime?: string
     }) => req<{ message: string }>('PUT', `/models/${id}/reservation`, b),
+    getPricing: (id: string) => req<ModelPricing>('GET', `/models/${id}/pricing`),
+    setPricing: (id: string, b: {
+      input_per_token: number
+      output_per_token: number
+      cached_per_token?: number
+      currency?: string
+    }) => req<{ message: string; id: string; model_id: string }>('PUT', `/models/${id}/pricing`, b),
+
     updateUpstream: (id: string, b: {
       upstream_api_key?: string
       upstream_base_url?: string
