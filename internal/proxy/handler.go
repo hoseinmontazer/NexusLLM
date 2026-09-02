@@ -21,6 +21,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/alias"
 	"github.com/nexusllm/nexusllm/internal/auth"
+	"github.com/nexusllm/nexusllm/internal/billing"
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/gatewaypolicy"
 	"github.com/nexusllm/nexusllm/internal/middleware"
@@ -1111,6 +1112,11 @@ func (h *Handler) syncChat(
 	// Normalise it here so the client always gets a spec-compliant response.
 	normalizeToolCallArguments(&chatResp)
 
+	// Cloud providers (OpenRouter, etc.) report their own real usage.cost —
+	// leave that untouched. Local/self-hosted backends never send one, so
+	// fill it in from the admin-configured model_pricing rate when present.
+	h.applyEstimatedCost(c.Request.Context(), ep, &chatResp)
+
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	// ── Thinking token accounting + content stripping ───────────────────
@@ -1542,6 +1548,44 @@ func (h *Handler) teamPolicy(teamID string) *policy.TeamPolicy {
 		return tp
 	}
 	return &policy.TeamPolicy{RPMLimit: 100, TPDLimit: 1_000_000, MaxConcurrent: 10, MaxContextTokens: 8192}
+}
+
+// applyEstimatedCost fills in usage.cost/usage.cost_details from the
+// admin-configured model_pricing rate (set via PUT /admin/v1/models/:id/pricing)
+// when the upstream response didn't already report a real cost. Cloud
+// providers that price per-request (OpenRouter) populate chatResp.Usage.Cost
+// themselves during json.Unmarshal, so this is skipped for them; it only
+// fires for backends — chiefly local/self-hosted ones — that never do.
+//
+// No-op when no pricing row exists for the model: SnapshotForModel returns a
+// zero-rate snapshot in that case, ComputeCost yields zero, and the
+// omitempty tags on Usage.Cost/CostDetails keep them out of the response.
+func (h *Handler) applyEstimatedCost(ctx context.Context, ep *runtime.Endpoint, chatResp *models.ChatCompletionResponse) {
+	if h.db == nil || ep.ModelID == "" || chatResp.Usage.Cost != 0 {
+		return
+	}
+	snap, err := billing.NewPricingResolver(h.db).SnapshotForModel(ctx, ep.ModelID)
+	if err != nil {
+		return
+	}
+	if snap.InputRate.IsZero() && snap.OutputRate.IsZero() && snap.CachedRate.IsZero() {
+		return
+	}
+	cachedTokens := 0
+	if chatResp.Usage.PromptTokensDetails != nil {
+		cachedTokens = chatResp.Usage.PromptTokensDetails.CachedTokens
+	}
+	inputCost, cachedCost, outputCost, totalCost := billing.ComputeCost(snap, billing.TokenCounts{
+		InputTokens:  chatResp.Usage.PromptTokens,
+		OutputTokens: chatResp.Usage.CompletionTokens,
+		CachedTokens: cachedTokens,
+	})
+	chatResp.Usage.Cost = totalCost.InexactFloat64()
+	chatResp.Usage.CostDetails = &models.UsageCostDetail{
+		UpstreamInferenceCost:            totalCost.InexactFloat64(),
+		UpstreamInferencePromptCost:      inputCost.Add(cachedCost).InexactFloat64(),
+		UpstreamInferenceCompletionsCost: outputCost.InexactFloat64(),
+	}
 }
 
 // normalizeToolCallArguments ensures tool_calls[].function.arguments is always

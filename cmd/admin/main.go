@@ -440,6 +440,13 @@ func main() {
 	a.PUT("/models/:id/deployment-mode", runtimeH.SetDeploymentMode) // managed (NexusLLM-owned) vs manual (operator-owned) container
 	a.PUT("/models/:id/capabilities", runtimeH.UpdateCapabilities)   // model capability validation
 
+	// ── Model Pricing ───────────────────────────────────────────────────────
+	// Per-token $ rate for a model. Once set, the gateway includes a computed
+	// usage.cost/usage.cost_details on every chat completion for that model
+	// (mirrors what cloud providers like OpenRouter report natively).
+	a.PUT("/models/:id/pricing", runtimeH.SetPricing)
+	a.GET("/models/:id/pricing", runtimeH.GetPricing)
+
 	// ── Projects ──────────────────────────────────────────────────────────────
 	a.POST("/projects", projectH.CreateProject)
 	a.GET("/projects", projectH.ListProjects)
