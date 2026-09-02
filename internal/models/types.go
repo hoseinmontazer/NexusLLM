@@ -237,26 +237,42 @@ type Message struct {
 	Name       string      `json:"name,omitempty"`
 	ToolCalls  interface{} `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
+	// Refusal/Reasoning are OpenRouter/OpenAI extensions. Passed through
+	// verbatim when the upstream sets them; omitted for backends that don't.
+	Refusal   interface{} `json:"refusal,omitempty"`
+	Reasoning interface{} `json:"reasoning,omitempty"`
 }
 
 // ChatCompletionResponse mirrors the OpenAI Chat Completions response.
+//
+// Provider/ServiceTier are OpenRouter extensions (the upstream provider that
+// actually served the request, e.g. "OpenAI", and the requested service
+// tier). They're populated verbatim when the upstream sets them and omitted
+// otherwise, so OpenAI/vLLM/llama.cpp responses are unaffected.
 type ChatCompletionResponse struct {
 	ID                string   `json:"id"`
 	Object            string   `json:"object"`
 	Created           int64    `json:"created"`
 	Model             string   `json:"model"`
+	Provider          string   `json:"provider,omitempty"`
 	Choices           []Choice `json:"choices"`
 	Usage             Usage    `json:"usage"`
 	SystemFingerprint string   `json:"system_fingerprint,omitempty"`
+	ServiceTier       string   `json:"service_tier,omitempty"`
 }
 
 // Choice is one generation choice in a completion response.
+//
+// NativeFinishReason is an OpenRouter extension carrying the upstream
+// provider's own finish-reason string (before OpenRouter normalizes it into
+// the standard finish_reason values).
 type Choice struct {
-	Index        int         `json:"index"`
-	Message      *Message    `json:"message,omitempty"`
-	Delta        *Delta      `json:"delta,omitempty"`
-	FinishReason *string     `json:"finish_reason"`
-	Logprobs     interface{} `json:"logprobs,omitempty"`
+	Index              int         `json:"index"`
+	Message            *Message    `json:"message,omitempty"`
+	Delta              *Delta      `json:"delta,omitempty"`
+	FinishReason       *string     `json:"finish_reason"`
+	NativeFinishReason *string     `json:"native_finish_reason,omitempty"`
+	Logprobs           interface{} `json:"logprobs,omitempty"`
 }
 
 // Delta is the streaming delta object in a chat completion chunk.
@@ -293,13 +309,34 @@ type Usage struct {
 
 	PromptTokensDetails     *UsageTokenDetails `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails *UsageTokenDetails `json:"completion_tokens_details,omitempty"`
+
+	// Cost/IsBYOK/CostDetails are OpenRouter extensions reporting what the
+	// request actually cost upstream. Passed through verbatim when the
+	// upstream sets them; omitted for backends that don't price per-request.
+	Cost        float64          `json:"cost,omitempty"`
+	IsBYOK      bool             `json:"is_byok,omitempty"`
+	CostDetails *UsageCostDetail `json:"cost_details,omitempty"`
 }
 
 // UsageTokenDetails is the OpenAI-shaped breakdown of cached/reasoning tokens
-// nested under prompt_tokens_details/completion_tokens_details.
+// nested under prompt_tokens_details/completion_tokens_details. The extra
+// fields (cache write, audio, video, image) are OpenRouter/OpenAI additions
+// that only ever populate on the side of the split they apply to.
 type UsageTokenDetails struct {
-	CachedTokens    int `json:"cached_tokens,omitempty"`
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	AudioTokens      int `json:"audio_tokens,omitempty"`
+	VideoTokens      int `json:"video_tokens,omitempty"`
+	ImageTokens      int `json:"image_tokens,omitempty"`
+}
+
+// UsageCostDetail is OpenRouter's per-request cost breakdown, nested under
+// usage.cost_details.
+type UsageCostDetail struct {
+	UpstreamInferenceCost            float64 `json:"upstream_inference_cost,omitempty"`
+	UpstreamInferencePromptCost      float64 `json:"upstream_inference_prompt_cost,omitempty"`
+	UpstreamInferenceCompletionsCost float64 `json:"upstream_inference_completions_cost,omitempty"`
 }
 
 // EmbeddingRequest mirrors the OpenAI Embeddings request body.
