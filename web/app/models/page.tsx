@@ -676,6 +676,27 @@ function DeployModelForm({ onDone }: { onDone: () => void }) {
               Suggested: <code>{DEFAULT_IMAGES[modelType] ?? 'any OpenAI-compatible HTTP server'}</code>
             </p>
           </div>
+          <div className="rounded-md border p-3 space-y-3">
+            <p className="text-xs font-medium text-muted-foreground">Model source — existing local path <span className="font-normal">(optional — pass the model repo/id via Extra args or Environment variables below instead if it should download)</span></p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label>Local model path</Label>
+                <Input value={localPath} onChange={e => setLocalPath(e.target.value)}
+                  placeholder="/models/whisper-large-v3-ct2" className="mt-1 font-mono text-xs" />
+                <p className="text-xs text-muted-foreground mt-0.5">Existing directory already mounted in the volume — no download. Mounted at this container path; pass it to the server via Extra args (e.g. <code className="bg-gray-100 px-1 rounded">--model /models/whisper-large-v3-ct2</code>).</p>
+              </div>
+              {localPath && (
+                <div>
+                  <Label>Models volume <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                  <Input value={modelsVolume} onChange={e => setModelsVolume(e.target.value)}
+                    placeholder="nexus_models" className="mt-1 font-mono text-xs" />
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Docker volume containing the path above. Defaults to <code>nexus_models</code> if left blank.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <Label>Bind port</Label>
