@@ -338,7 +338,17 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 
 	args = append(args, spec.Image)
 
-	if spec.BindPort > 0 {
+	// Skipped for images that read the port from an env var only (see
+	// usesEnvVarPortOnly). Appending ANY CMD args — even a lone "--port N" —
+	// replaces Docker's CMD entirely. Images built FROM an nvidia/cuda base
+	// (e.g. fedirz/faster-whisper-server:*-cuda) keep ENTRYPOINT=
+	// nvidia_entrypoint.sh and rely on their baked-in CMD to supply the actual
+	// interpreter + app ("python3 -m uvicorn …"); a replaced CMD of just
+	// "--port 43169" makes nvidia_entrypoint.sh's final `exec "$@"` try to exec
+	// a bare flag, which bash's exec builtin rejects immediately with
+	// "exec: --: invalid option" — the container then restart-loops without
+	// the app ever starting. Mirrors internal/nodeagent/executor.go.
+	if spec.BindPort > 0 && !usesEnvVarPortOnly(spec.Image) {
 		hasPortFlag := false
 		for _, a := range spec.ExtraArgs {
 			if a == "--port" || a == "-p" || strings.HasPrefix(a, "--port=") {
@@ -387,6 +397,22 @@ func (d *dockerDriver) buildCPUNativeArgs(spec RuntimeSpec) []string {
 
 	args = append(args, spec.ExtraArgs...)
 	return args
+}
+
+// usesEnvVarPortOnly reports whether the given cpu_native image is known to
+// read its listen port exclusively from PORT/HTTP_PORT/UVICORN_PORT (already
+// injected unconditionally via applyCommonResourceArgs) and must never
+// receive a CLI "--port" arg via CMD override. Mirrors
+// internal/nodeagent/executor.go's function of the same name — both code
+// paths must stay in sync (see the package doc comment above).
+func usesEnvVarPortOnly(image string) bool {
+	img := strings.ToLower(image)
+	for _, marker := range []string{"faster-whisper", "whisper-server", "kokoro"} {
+		if strings.Contains(img, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildLlamaCppArgs builds docker run args for llama.cpp server.

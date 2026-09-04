@@ -554,6 +554,23 @@ func backendPortEnvVars(backend string, port int) map[string]string {
 	}
 }
 
+// usesEnvVarPortOnly reports whether the given cpu_native/openai_compat image
+// is known to read its listen port exclusively from PORT/HTTP_PORT/UVICORN_PORT
+// (already injected unconditionally by backendPortEnvVars) and must never
+// receive a CLI "--port" arg via CMD override. These images are typically
+// built FROM an nvidia/cuda base and keep ENTRYPOINT=nvidia_entrypoint.sh,
+// which execs CMD directly — CMD must stay untouched (the image's own
+// "python3 -m uvicorn …" launcher), not be replaced with bare flags.
+func usesEnvVarPortOnly(image string) bool {
+	img := strings.ToLower(image)
+	for _, marker := range []string{"faster-whisper", "whisper-server", "kokoro"} {
+		if strings.Contains(img, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // backendContainerPort returns the fixed internal port a backend listens on
 // inside the container, independent of any allocation or env var override.
 //
@@ -1535,8 +1552,19 @@ func (e *Executor) buildDockerArgs(p startModelPayload) []string {
 		//      "serve --model … --port 43169 … --port 43169". argparse takes the
 		//      last value so the duplicate was harmless, but it made deployed
 		//      command lines confusing to audit.
+		//
+		//      Also skipped for images that read the port from an env var only
+		//      (see usesEnvVarPortOnly). Appending ANY CMD args — even a lone
+		//      "--port N" — replaces Docker's CMD entirely. Images built FROM an
+		//      nvidia/cuda base (e.g. fedirz/faster-whisper-server:*-cuda) keep
+		//      ENTRYPOINT=nvidia_entrypoint.sh and rely on their baked-in CMD to
+		//      supply the actual interpreter + app ("python3 -m uvicorn …"); a
+		//      replaced CMD of just "--port 43169" makes nvidia_entrypoint.sh's
+		//      final `exec "$@"` try to exec a bare flag, which bash's exec
+		//      builtin rejects immediately with "exec: --: invalid option" —
+		//      the container then restart-loops without the app ever starting.
 		args = append(args, "--network", "host")
-		emitsOwnPort := p.Backend == "vllm" || p.Backend == "tgi" || p.Backend == "tei"
+		emitsOwnPort := p.Backend == "vllm" || p.Backend == "tgi" || p.Backend == "tei" || usesEnvVarPortOnly(p.Image)
 		if p.BindPort > 0 && !emitsOwnPort {
 			hasPortFlag := false
 			for _, a := range p.ExtraArgs {
