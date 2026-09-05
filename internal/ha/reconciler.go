@@ -1145,7 +1145,12 @@ func (r *Reconciler) handleUnhealthyReplica(
 			)
 
 		case "failed", "stopped", "deleted":
-			// Replacement failed. Clear the pointer so we try again next
+			// Replacement failed. Stop its container — it never passed
+			// through 'draining', so nothing else will (see
+			// stopFailedRuntimeContainer's doc comment for why this is
+			// necessary, not redundant).
+			r.stopFailedRuntimeContainer(ctx, *replacedBy, "replacement_ended_"+replacementState)
+			// Clear the pointer so we try again next
 			// sweep, but persist next_retry_at on the ORIGINAL row so the
 			// cooldown survives — it must NOT be re-derived from updated_at,
 			// which this very statement is about to touch (production bug:
@@ -1181,6 +1186,10 @@ func (r *Reconciler) handleUnhealthyReplica(
 					`UPDATE agent_runtimes SET state='failed',
 					    error_msg='rolling replacement: startup timeout exceeded',
 					    updated_at=NOW() WHERE id=$1`, *replacedBy)
+				// The timed-out replacement's container (if one was ever
+				// started) never passed through 'draining' — stop it now or
+				// it leaks forever. See stopFailedRuntimeContainer.
+				r.stopFailedRuntimeContainer(ctx, *replacedBy, "replacement_startup_timeout")
 				_, _ = r.db.ExecContext(ctx,
 					`UPDATE agent_runtimes SET replaced_by=NULL, next_retry_at=$2, updated_at=NOW() WHERE id=$1`,
 					runtimeID, retryAt)
@@ -1290,6 +1299,59 @@ func (r *Reconciler) handleUnhealthyReplica(
 		zap.String("new_runtime", newRuntimeID),
 		zap.String("node", targetNode),
 	)
+}
+
+// stopFailedRuntimeContainer enqueues an UNLOAD_RUNTIME task for a runtime
+// row that ended up in 'failed' state WITHOUT ever passing through
+// 'draining' — e.g. a rolling-replacement attempt that itself failed to
+// start, or timed out before becoming ready. Confirmed via code review: the
+// only place in this file that ever enqueues a real stop task is
+// stopDrainedRuntime, reachable exclusively from the 'draining' state
+// (stepDrainingReplicas). A replacement that goes straight to 'failed' — or
+// a row later swept failed→stopped by sweepFailedContainers — never had its
+// physical container stopped; only its DB bookkeeping ever moved. Left
+// unfixed, this leaks one running container per failed replacement attempt,
+// accumulating indefinitely on machines with a persistently flaky health
+// check or under-provisioned node (confirmed in production: dozens of
+// same-model containers, some days old, still running with no live route to
+// them).
+//
+// Best-effort: a failure here is logged, not propagated — the caller's own
+// state transition must still proceed so the row isn't stuck retrying the
+// cleanup forever.
+func (r *Reconciler) stopFailedRuntimeContainer(ctx context.Context, runtimeID, reason string) {
+	var row struct {
+		NodeID      string `db:"node_id"`
+		ContainerID string `db:"container_id"`
+	}
+	if err := r.db.GetContext(ctx, &row, `
+		SELECT COALESCE(node_id::text,'') AS node_id, COALESCE(container_id,'') AS container_id
+		FROM agent_runtimes WHERE id = $1`, runtimeID); err != nil {
+		r.log.Warn("stopFailedRuntimeContainer: could not load runtime for cleanup",
+			zap.String("runtime_id", runtimeID), zap.String("reason", reason), zap.Error(err))
+		return
+	}
+	if row.ContainerID == "" || row.NodeID == "" {
+		// Never got far enough to have a container (e.g. failed before
+		// docker run was even attempted) — nothing to clean up.
+		return
+	}
+	_, err := r.taskMgr.Enqueue(ctx, row.NodeID,
+		taskmanager.TaskUnloadRuntime,
+		taskmanager.StopRuntimePayload{RuntimeID: runtimeID, ContainerID: row.ContainerID, DrainSecs: 5},
+		taskmanager.WithPriority(70),
+		taskmanager.WithActor("ha-reconciler-failed-cleanup"),
+		taskmanager.WithRuntimeID(runtimeID),
+		taskmanager.WithIdempotencyKey(fmt.Sprintf("failed-cleanup-stop:%s", runtimeID)),
+	)
+	if err != nil {
+		r.log.Warn("stopFailedRuntimeContainer: failed to enqueue cleanup stop",
+			zap.String("runtime_id", runtimeID), zap.String("reason", reason), zap.Error(err))
+		return
+	}
+	r.log.Info("stopFailedRuntimeContainer: cleanup stop enqueued for failed replacement container",
+		zap.String("runtime_id", runtimeID), zap.String("node_id", row.NodeID),
+		zap.String("container_id", row.ContainerID), zap.String("reason", reason))
 }
 
 // stepDrainingReplicas handles the DRAINING → STOPPED leg.
@@ -1452,18 +1514,33 @@ func (r *Reconciler) sweepFailedContainers(ctx context.Context) {
 		)
 	}
 
-	// Path 2: other failed rows — 5-minute grace period.
-	res2, _ := r.db.ExecContext(ctx, `
-		UPDATE agent_runtimes
-		SET state      = 'stopped',
-		    error_msg  = COALESCE(error_msg, '') || ' [ha-sweep: moved failed→stopped after grace period]',
-		    updated_at = NOW()
+	// Path 2: other failed rows — 5-minute grace period. Unlike Path 1, these
+	// were never confirmed dead, so (unlike a rolling-replacement failure
+	// handled inline in handleUnhealthyReplica) their container may still be
+	// running — stop each one before flipping its row to 'stopped', or it
+	// leaks exactly like the rolling-replacement case did.
+	var staleFailedIDs []string
+	_ = r.db.SelectContext(ctx, &staleFailedIDs, `
+		SELECT id FROM agent_runtimes
 		WHERE state = 'failed'
 		  AND error_msg NOT LIKE '%[container-dead]%'
 		  AND updated_at < NOW() - INTERVAL '5 minutes'`)
-	if n, _ := res2.RowsAffected(); n > 0 {
-		r.log.Info("HA sweep: failed runtimes moved to stopped after grace period",
-			zap.Int64("count", n),
-		)
+	for _, id := range staleFailedIDs {
+		r.stopFailedRuntimeContainer(ctx, id, "failed_grace_period_sweep")
+	}
+	if len(staleFailedIDs) > 0 {
+		res2, _ := r.db.ExecContext(ctx, `
+			UPDATE agent_runtimes
+			SET state      = 'stopped',
+			    error_msg  = COALESCE(error_msg, '') || ' [ha-sweep: moved failed→stopped after grace period]',
+			    updated_at = NOW()
+			WHERE state = 'failed'
+			  AND error_msg NOT LIKE '%[container-dead]%'
+			  AND updated_at < NOW() - INTERVAL '5 minutes'`)
+		if n, _ := res2.RowsAffected(); n > 0 {
+			r.log.Info("HA sweep: failed runtimes moved to stopped after grace period",
+				zap.Int64("count", n),
+			)
+		}
 	}
 }

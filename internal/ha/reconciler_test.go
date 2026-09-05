@@ -687,6 +687,98 @@ func TestHandleUnhealthyReplica_HealthyReplacement_StillDrainsOldRuntime(t *test
 	}
 }
 
+// TestHandleUnhealthyReplica_FailedReplacement_ContainerActuallyStopped
+// proves the container-leak fix: previously, when a rolling-replacement
+// attempt itself ended in 'failed' (or timed out), only its agent_runtimes
+// row was updated — the container it had already started (if any) was never
+// asked to stop, since the only stop-dispatch path (stopDrainedRuntime) is
+// reachable exclusively via the 'draining' state, which a failed replacement
+// never passes through. Confirmed in production: dozens of same-model
+// containers accumulating over hours/days with no live route to them.
+func TestHandleUnhealthyReplica_FailedReplacement_ContainerActuallyStopped(t *testing.T) {
+	db := setupReconcilerTestDB(t)
+	f := seedReconcilerFixture(t, db, "always_on")
+	runtimeID := f.seedUnhealthyRuntime(t, time.Now(), 0)
+	f.backdateUpdatedAt(t, runtimeID, unhealthyRecoveryCooldown(0)+time.Second)
+
+	ctx := context.Background()
+	f.r.rollingReplacementSweep(ctx)
+
+	_, replacedBy, _ := f.rowState(t, runtimeID)
+	if replacedBy == nil {
+		t.Fatal("expected a replacement to have been spawned")
+	}
+
+	// Simulate the replacement having actually started a real container
+	// (container_id populated by the node-agent's TaskResult) and then
+	// failing before ever becoming ready.
+	const fakeContainerID = "deadbeef0000"
+	if _, err := db.Exec(`UPDATE agent_runtimes SET state='failed', container_id=$2 WHERE id=$1`,
+		*replacedBy, fakeContainerID); err != nil {
+		t.Fatalf("mark replacement failed with container_id: %v", err)
+	}
+
+	f.r.rollingReplacementSweep(ctx)
+
+	// The hub row must have cleared its pointer (existing behavior).
+	_, clearedReplacedBy, _ := f.rowState(t, runtimeID)
+	if clearedReplacedBy != nil {
+		t.Fatalf("expected replaced_by cleared after replacement failed, still %v", *clearedReplacedBy)
+	}
+
+	// The fix: an UNLOAD_RUNTIME task must have been enqueued for the FAILED
+	// REPLACEMENT's runtime_id — this is the only mechanism that actually
+	// stops the physical container. Without the fix, agent_tasks stays empty.
+	var taskCount int
+	if err := db.Get(&taskCount, `
+		SELECT COUNT(*) FROM agent_tasks
+		WHERE task_type = 'UNLOAD_RUNTIME' AND runtime_id::text = $1`, *replacedBy); err != nil {
+		t.Fatalf("query agent_tasks: %v", err)
+	}
+	if taskCount == 0 {
+		t.Fatalf("expected an UNLOAD_RUNTIME task enqueued for the failed replacement's container (runtime_id=%s) — none found; the container leaks", *replacedBy)
+	}
+}
+
+// TestSweepFailedContainers_GracePeriodRows_ContainerActuallyStopped proves
+// the same fix applies to the general failed→stopped grace-period sweep, not
+// just the rolling-replacement path — any 'failed' row with a real
+// container_id that wasn't confirmed dead must get a stop dispatched before
+// its bookkeeping moves to 'stopped'.
+func TestSweepFailedContainers_GracePeriodRows_ContainerActuallyStopped(t *testing.T) {
+	db := setupReconcilerTestDB(t)
+	f := seedReconcilerFixture(t, db, "always_on")
+
+	const fakeContainerID = "cafef00dbaad"
+	var runtimeID string
+	// error_msg must be non-NULL and not match '%[container-dead]%' — Path 2's
+	// filter is `error_msg NOT LIKE ...`, which is NULL (excludes the row) for
+	// a NULL error_msg, same as the original Path 1/Path 2 split intends.
+	if err := f.db.Get(&runtimeID, `
+		INSERT INTO agent_runtimes (node_id, model_id, runtime_name, backend, state, container_id, error_msg, bind_port, replica_index, updated_at)
+		VALUES ($1,$2,$3,'llamacpp','failed',$4,'startup probe failed',8100,0,NOW() - INTERVAL '10 minutes') RETURNING id::text`,
+		f.nodeID, f.modelID, "nexus-"+uuid.New().String()[:8], fakeContainerID); err != nil {
+		t.Fatalf("seed stale failed runtime: %v", err)
+	}
+
+	f.r.sweepFailedContainers(context.Background())
+
+	state, _, _ := f.rowState(t, runtimeID)
+	if state != "stopped" {
+		t.Fatalf("expected row moved to 'stopped' after grace period, got %q", state)
+	}
+
+	var taskCount int
+	if err := db.Get(&taskCount, `
+		SELECT COUNT(*) FROM agent_tasks
+		WHERE task_type = 'UNLOAD_RUNTIME' AND runtime_id::text = $1`, runtimeID); err != nil {
+		t.Fatalf("query agent_tasks: %v", err)
+	}
+	if taskCount == 0 {
+		t.Fatalf("expected an UNLOAD_RUNTIME task enqueued before the grace-period sweep marked this row 'stopped' — none found; the container leaks")
+	}
+}
+
 // TestNextReplicaIndex_PicksSmallestUnusedSlot proves the replica_index
 // collision fix directly: production data showed two simultaneously-active
 // replicas both labeled "-r1-" (forensic audit, Case File 003, round 6).
