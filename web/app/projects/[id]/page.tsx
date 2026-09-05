@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy, type CatalogProvider, type ProjectProviderAccess, type Model } from '@/lib/api'
+import { api, type AdmissionPolicy, type PriorityPreset, type ProjectPolicy, type CatalogProvider, type ProjectProviderAccess, type ProviderCredential, type Model } from '@/lib/api'
 import { PriorityBadge, PriorityBar, EffectivePriorityCard, weightLabel } from '@/components/projects/PriorityBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -14,7 +14,7 @@ import {
   ArrowLeft, Shield, Zap, Activity, AlertTriangle,
   Server, BarChart2, Clock, DollarSign, Layers, Gauge,
   Settings2, TrendingUp, Percent, Globe, CheckCircle2,
-  Loader2, Trash2, Plus, ShieldCheck, Cpu, X,
+  Loader2, Trash2, Plus, ShieldCheck, Cpu, X, KeyRound,
 } from 'lucide-react'
 
 // ── Policy & Quota panel ──────────────────────────────────────────────────────
@@ -821,6 +821,7 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
   // Grant form state
   const [showForm, setShowForm] = useState(false)
   const [selectedProvider, setSelectedProvider] = useState('')
+  const [selectedCredential, setSelectedCredential] = useState('')
   const [allowedRaw, setAllowedRaw] = useState('')
   const [deniedRaw, setDeniedRaw] = useState('')
 
@@ -828,6 +829,25 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editAllowed, setEditAllowed] = useState('')
   const [editDenied, setEditDenied] = useState('')
+
+  // Credential picker for the currently-selected provider in the grant form.
+  const { data: newGrantCredsData } = useQuery({
+    queryKey: ['provider-credentials', selectedProvider],
+    queryFn: () => api.providerCredentials.list(selectedProvider),
+    enabled: !!selectedProvider,
+  })
+  const newGrantCredentials: ProviderCredential[] = newGrantCredsData?.data ?? []
+
+  // Inline "change credential" state — keyed by grant provider_id, separate
+  // from the prefix editor so either can be opened independently.
+  const [credentialEditingId, setCredentialEditingId] = useState<string | null>(null)
+  const [editCredential, setEditCredential] = useState('')
+  const { data: editCredsData } = useQuery({
+    queryKey: ['provider-credentials', credentialEditingId],
+    queryFn: () => api.providerCredentials.list(credentialEditingId!),
+    enabled: !!credentialEditingId,
+  })
+  const editCredentials: ProviderCredential[] = editCredsData?.data ?? []
 
   const splitPrefixes = (raw: string) =>
     raw.split('\n').map(s => s.trim()).filter(Boolean)
@@ -837,6 +857,7 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
     mutationFn: () =>
       api.providerAccess.grant(projectId, {
         provider_id: selectedProvider,
+        credential_id: selectedCredential || undefined,
         allowed_prefixes: splitPrefixes(allowedRaw),
         denied_prefixes: splitPrefixes(deniedRaw),
       }),
@@ -845,6 +866,7 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
       qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
       setShowForm(false)
       setSelectedProvider('')
+      setSelectedCredential('')
       setAllowedRaw('')
       setDeniedRaw('')
     },
@@ -862,6 +884,20 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
       toast({ title: 'Prefix rules updated' })
       qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
       setEditingId(null)
+    },
+    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
+  })
+
+  // Change (or clear) the pinned credential on an existing grant. Passing ''
+  // clears the pin (credential_id: null) so the project falls back to the
+  // provider's default credential.
+  const updateCredentialMut = useMutation({
+    mutationFn: ({ pid, credentialId }: { pid: string; credentialId: string }) =>
+      api.providerAccess.update(projectId, pid, { credential_id: credentialId || null }),
+    onSuccess: () => {
+      toast({ title: 'Credential updated' })
+      qc.invalidateQueries({ queryKey: ['project-provider-access', projectId] })
+      setCredentialEditingId(null)
     },
     onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
   })
@@ -954,8 +990,34 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
                         Granted {new Date(g.created_at).toLocaleDateString()}
                         {g.updated_at !== g.created_at && ` · Updated ${new Date(g.updated_at).toLocaleDateString()}`}
                       </p>
+                      {/* Which upstream credential this project's calls to this
+                          provider actually use — the answer to "which OpenRouter
+                          token is this NexusLLM key connected to?" */}
+                      <p className="text-xs flex items-center gap-1.5 mt-1">
+                        <KeyRound className="w-3 h-3 text-muted-foreground" />
+                        <span className="text-muted-foreground">Credential:</span>
+                        {g.credential_name ? (
+                          <code className="bg-white border border-amber-200 px-1.5 py-0.5 rounded text-amber-800 font-medium">
+                            {g.credential_name}
+                          </code>
+                        ) : (
+                          <span className="text-muted-foreground italic">provider default</span>
+                        )}
+                      </p>
                     </div>
                     <div className="flex gap-1 shrink-0">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => {
+                          const opening = credentialEditingId !== g.provider_id
+                          setCredentialEditingId(opening ? g.provider_id : null)
+                          setEditCredential(opening ? (g.credential_id ?? '') : '')
+                        }}
+                      >
+                        {credentialEditingId === g.provider_id ? 'Cancel' : 'Change credential'}
+                      </Button>
                       <Button
                         size="sm"
                         variant="ghost"
@@ -983,6 +1045,36 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
                       </Button>
                     </div>
                   </div>
+
+                  {/* Inline credential editor */}
+                  {credentialEditingId === g.provider_id && (
+                    <div className="space-y-2 pt-1 border-t border-amber-200">
+                      <Label className="text-[10px]">
+                        Pin a specific credential <span className="text-muted-foreground font-normal">(or leave as "provider default")</span>
+                      </Label>
+                      <select
+                        className="w-full border rounded-md h-9 px-3 text-sm"
+                        value={editCredential}
+                        onChange={e => setEditCredential(e.target.value)}
+                      >
+                        <option value="">— provider default —</option>
+                        {editCredentials.map(c => (
+                          <option key={c.id} value={c.id} disabled={!c.enabled}>
+                            {c.name}{c.is_default ? ' (default)' : ''}{!c.enabled ? ' — disabled' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <Button
+                        size="sm"
+                        disabled={updateCredentialMut.isPending}
+                        onClick={() => updateCredentialMut.mutate({ pid: g.provider_id, credentialId: editCredential })}
+                      >
+                        {updateCredentialMut.isPending ? (
+                          <><Loader2 className="w-3 h-3 animate-spin mr-1" />Saving…</>
+                        ) : 'Save credential'}
+                      </Button>
+                    </div>
+                  )}
 
                   {/* Prefix summary — collapsed view */}
                   {!isEditing && (
@@ -1115,6 +1207,30 @@ function ProviderAccessPanel({ projectId }: { projectId: string }) {
 
                 {selectedProvider && (
                   <>
+                    <div>
+                      <Label className="text-xs">
+                        Credential <span className="text-muted-foreground font-normal">(optional — which upstream token this project uses)</span>
+                      </Label>
+                      <select
+                        className="w-full border rounded-md h-9 px-3 text-sm mt-1"
+                        value={selectedCredential}
+                        onChange={e => setSelectedCredential(e.target.value)}
+                      >
+                        <option value="">— provider default —</option>
+                        {newGrantCredentials.map(c => (
+                          <option key={c.id} value={c.id} disabled={!c.enabled}>
+                            {c.name}{c.is_default ? ' (default)' : ''}{!c.enabled ? ' — disabled' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {newGrantCredentials.length === 0 && (
+                        <p className="text-[10px] text-muted-foreground mt-1">
+                          No named credentials configured for this provider yet — every project will share the
+                          provider's single legacy API key until you add some in <strong>Providers → Credentials</strong>.
+                        </p>
+                      )}
+                    </div>
+
                     <div className="rounded-md bg-gray-50 border px-3 py-2.5 text-xs text-muted-foreground space-y-1">
                       <p className="font-medium text-foreground">
                         Virtual model names from this provider look like:

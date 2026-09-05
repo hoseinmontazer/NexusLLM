@@ -3,14 +3,15 @@
 import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type CatalogEntry, type ExposureRule, type ExposureMode, type ProjectProviderAccess, type ProviderLiveModel } from '@/lib/api'
+import { api, type CatalogEntry, type ExposureRule, type ExposureMode, type ProjectProviderAccess, type ProviderCredential, type ProviderLiveModel } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { toast } from '@/components/ui/toaster'
 import {
   ArrowLeft, RefreshCw, Zap, Search, CheckCircle2,
-  XCircle, Loader2, Settings, Shield, Eye, PackageCheck, Users, Globe,
+  XCircle, Loader2, Settings, Shield, Eye, PackageCheck, Users, Globe, KeyRound, Trash2, Plus, Ban,
 } from 'lucide-react'
 
 // ── Capability badges ──────────────────────────────────────────────────────────
@@ -992,6 +993,183 @@ function ProjectAccessTab({ providerId, providerName }: { providerId: string; pr
   )
 }
 
+// ── Credentials tab ─────────────────────────────────────────────────────────────
+// Manages the named credential pool for this provider (migration 062). This is
+// what lets two projects hitting the same provider (e.g. two OpenRouter
+// accounts) land on two different upstream tokens — see the "Project Access"
+// tab, where each grant is pinned to one of these credentials. Secrets are
+// entered here once, encrypted server-side, and never shown again.
+
+function CredentialsTab({ providerId, providerName }: { providerId: string; providerName: string }) {
+  const qc = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ['provider-credentials', providerId],
+    queryFn: () => api.providerCredentials.list(providerId),
+    refetchInterval: 30_000,
+  })
+  const credentials: ProviderCredential[] = data?.data ?? []
+
+  const [showForm, setShowForm] = useState(false)
+  const [name, setName] = useState('')
+  const [secret, setSecret] = useState('')
+  const [isDefault, setIsDefault] = useState(credentials.length === 0)
+
+  const createMut = useMutation({
+    mutationFn: () => api.providerCredentials.create(providerId, { name, secret, is_default: isDefault }),
+    onSuccess: (c) => {
+      toast({ title: 'Credential created', description: `"${c.name}" is ready to assign to a project.` })
+      qc.invalidateQueries({ queryKey: ['provider-credentials', providerId] })
+      setShowForm(false); setName(''); setSecret(''); setIsDefault(false)
+    },
+    onError: (e: any) => toast({ title: 'Create failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const toggleMut = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.providerCredentials.update(providerId, id, { enabled }),
+    onSuccess: () => {
+      toast({ title: 'Credential updated' })
+      qc.invalidateQueries({ queryKey: ['provider-credentials', providerId] })
+    },
+    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const setDefaultMut = useMutation({
+    mutationFn: (id: string) => api.providerCredentials.update(providerId, id, { is_default: true }),
+    onSuccess: () => {
+      toast({ title: 'Default credential changed' })
+      qc.invalidateQueries({ queryKey: ['provider-credentials', providerId] })
+    },
+    onError: (e: any) => toast({ title: 'Update failed', description: e.message, variant: 'destructive' }),
+  })
+
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => api.providerCredentials.delete(providerId, id),
+    onSuccess: (r) => {
+      toast({ title: 'Credential deleted', description: r.note })
+      qc.invalidateQueries({ queryKey: ['provider-credentials', providerId] })
+    },
+    onError: (e: any) => toast({ title: 'Delete failed', description: e.message, variant: 'destructive' }),
+  })
+
+  return (
+    <div className="space-y-5 max-w-2xl">
+      <div className="rounded-md bg-amber-50 border border-amber-200 px-4 py-3 text-xs text-amber-800 space-y-1">
+        <p className="font-semibold flex items-center gap-1.5">
+          <KeyRound className="w-3.5 h-3.5" />Multi-Credential Routing
+        </p>
+        <p>
+          Add one credential per upstream account (e.g. two different {providerName} API tokens for two
+          different apps). Assign each to a project in that project's <strong>Provider Access</strong> tab.
+          A project with no credential assigned uses whichever one is marked <strong>default</strong> below.
+        </p>
+        <p>Secrets are encrypted at rest and never displayed again after creation — not here, not in any API response.</p>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center justify-between">
+            <span className="flex items-center gap-2"><KeyRound className="w-4 h-4" />Credentials</span>
+            {!showForm && (
+              <Button size="sm" onClick={() => { setShowForm(true); setIsDefault(credentials.length === 0) }}>
+                <Plus className="w-3.5 h-3.5 mr-1" />Add credential
+              </Button>
+            )}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {isLoading && (
+            <p className="text-sm text-muted-foreground flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />Loading…
+            </p>
+          )}
+
+          {!isLoading && credentials.length === 0 && !showForm && (
+            <div className="rounded-lg border bg-white p-6 text-center space-y-1">
+              <KeyRound className="w-6 h-6 mx-auto text-muted-foreground opacity-30" />
+              <p className="text-sm text-muted-foreground">
+                No named credentials yet — every project shares this provider's single legacy API key
+                (set in the Overview tab) until you add one.
+              </p>
+            </div>
+          )}
+
+          {credentials.map(c => (
+            <div key={c.id} className={`rounded-lg border p-3 flex items-center justify-between gap-3 ${
+              c.enabled ? 'border-amber-200 bg-amber-50/40' : 'border-gray-200 bg-gray-50 opacity-60'
+            }`}>
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold text-sm">{c.name}</span>
+                  {c.is_default && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full border font-medium bg-violet-100 text-violet-700 border-violet-200">
+                      default
+                    </span>
+                  )}
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded-full border font-medium ${
+                    c.enabled ? 'bg-green-100 text-green-700 border-green-200' : 'bg-gray-100 text-gray-500 border-gray-200'
+                  }`}>
+                    {c.enabled ? 'active' : 'disabled'}
+                  </span>
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  Assigned to {c.assigned_count} project{c.assigned_count === 1 ? '' : 's'}
+                  {c.last_used_at && ` · Last used ${new Date(c.last_used_at).toLocaleString()}`}
+                </p>
+              </div>
+              <div className="flex gap-1 shrink-0">
+                {!c.is_default && (
+                  <Button size="sm" variant="ghost" className="h-7 px-2 text-xs"
+                    disabled={setDefaultMut.isPending}
+                    onClick={() => setDefaultMut.mutate(c.id)}>
+                    Make default
+                  </Button>
+                )}
+                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs"
+                  disabled={toggleMut.isPending}
+                  onClick={() => toggleMut.mutate({ id: c.id, enabled: !c.enabled })}>
+                  {c.enabled ? <><Ban className="w-3 h-3 mr-1" />Disable</> : 'Enable'}
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs text-red-600 hover:text-red-700 hover:bg-red-50"
+                  disabled={deleteMut.isPending}
+                  onClick={() => deleteMut.mutate(c.id)}>
+                  <Trash2 className="w-3 h-3" />
+                </Button>
+              </div>
+            </div>
+          ))}
+
+          {showForm && (
+            <div className="space-y-3 rounded-lg border p-3">
+              <div>
+                <Label className="text-xs">Name <span className="text-muted-foreground font-normal">(internal label, e.g. "production-app-a")</span></Label>
+                <Input value={name} onChange={e => setName(e.target.value)} placeholder="production-app-a" className="mt-1" />
+              </div>
+              <div>
+                <Label className="text-xs">Secret <span className="text-muted-foreground font-normal">(the actual {providerName} API token — encrypted on save, shown only now)</span></Label>
+                <Input type="password" value={secret} onChange={e => setSecret(e.target.value)} placeholder="sk-or-v1-…" className="mt-1 font-mono" />
+              </div>
+              <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+                <input type="checkbox" checked={isDefault} onChange={e => setIsDefault(e.target.checked)} className="h-3.5 w-3.5" />
+                Make this the provider's default credential (used by any project with no credential pinned)
+              </label>
+              <div className="flex gap-2">
+                <Button size="sm" disabled={createMut.isPending || !name || !secret}
+                  onClick={() => createMut.mutate()}>
+                  {createMut.isPending ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Creating…</> : 'Create credential'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => { setShowForm(false); setName(''); setSecret('') }}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 // ── Live Models tab ────────────────────────────────────────────────────────────
 // Calls GET /admin/v1/providers/:id/live-models on the admin server, which
 // proxies the request to the provider using stored credentials and transport
@@ -1188,7 +1366,7 @@ function LiveModelsTab({ providerId, providerDisplayName }: { providerId: string
 
 // ---- Main provider detail page
 
-type Tab = 'overview' | 'catalog' | 'rules' | 'access' | 'live'
+type Tab = 'overview' | 'catalog' | 'rules' | 'access' | 'credentials' | 'live'
 
 export default function ProviderDetailPage() {
   const params = useParams()
@@ -1212,6 +1390,7 @@ export default function ProviderDetailPage() {
     { key: 'catalog',  label: `Catalog (${p?.catalog_model_count ?? '…'})`,           icon: Zap },
     { key: 'rules',    label: 'Exposure Rules',                                        icon: Shield },
     { key: 'access',   label: 'Project Access',                                        icon: Users },
+    { key: 'credentials', label: 'Credentials',                                       icon: KeyRound },
     { key: 'live',     label: 'Live Models',                                           icon: Globe },
   ]
 
@@ -1281,6 +1460,9 @@ export default function ProviderDetailPage() {
             providerId={id}
             providerName={p?.catalog_expose_prefix || p?.name || id}
           />
+        )}
+        {tab === 'credentials' && (
+          <CredentialsTab providerId={id} providerName={p?.display_name ?? p?.name ?? id} />
         )}
         {tab === 'live' && (
           <LiveModelsTab providerId={id} providerDisplayName={p?.display_name ?? p?.name ?? id} />
