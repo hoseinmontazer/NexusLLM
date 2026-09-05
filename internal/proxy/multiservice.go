@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/middleware"
 	"github.com/nexusllm/nexusllm/internal/models"
 	"github.com/nexusllm/nexusllm/internal/policy"
@@ -205,7 +206,13 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 	if err != nil {
 		// Registry miss — try Mode-B virtual catalog resolver.
 		if h.virtualResolver != nil {
-			vep, verr := h.virtualResolver.Resolve(c.Request.Context(), realModel)
+			vep, _, verr := h.virtualResolver.ResolveForProject(c.Request.Context(), realModel, claims.ProjectID)
+			if verr == catalog.ErrCredentialUnavailable {
+				h.decrementInflight(c.Request.Context(), claims.TeamID, claims.ProjectID, realModel)
+				abortErr(c, http.StatusFailedDependency, "provider_credential_unavailable",
+					fmt.Sprintf("no usable provider credential is assigned to this project for model %q", realModel))
+				return pipelineResult{}, false
+			}
 			if verr != nil {
 				h.log.Warn("virtual resolver error in pipelineSetup",
 					zap.String("model", realModel), zap.Error(verr))
@@ -307,7 +314,7 @@ func (h *Handler) Rerank(c *gin.Context) {
 	respBody, _ := io.ReadAll(resp.Body)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID,
-		ModelName: res.realModel, EndpointID: ep.ID,
+		ModelName: res.realModel, EndpointID: ep.ID, CredentialID: ep.CredentialID,
 		LatencyMs: int(time.Since(start).Milliseconds()),
 		Status:    statusFromHTTP(resp.StatusCode),
 	})
@@ -412,7 +419,7 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID,
-		ModelName: res.realModel, EndpointID: ep.ID,
+		ModelName: res.realModel, EndpointID: ep.ID, CredentialID: ep.CredentialID,
 		LatencyMs: int(time.Since(start).Milliseconds()), Status: "success",
 	})
 }
@@ -474,7 +481,7 @@ func (h *Handler) Speech(c *gin.Context) {
 
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID,
-		ModelName: res.realModel, EndpointID: ep.ID,
+		ModelName: res.realModel, EndpointID: ep.ID, CredentialID: ep.CredentialID,
 		LatencyMs: int(time.Since(start).Milliseconds()),
 		Status:    statusFromHTTP(resp.StatusCode),
 	})
@@ -533,7 +540,7 @@ func (h *Handler) OCR(c *gin.Context) {
 	respBody, _ := io.ReadAll(resp.Body)
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID,
-		ModelName: res.realModel, EndpointID: ep.ID,
+		ModelName: res.realModel, EndpointID: ep.ID, CredentialID: ep.CredentialID,
 		LatencyMs: int(time.Since(start).Milliseconds()),
 		Status:    statusFromHTTP(resp.StatusCode),
 	})

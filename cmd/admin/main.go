@@ -35,6 +35,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/replicaguard"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/scheduler"
+	"github.com/nexusllm/nexusllm/internal/secretstore"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -240,11 +241,13 @@ func main() {
 	haH := handlers.NewHAHandler(db)
 	ppH2 := handlers.NewProjectPolicyHandler(db, rdb, policyEngine, usageTracker)
 	factory2 := runtime.NewFactory(&http.Client{Timeout: 10 * time.Second})
-	catalogResolver := catalog.NewVirtualModelResolver(db, log)
+	credentialSecrets := loadCredentialSecretStore(log)
+	catalogResolver := catalog.NewVirtualModelResolver(db, log, credentialSecrets)
 	catalogScheduler := catalog.NewSyncScheduler(db, factory2, log)
 	go catalogScheduler.Start(usageCtx)
 	authSvc := internalauth.NewService(rdb, db, cfg.Auth.JWTSecret, 24*time.Hour)
-	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry).WithPolicyEngine(policyEngine)
+	catalogH := handlers.NewCatalogHandler(db, catalogScheduler, catalogResolver, registry).
+		WithPolicyEngine(policyEngine).WithSecretStore(credentialSecrets)
 	portalH := handlers.NewPortalHandler(db, rdb, policyEngine, registry, catalogResolver, authSvc)
 	userH := handlers.NewUserHandler(db, authSvc)
 
@@ -323,6 +326,15 @@ func main() {
 	a.POST("/providers/:id/rules", catalogH.CreateRule)
 	a.DELETE("/providers/:id/rules/:rid", catalogH.DeleteRule)
 	a.POST("/providers/:id/rules/preview", catalogH.PreviewRules)
+	// Provider credential pool — multi-credential routing (migration 062).
+	// GET    /admin/v1/providers/:id/credentials                — list (no secrets)
+	// POST   /admin/v1/providers/:id/credentials                — create (encrypts secret)
+	// PATCH  /admin/v1/providers/:id/credentials/:credential_id — enable/disable/set default
+	// DELETE /admin/v1/providers/:id/credentials/:credential_id — delete
+	a.GET("/providers/:id/credentials", catalogH.ListProviderCredentials)
+	a.POST("/providers/:id/credentials", catalogH.CreateProviderCredential)
+	a.PATCH("/providers/:id/credentials/:credential_id", catalogH.UpdateProviderCredential)
+	a.DELETE("/providers/:id/credentials/:credential_id", catalogH.DeleteProviderCredential)
 	a.POST("/models/catalog-alias", catalogH.RegisterCatalogAlias)
 	a.POST("/models/external", runtimeH.RegisterExternalModel) // cloud/provider models
 	a.POST("/models/deploy", runtimeH.DeployModel)
@@ -600,6 +612,28 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 	_ = metricsSrv.Shutdown(shutCtx)
 	log.Info("nexus-admin stopped")
+}
+
+// loadCredentialSecretStore builds the secretstore.Store used to encrypt new
+// provider_credentials secrets on write and decrypt them for LiveModels/
+// test-provider calls. Returns nil when NEXUS_CREDENTIAL_ENCRYPTION_KEY is
+// unset or invalid — CreateProviderCredential then refuses to create a
+// credential (rather than ever storing one unencrypted), while everything
+// that only needs the legacy providers.api_key column keeps working.
+func loadCredentialSecretStore(log *zap.Logger) *secretstore.Store {
+	raw := os.Getenv(secretstore.KeyEnvVar)
+	if raw == "" {
+		log.Warn(secretstore.KeyEnvVar + " is not set — creating new provider credentials is disabled; " +
+			"legacy providers.api_key resolution still works")
+		return nil
+	}
+	store, err := secretstore.NewFromBase64Key(raw)
+	if err != nil {
+		log.Error("invalid "+secretstore.KeyEnvVar+" — creating new provider credentials is disabled",
+			zap.Error(err))
+		return nil
+	}
+	return store
 }
 
 // startInProcessAgent self-registers the current machine as a cluster node

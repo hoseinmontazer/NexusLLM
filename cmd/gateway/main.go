@@ -26,6 +26,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/proxy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/runtimemgr"
+	"github.com/nexusllm/nexusllm/internal/secretstore"
 	"github.com/nexusllm/nexusllm/internal/taskmanager"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -204,14 +205,14 @@ func main() {
 	// ── Billing services ──────────────────────────────────────────────────────
 	expiryPolicy := billing.ExpiryRecoveryPolicy(cfg.Billing.ExpiryRecoveryPolicy)
 	billingReserver := billing.NewReserver(db, log).WithAuthTTL(cfg.Billing.AuthTTL)
-	billingSettler  := billing.NewSettler(db, log, expiryPolicy)
+	billingSettler := billing.NewSettler(db, log, expiryPolicy)
 
 	// ── Billing background sweeps ─────────────────────────────────────────────
 	// All sweeps are idempotent and safe to run concurrently with requests.
 	pendingSweep := billingsweep.NewPendingSweep(db, billingSettler, billingReserver, log)
-	expirySweep  := billingsweep.NewExpirySweep(db, log)
-	walletRecon  := billingsweep.NewWalletReconciler(db, log)
-	quotaSync    := billingsweep.NewQuotaLedgerSync(db, log)
+	expirySweep := billingsweep.NewExpirySweep(db, log)
+	walletRecon := billingsweep.NewWalletReconciler(db, log)
+	quotaSync := billingsweep.NewQuotaLedgerSync(db, log)
 
 	go pendingSweep.Start(watchCtx, 5*time.Minute)
 	go expirySweep.Start(watchCtx, 2*time.Minute)
@@ -226,7 +227,8 @@ func main() {
 	_ = billingSettler
 
 	// ── Proxy handler ─────────────────────────────────────────────────────────
-	catalogResolver := catalog.NewVirtualModelResolver(db, log)
+	credentialSecrets := loadCredentialSecretStore(log)
+	catalogResolver := catalog.NewVirtualModelResolver(db, log, credentialSecrets)
 	capValidator := proxy.NewCapabilityValidator(registry).WithCatalogResolver(catalogResolver)
 	proxyHandler := proxy.NewHandler(
 		policyEngine, gwPolicyEng, ppEngine, aliasRes,
@@ -234,7 +236,7 @@ func main() {
 	).WithActivator(activator).WithDB(db).WithColdStartTimeout(rmCfg.ColdStartTimeout).
 		WithStartTracker(startTracker).
 		WithCapabilityValidator(capValidator).WithFactory(factory).
-		WithVirtualResolver(catalogResolver)
+		WithVirtualResolver(catalogResolver).WithSecretStore(credentialSecrets)
 
 	// ── Policy live reload every 60s ──────────────────────────────────────────
 	// Uses a sync.RWMutex-protected wrapper to avoid data races between the
@@ -421,6 +423,31 @@ func seedProjectPolicies(ctx context.Context, db *sqlx.DB, engine *policy.Engine
 		})
 	}
 	log.Info("project policies seeded", zap.Int("count", len(rows)))
+}
+
+// loadCredentialSecretStore builds the secretstore.Store used to decrypt
+// provider_credentials.secret_ciphertext (migration 062). Returns nil when
+// NEXUS_CREDENTIAL_ENCRYPTION_KEY is unset or invalid — deployments that have
+// not created any provider_credentials rows yet keep working unchanged
+// (CredentialResolver falls back to the legacy providers.api_key column,
+// which never needs decryption). The moment an operator creates their first
+// provider_credentials row without this key configured, resolution for that
+// provider fails loudly (provider_credential_unavailable) rather than ever
+// serving a wrong or empty credential.
+func loadCredentialSecretStore(log *zap.Logger) *secretstore.Store {
+	raw := os.Getenv(secretstore.KeyEnvVar)
+	if raw == "" {
+		log.Warn(secretstore.KeyEnvVar + " is not set — multi-credential provider routing " +
+			"is unavailable; only legacy providers.api_key resolution will work")
+		return nil
+	}
+	store, err := secretstore.NewFromBase64Key(raw)
+	if err != nil {
+		log.Error("invalid "+secretstore.KeyEnvVar+" — multi-credential provider routing disabled",
+			zap.Error(err))
+		return nil
+	}
+	return store
 }
 
 // seedProjectProviderAccess loads all project_provider_access rows for

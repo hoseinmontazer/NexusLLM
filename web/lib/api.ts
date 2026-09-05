@@ -615,6 +615,27 @@ export interface ProjectProviderAccess {
   enabled: boolean
   created_at: string
   updated_at: string
+  /** provider_credentials.id this grant is pinned to (migration 062). null =
+   *  falls back to the provider's default credential. Never the secret. */
+  credential_id: string | null
+  credential_name: string | null
+}
+
+export interface ProviderCredential {
+  id: string
+  provider_id: string
+  name: string
+  api_key_header?: string
+  is_default: boolean
+  enabled: boolean
+  metadata?: Record<string, unknown>
+  last_used_at?: string
+  created_at: string
+  updated_at: string
+  /** How many enabled project_provider_access grants are pinned to this
+   *  credential right now — shown so an operator sees the blast radius
+   *  before disabling/deleting it. */
+  assigned_count: number
 }
 
 export interface CatalogEntry {
@@ -1127,22 +1148,53 @@ export const api = {
         'GET', `/projects/${projectId}/provider-access`),
     grant: (projectId: string, b: {
       provider_id: string
+      /** provider_credentials.id to pin this grant to (migration 062).
+       *  Omit/undefined = use the provider's default credential. */
+      credential_id?: string
       allowed_prefixes?: string[]
       denied_prefixes?: string[]
     }) => req<{
       id: string; project_id: string; provider_id: string
-      provider_name: string; exposure_mode: string
+      provider_name: string; exposure_mode: string; credential_id: string | null
       allowed_prefixes: string[]; denied_prefixes: string[]; note: string
     }>('POST', `/projects/${projectId}/provider-access`, b),
     update: (projectId: string, providerId: string, b: {
       allowed_prefixes?: string[]
       denied_prefixes?: string[]
       enabled?: boolean
+      /** Pass null to explicitly clear the pin (fall back to provider
+       *  default); omit the key entirely to leave the current pin unchanged. */
+      credential_id?: string | null
     }) => req<{ message: string; project_id: string; provider_id: string }>(
       'PUT', `/projects/${projectId}/provider-access/${providerId}`, b),
     revoke: (projectId: string, providerId: string) =>
       req<{ message: string; project_id: string; provider_id: string }>(
         'DELETE', `/projects/${projectId}/provider-access/${providerId}`),
+  },
+
+  // ── Provider Credentials (migration 062) — multi-credential routing ──────
+  // The pool of named upstream credentials for one provider. A project is
+  // routed to exactly one of these via providerAccess.grant/update's
+  // credential_id — never per-API-key, always per-project (see
+  // migrations/062_provider_credentials.sql). Secrets are never returned by
+  // any of these calls.
+  providerCredentials: {
+    list: (providerId: string) =>
+      req<{ data: ProviderCredential[]; total: number; provider_id: string }>(
+        'GET', `/providers/${providerId}/credentials`),
+    create: (providerId: string, b: {
+      name: string
+      /** Plaintext secret — encrypted server-side, never echoed back or logged. */
+      secret: string
+      api_key_header?: string
+      is_default?: boolean
+    }) => req<ProviderCredential>('POST', `/providers/${providerId}/credentials`, b),
+    update: (providerId: string, credentialId: string, b: {
+      enabled?: boolean
+      is_default?: boolean
+    }) => req<ProviderCredential>('PATCH', `/providers/${providerId}/credentials/${credentialId}`, b),
+    delete: (providerId: string, credentialId: string) =>
+      req<{ message: string; note: string }>('DELETE', `/providers/${providerId}/credentials/${credentialId}`),
   },
 
   // ── Project policy & quota (migration 023) ────────────────────────────────

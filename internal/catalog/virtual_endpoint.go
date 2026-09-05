@@ -19,6 +19,20 @@ type VirtualEndpoint struct {
 	UpstreamModelName string
 	Transport         runtime.ProviderTransportConfig
 
+	// providerID is the raw provider UUID (unlike ID, which is a composite
+	// "virt:..." string) — used by ResolveForProject to look up the caller's
+	// project-specific credential. Not exported: only this package resolves
+	// credentials.
+	providerID string
+
+	// CredentialHeader and CredentialID are populated by ResolveForProject
+	// (empty when built via the legacy Resolve). CredentialHeader is the
+	// header name the resolved secret must be sent on (usually
+	// "Authorization"); CredentialID identifies which provider_credentials
+	// row was used, for usage/cost attribution — never the secret itself.
+	CredentialHeader string
+	CredentialID     string
+
 	// ExposureMode from the parent provider (catalog or hybrid).
 	// Used by GET /v1/models and ModelByID to decide which callers may see
 	// this endpoint (project_provider_access check vs team_model_permissions).
@@ -47,6 +61,7 @@ func (v *VirtualEndpoint) AsEndpoint() *runtime.Endpoint {
 		UpstreamModelName: v.UpstreamModelName,
 		Transport:         v.Transport,
 		Status:            runtime.StatusHealthy,
+		CredentialID:      v.CredentialID,
 	}
 }
 

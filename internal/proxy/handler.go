@@ -30,6 +30,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/promptpolicy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
 	"github.com/nexusllm/nexusllm/internal/runtimemgr"
+	"github.com/nexusllm/nexusllm/internal/secretstore"
 	"github.com/nexusllm/nexusllm/internal/thinking"
 	"github.com/nexusllm/nexusllm/internal/usage"
 	"go.uber.org/zap"
@@ -63,6 +64,21 @@ type Handler struct {
 	// virtualResolver resolves Mode-B catalog model names when the registry
 	// has no matching pool entry. Nil-safe — skipped when not set.
 	virtualResolver *catalog.VirtualModelResolver
+	// secrets decrypts provider_credentials for call sites that need a
+	// standalone credential resolution outside the virtual-model hot path
+	// (currently only ProviderModels). Nil-safe — WithSecretStore is optional;
+	// CredentialResolver.Resolve degrades to legacy providers.api_key when nil.
+	secrets *secretstore.Store
+}
+
+// secretStore returns h.secrets — trivial accessor kept so call sites read
+// uniformly regardless of whether the field is ever renamed.
+func (h *Handler) secretStore() *secretstore.Store { return h.secrets }
+
+// WithSecretStore attaches the credential-decryption store (migration 062).
+func (h *Handler) WithSecretStore(s *secretstore.Store) *Handler {
+	h.secrets = s
+	return h
 }
 
 // NewHandler constructs the proxy Handler.
@@ -356,7 +372,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// activator entirely. This is the correct behaviour — virtual models
 		// are always "running" because they are backed by a remote API.
 		if h.virtualResolver != nil {
-			vep, verr := h.virtualResolver.Resolve(c.Request.Context(), req.Model)
+			vep, _, verr := h.virtualResolver.ResolveForProject(c.Request.Context(), req.Model, claims.ProjectID)
+			if verr == catalog.ErrCredentialUnavailable {
+				abortErr(c, http.StatusFailedDependency, "provider_credential_unavailable",
+					fmt.Sprintf("no usable provider credential is assigned to this project for model %q", req.Model))
+				return
+			}
 			if verr != nil {
 				h.log.Warn("virtual resolver error", zap.String("model", req.Model), zap.Error(verr))
 			}
@@ -703,7 +724,7 @@ func (h *Handler) Embeddings(c *gin.Context) {
 	}
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: res.orgID, TeamID: res.teamID, ModelName: res.realModel,
-		EndpointID: ep.ID, PromptTokens: resp.Usage.TotalTokens,
+		EndpointID: ep.ID, CredentialID: ep.CredentialID, PromptTokens: resp.Usage.TotalTokens,
 		LatencyMs: latencyMs, Status: "success",
 	})
 	// Normalize model field — always echo back the NexusLLM model name the
@@ -1217,7 +1238,7 @@ func (h *Handler) syncChat(
 		}
 		h.usageTracker.Record(context.Background(), usage.Event{
 			OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
-			EndpointID: ep.ID, PromptTokens: chatResp.Usage.PromptTokens,
+			EndpointID: ep.ID, CredentialID: ep.CredentialID, PromptTokens: chatResp.Usage.PromptTokens,
 			CompletionTokens: chatResp.Usage.CompletionTokens,
 			TotalTokens:      chatResp.Usage.TotalTokens,
 			CachedTokens:     syncCachedTokens,
@@ -1498,7 +1519,7 @@ func (h *Handler) streamChat(
 	}
 	h.usageTracker.Record(context.Background(), usage.Event{
 		OrgID: claims.OrgID, TeamID: claims.TeamID, ModelName: req.Model,
-		EndpointID: ep.ID, PromptTokens: promptTokens,
+		EndpointID: ep.ID, CredentialID: ep.CredentialID, PromptTokens: promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
 		CachedTokens:     cachedTokens,
@@ -2179,12 +2200,28 @@ func (h *Handler) ProviderModels(c *gin.Context) {
 		return
 	}
 
-	// Inject API key using the provider's configured header convention.
-	if prov.APIKey != "" {
-		if prov.APIKeyHeader == "Authorization" || prov.APIKeyHeader == "" {
-			upstreamReq.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	// Inject the resolved credential for this caller's project (falls back to
+	// the provider default / legacy providers.api_key when the caller has no
+	// project-pinned credential — see catalog.CredentialResolver).
+	var projectIDForCred string
+	if claims != nil {
+		projectIDForCred = claims.ProjectID
+	}
+	cred, credErr := catalog.NewCredentialResolver(h.db, h.secretStore()).Resolve(c.Request.Context(), prov.ID, projectIDForCred)
+	if credErr != nil {
+		if credErr == catalog.ErrCredentialUnavailable {
+			abortErr(c, http.StatusFailedDependency, "provider_credential_unavailable",
+				"no usable provider credential is assigned to this project for provider "+providerName)
+			return
+		}
+		abortErr(c, http.StatusInternalServerError, "credential_resolution_error", credErr.Error())
+		return
+	}
+	if cred.Secret != "" {
+		if cred.HeaderName == "Authorization" || cred.HeaderName == "" {
+			upstreamReq.Header.Set("Authorization", "Bearer "+cred.Secret)
 		} else {
-			upstreamReq.Header.Set(prov.APIKeyHeader, prov.APIKey)
+			upstreamReq.Header.Set(cred.HeaderName, cred.Secret)
 		}
 	}
 

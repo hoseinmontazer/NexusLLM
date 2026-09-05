@@ -38,6 +38,13 @@ type ProjectProviderAccess struct {
 	Enabled         bool      `db:"enabled"`
 	CreatedAt       time.Time `db:"created_at"`
 	UpdatedAt       time.Time `db:"updated_at"`
+
+	// CredentialID/CredentialName (migration 062) identify which specific
+	// provider_credentials row this project is pinned to. Both empty when
+	// unset — resolution then falls back to the provider's default credential
+	// (see catalog.CredentialResolver). Never the secret itself.
+	CredentialID   *string `db:"credential_id"`
+	CredentialName *string `db:"credential_name"` // joined from provider_credentials
 }
 
 // IsAllowed returns true when virtualModelName passes the allow/deny prefix
@@ -98,6 +105,8 @@ type projectProviderAccessRow struct {
 	Enabled         bool           `db:"enabled"`
 	CreatedAt       time.Time      `db:"created_at"`
 	UpdatedAt       time.Time      `db:"updated_at"`
+	CredentialID    *string        `db:"credential_id"`
+	CredentialName  *string        `db:"credential_name"`
 }
 
 func (r *projectProviderAccessRow) toAccess() ProjectProviderAccess {
@@ -107,6 +116,7 @@ func (r *projectProviderAccessRow) toAccess() ProjectProviderAccess {
 		AllowedPrefixes: []string(r.AllowedPrefixes),
 		DeniedPrefixes:  []string(r.DeniedPrefixes),
 		Enabled:         r.Enabled, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		CredentialID: r.CredentialID, CredentialName: r.CredentialName,
 	}
 }
 
@@ -116,7 +126,9 @@ const projectProviderAccessCols = `
 	COALESCE(p.exposure_mode,'managed') AS exposure_mode,
 	COALESCE(ppa.allowed_prefixes,'{}') AS allowed_prefixes,
 	COALESCE(ppa.denied_prefixes,'{}') AS denied_prefixes,
-	ppa.enabled, ppa.created_at, ppa.updated_at`
+	ppa.enabled, ppa.created_at, ppa.updated_at,
+	ppa.credential_id::text AS credential_id,
+	pc.name AS credential_name`
 
 // ListForProject returns all enabled access grants for a project.
 func (s *ProjectProviderAccessStore) ListForProject(ctx context.Context, projectID string) ([]ProjectProviderAccess, error) {
@@ -125,6 +137,7 @@ func (s *ProjectProviderAccessStore) ListForProject(ctx context.Context, project
 		SELECT `+projectProviderAccessCols+`
 		FROM project_provider_access ppa
 		JOIN providers p ON p.id = ppa.provider_id
+		LEFT JOIN provider_credentials pc ON pc.id = ppa.credential_id
 		WHERE ppa.project_id::text = $1 AND ppa.enabled = TRUE
 		  AND p.enabled = TRUE
 		ORDER BY p.name`, projectID)

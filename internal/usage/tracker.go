@@ -59,6 +59,15 @@ type Event struct {
 	ProviderName      string `json:"provider_name"       db:"provider_name"`
 	ProviderRequestID string `json:"provider_request_id" db:"provider_request_id"`
 	CostCurrency      string `json:"cost_currency"       db:"cost_currency"`
+
+	// CredentialID identifies the provider_credentials row (migration 062)
+	// that handled this request — empty for local/managed models and for
+	// providers still on the legacy single providers.api_key column. This is
+	// the field that makes per-credential cost attribution (two OpenRouter
+	// accounts routed through NexusLLM) queryable: "which project spent how
+	// much on which credential" is `SELECT project_id, credential_id,
+	// SUM(cost_usd) FROM usage_events GROUP BY 1,2`.
+	CredentialID string `json:"credential_id,omitempty" db:"credential_id"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +233,7 @@ func (t *Tracker) persist(ctx context.Context, e Event) error {
 	endpointID := sanitizeUUIDField(e.EndpointID)
 	providerName := nilIfEmpty(e.ProviderName)
 	providerRequestID := nilIfEmpty(e.ProviderRequestID)
+	credentialID := nilIfEmpty(e.CredentialID)
 	currency := e.CostCurrency
 	if currency == "" {
 		currency = "USD"
@@ -236,15 +246,17 @@ func (t *Tracker) persist(ctx context.Context, e Event) error {
 		   latency_ms, ttft_ms, queue_wait_ms, status, error_code, cost_usd,
 		   gpu_time_ms, created_at, project_id, project_name, project_priority,
 		   project_priority_weight,
-		   cached_tokens, reasoning_tokens, provider_name, provider_request_id, cost_currency)
+		   cached_tokens, reasoning_tokens, provider_name, provider_request_id, cost_currency,
+		   credential_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
-		        $24,$25,$26,$27,$28)`,
+		        $24,$25,$26,$27,$28,$29)`,
 		e.ID, e.OrgID, e.TeamID, apiKeyID, modelID, e.ModelName, endpointID,
 		e.RequestID, e.PromptTokens, e.CompletionTokens, e.TotalTokens,
 		e.LatencyMs, e.TTFTMs, e.QueueWaitMs, e.Status, e.ErrorCode, e.CostUSD,
 		e.GPUTimeMs, e.CreatedAt, e.ProjectID, e.ProjectName, e.ProjectPriority,
 		e.ProjectPriorityWeight,
 		e.CachedTokens, e.ReasoningTokens, providerName, providerRequestID, currency,
+		credentialID,
 	)
 	if isUniqueViolation(err) {
 		// Either this exact event.ID was already committed by an earlier attempt

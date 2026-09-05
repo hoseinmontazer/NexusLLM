@@ -16,6 +16,7 @@ import (
 	"github.com/nexusllm/nexusllm/internal/catalog"
 	"github.com/nexusllm/nexusllm/internal/policy"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/secretstore"
 	"go.uber.org/zap"
 )
 
@@ -29,6 +30,13 @@ type CatalogHandler struct {
 	registry  *runtime.Registry
 	log       *zap.Logger
 	engine    *policy.Engine // required for permission-restore Redis sync — see WithPolicyEngine
+
+	// credStore/secrets back the provider-credential admin endpoints
+	// (credential.go). secrets may be nil (NEXUS_CREDENTIAL_ENCRYPTION_KEY
+	// unset) — Create fails clearly rather than ever storing a plaintext or
+	// improperly-encrypted secret.
+	credStore *catalog.ProviderCredentialStore
+	secrets   *secretstore.Store
 }
 
 // NewCatalogHandler constructs a CatalogHandler.
@@ -47,6 +55,7 @@ func NewCatalogHandler(
 		resolver:  resolver,
 		registry:  registry,
 		log:       log,
+		credStore: catalog.NewProviderCredentialStore(db),
 	}
 }
 
@@ -57,6 +66,23 @@ func NewCatalogHandler(
 func (h *CatalogHandler) WithPolicyEngine(e *policy.Engine) *CatalogHandler {
 	h.engine = e
 	return h
+}
+
+// WithSecretStore attaches the encryption store used to encrypt new
+// provider_credentials secrets on write (credential.go) and to resolve them
+// on LiveModels/test-provider calls. Safe to leave unattached (nil) in
+// deployments that only use the legacy providers.api_key column.
+func (h *CatalogHandler) WithSecretStore(s *secretstore.Store) *CatalogHandler {
+	h.secrets = s
+	return h
+}
+
+// credentialResolver builds a fresh catalog.CredentialResolver for this
+// request. Construction is cheap (no state beyond the db/secrets handles it
+// already holds) — admin endpoints are not hot-path, so no need to cache it
+// on the handler struct.
+func (h *CatalogHandler) credentialResolver() *catalog.CredentialResolver {
+	return catalog.NewCredentialResolver(h.db, h.secrets)
 }
 
 // ── Provider CRUD ─────────────────────────────────────────────────────────────
@@ -1054,18 +1080,22 @@ func (h *CatalogHandler) ListProjectProviderAccess(c *gin.Context) {
 
 // GrantProjectProviderAccess handles POST /admin/v1/projects/:id/provider-access
 //
-// Grants a project access to a provider's virtual catalog models.
-// Request body:
+// Grants a project access to a provider's virtual catalog models, optionally
+// pinning it to one specific credential from that provider's credential pool
+// (migration 062) — this is what makes two projects hitting the same provider
+// land on two different upstream tokens. Request body:
 //
 //	{
 //	  "provider_id":      "uuid",
-//	  "allowed_prefixes": ["openrouter/openai/*"],   // optional; empty = allow all
-//	  "denied_prefixes":  ["openrouter/openai/gpt-4-*"] // optional
+//	  "credential_id":    "uuid",                        // optional; omit/null = use provider default
+//	  "allowed_prefixes": ["openrouter/openai/*"],        // optional; empty = allow all
+//	  "denied_prefixes":  ["openrouter/openai/gpt-4-*"]   // optional
 //	}
 func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
 	projectID := c.Param("id")
 	var in struct {
 		ProviderID      string   `json:"provider_id" binding:"required"`
+		CredentialID    *string  `json:"credential_id"`
 		AllowedPrefixes []string `json:"allowed_prefixes"`
 		DeniedPrefixes  []string `json:"denied_prefixes"`
 	}
@@ -1088,25 +1118,33 @@ func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
 		return
 	}
 
+	credentialID, ok := h.validateCredentialBelongsToProvider(c, in.CredentialID, p.ID)
+	if !ok {
+		return // response already written
+	}
+
 	// Upsert the access grant.
 	allowArr := pq.Array(in.AllowedPrefixes)
 	denyArr := pq.Array(in.DeniedPrefixes)
 	grantID := uuid.New().String()
 	_, err = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO project_provider_access
-		  (id, project_id, provider_id, allowed_prefixes, denied_prefixes)
-		VALUES ($1, $2::uuid, $3::uuid, $4, $5)
+		  (id, project_id, provider_id, credential_id, allowed_prefixes, denied_prefixes)
+		VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6)
 		ON CONFLICT (project_id, provider_id) DO UPDATE
-		SET allowed_prefixes = EXCLUDED.allowed_prefixes,
+		SET credential_id    = EXCLUDED.credential_id,
+		    allowed_prefixes = EXCLUDED.allowed_prefixes,
 		    denied_prefixes  = EXCLUDED.denied_prefixes,
 		    enabled          = TRUE,
 		    updated_at       = NOW()`,
-		grantID, projectID, p.ID, allowArr, denyArr,
+		grantID, projectID, p.ID, credentialID, allowArr, denyArr,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error: " + err.Error()})
 		return
 	}
+
+	h.auditCredentialAssignment(c, p, projectID, credentialID, "grant")
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":               grantID,
@@ -1114,6 +1152,7 @@ func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
 		"provider_id":      p.ID,
 		"provider_name":    p.Name,
 		"exposure_mode":    string(p.ExposureMode),
+		"credential_id":    credentialID,
 		"allowed_prefixes": in.AllowedPrefixes,
 		"denied_prefixes":  in.DeniedPrefixes,
 		"note": "Project can now call virtual models from this provider. " +
@@ -1124,7 +1163,9 @@ func (h *CatalogHandler) GrantProjectProviderAccess(c *gin.Context) {
 
 // UpdateProjectProviderAccess handles PUT /admin/v1/projects/:id/provider-access/:provider_id
 //
-// Updates the prefix filters on an existing grant.
+// Updates the prefix filters and/or pinned credential on an existing grant.
+// Pass "credential_id": null explicitly to clear a pin and fall back to the
+// provider's default credential; omit the field entirely to leave it unchanged.
 func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
 	projectID := c.Param("id")
 	providerID := c.Param("provider_id")
@@ -1132,11 +1173,24 @@ func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
 		AllowedPrefixes []string `json:"allowed_prefixes"`
 		DeniedPrefixes  []string `json:"denied_prefixes"`
 		Enabled         *bool    `json:"enabled"`
+		CredentialID    *string  `json:"credential_id"`
 	}
-	if err := c.ShouldBindJSON(&in); err != nil {
+	raw, err := c.GetRawData()
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Distinguish "credential_id omitted" (leave unchanged) from
+	// "credential_id explicitly null" (clear the pin) — both unmarshal
+	// in.CredentialID to nil, so check the raw JSON keys too.
+	var rawFields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &rawFields)
+	_, credentialFieldPresent := rawFields["credential_id"]
+
 	ctx := c.Request.Context()
 	if in.AllowedPrefixes != nil {
 		_, _ = h.db.ExecContext(ctx,
@@ -1156,11 +1210,78 @@ func (h *CatalogHandler) UpdateProjectProviderAccess(c *gin.Context) {
 			 WHERE project_id::text=$1 AND provider_id::text=$2`,
 			projectID, providerID, *in.Enabled)
 	}
+	if credentialFieldPresent {
+		credentialID, ok := h.validateCredentialBelongsToProvider(c, in.CredentialID, providerID)
+		if !ok {
+			return // response already written
+		}
+		_, _ = h.db.ExecContext(ctx,
+			`UPDATE project_provider_access SET credential_id=$3, updated_at=NOW()
+			 WHERE project_id::text=$1 AND provider_id::text=$2`,
+			projectID, providerID, credentialID)
+		if p, perr := h.store.Get(ctx, providerID); perr == nil {
+			h.auditCredentialAssignment(c, p, projectID, credentialID, "update")
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "provider access updated",
 		"project_id":  projectID,
 		"provider_id": providerID,
 	})
+}
+
+// validateCredentialBelongsToProvider checks that credentialID (if non-nil)
+// names a real provider_credentials row belonging to providerID. Writes a 400
+// response and returns ok=false on any mismatch — callers must return
+// immediately when ok is false. Returns (nil, true) when credentialID is nil
+// (no pin requested).
+func (h *CatalogHandler) validateCredentialBelongsToProvider(c *gin.Context, credentialID *string, providerID string) (*string, bool) {
+	if credentialID == nil || *credentialID == "" {
+		return nil, true
+	}
+	cred, err := h.credStore.Get(c.Request.Context(), *credentialID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "credential not found: " + *credentialID})
+		return nil, false
+	}
+	if cred.ProviderID != providerID {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "credential " + *credentialID + " belongs to a different provider than " + providerID,
+		})
+		return nil, false
+	}
+	return credentialID, true
+}
+
+// auditCredentialAssignment records a project↔credential assignment change in
+// audit_logs (org_id resolved from the project, matching the working
+// auditPriorityChange pattern in project.go — never the broken
+// portal.go recordAudit shape). Best-effort: failures are logged, not
+// propagated, since the assignment itself already succeeded.
+func (h *CatalogHandler) auditCredentialAssignment(c *gin.Context, p *catalog.Provider, projectID string, credentialID *string, action string) {
+	var orgID string
+	if err := h.db.GetContext(c.Request.Context(), &orgID,
+		`SELECT organization_id::text FROM projects WHERE id::text = $1`, projectID); err != nil {
+		h.log.Warn("audit: could not resolve project org_id for credential assignment", zap.Error(err))
+		return
+	}
+	credRef := "null (provider default)"
+	if credentialID != nil {
+		credRef = *credentialID
+	}
+	metadata, _ := json.Marshal(map[string]string{
+		"provider_id":   p.ID,
+		"provider_name": p.Name,
+		"credential_id": credRef,
+		"action":        action,
+	})
+	_, err := h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO audit_logs (org_id, action, resource, resource_id, metadata)
+		VALUES ($1::uuid, 'provider_credential.assign', 'project_provider_access', $2::uuid, $3)`,
+		orgID, projectID, metadata)
+	if err != nil {
+		h.log.Warn("audit: failed to record credential assignment", zap.Error(err))
+	}
 }
 
 // RevokeProjectProviderAccess handles DELETE /admin/v1/projects/:id/provider-access/:provider_id
@@ -1230,13 +1351,26 @@ func (h *CatalogHandler) LiveModels(c *gin.Context) {
 		return
 	}
 
-	// Inject the stored API key using the provider's configured header.
-	if p.APIKey != "" {
-		header := p.APIKeyHeader
-		if header == "" || header == "Authorization" {
-			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	// Inject the resolved credential. No project context here (this is an
+	// operator "peek at the provider's catalogue" call, not a proxied
+	// inference request) — CredentialResolver.Resolve with an empty project ID
+	// falls through to the provider's default provider_credentials row, or to
+	// the legacy providers.api_key column when the provider has never been
+	// migrated to the new credential pool. Never logs or returns the secret.
+	cred, credErr := h.credentialResolver().Resolve(c.Request.Context(), p.ID, "")
+	if credErr != nil {
+		if credErr == catalog.ErrCredentialUnavailable {
+			c.JSON(http.StatusFailedDependency, gin.H{"error": "provider_credential_unavailable"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "resolving provider credential: " + credErr.Error()})
+		return
+	}
+	if cred.Secret != "" {
+		if cred.HeaderName == "" || cred.HeaderName == "Authorization" {
+			req.Header.Set("Authorization", "Bearer "+cred.Secret)
 		} else {
-			req.Header.Set(header, p.APIKey)
+			req.Header.Set(cred.HeaderName, cred.Secret)
 		}
 	}
 

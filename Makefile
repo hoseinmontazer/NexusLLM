@@ -209,7 +209,8 @@ MIGRATIONS := \
     	058_project_model_permissions.sql \
     	059_model_permission_scopes.sql \
     	060_bounded_recovery_chain.sql \
-	061_manual_deployment_mode.sql
+	061_manual_deployment_mode.sql \
+	062_provider_credentials.sql
 
 migrate:
 	@echo "→ Waiting for postgres..."

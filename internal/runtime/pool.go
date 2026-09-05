@@ -43,6 +43,14 @@ type Endpoint struct {
 	UpstreamProxy     string
 	UpstreamModelName string
 
+	// CredentialID identifies which provider_credentials row (migration 062)
+	// supplied UpstreamAPIKey for this request — empty for local/managed
+	// endpoints and for providers still on the legacy single providers.api_key
+	// column. Populated only via catalog.VirtualEndpoint.AsEndpoint() after a
+	// catalog.CredentialResolver.Resolve call. Carried through to usage.Event
+	// for per-credential cost attribution — never logged, never the secret.
+	CredentialID string
+
 	// Transport holds the per-endpoint HTTP transport configuration for
 	// provider backends. It is populated from the DB columns added by
 	// migration 046 (provider_proxy_url, provider_tls_insecure, etc.).

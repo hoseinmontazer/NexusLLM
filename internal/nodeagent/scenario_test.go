@@ -156,9 +156,19 @@ func TestScenario1_BridgeHostPortWins(t *testing.T) {
 			dockerEnv := envFromDockerArgs(args)
 			assertPortEnvVars(t, dockerEnv, hostPort)
 
-			// (e) Dual-path injection: both env vars and --port flag are provided.
-			if portFlagFromDockerArgs(args) != hostPort {
-				t.Errorf("backend %q: expected --port %d flag in docker args (dual-path injection)", backend, hostPort)
+			// (e) faster-whisper-server (and Kokoro) read the port exclusively from
+			// PORT/HTTP_PORT/UVICORN_PORT (asserted above) and must NOT also get a
+			// "--port N" CMD-arg: appending any CMD arg replaces Docker's CMD
+			// entirely, and this image's CUDA-base variant keeps
+			// ENTRYPOINT=nvidia_entrypoint.sh with the real launcher baked into
+			// CMD — a replaced CMD of just "--port N" makes nvidia_entrypoint.sh's
+			// `exec "$@"` try to exec a bare flag, crash-looping the container
+			// with "exec: --: invalid option" (see usesEnvVarPortOnly). This was a
+			// real, confirmed production bug; the previous "dual-path" expectation
+			// this test asserted was the bug, not a feature.
+			if got := portFlagFromDockerArgs(args); got != 0 {
+				t.Errorf("backend %q, image %q: expected NO --port CMD flag (env-var-only port injection), got --port %d",
+					backend, p.Image, got)
 			}
 		})
 	}

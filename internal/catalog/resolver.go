@@ -7,6 +7,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/nexusllm/nexusllm/internal/runtime"
+	"github.com/nexusllm/nexusllm/internal/secretstore"
 	"go.uber.org/zap"
 )
 
@@ -55,26 +56,36 @@ type VirtualModelResolver struct {
 	rules   *RuleStore
 	engine  *RuleEngine
 	clients *ProviderClientCache
+	creds   *CredentialResolver
 	log     *zap.Logger
 
 	mu    sync.RWMutex
 	cache *virtualCache
 }
 
-// NewVirtualModelResolver constructs a resolver.
-func NewVirtualModelResolver(db *sqlx.DB, log *zap.Logger) *VirtualModelResolver {
+// NewVirtualModelResolver constructs a resolver. secrets may be nil in
+// deployments with no provider_credentials rows configured yet (pure legacy
+// providers.api_key usage) — see CredentialResolver.Resolve step 3.
+func NewVirtualModelResolver(db *sqlx.DB, log *zap.Logger, secrets *secretstore.Store) *VirtualModelResolver {
 	return &VirtualModelResolver{
 		db:      db,
 		store:   NewProviderStore(db),
 		rules:   NewRuleStore(db),
 		engine:  NewRuleEngine(),
 		clients: NewProviderClientCache(),
+		creds:   NewCredentialResolver(db, secrets),
 		log:     log,
 	}
 }
 
-// Resolve returns a VirtualEndpoint for a Mode-B model name.
+// Resolve returns a VirtualEndpoint for a Mode-B model name, using the
+// provider's default/legacy credential (no project-specific routing).
 // Returns (nil, nil) when the name is not in the exposed catalog.
+//
+// Callers that have a project identity (i.e. every real proxied inference
+// request) MUST call ResolveForProject instead, so each project is routed to
+// its own assigned credential — this method exists for callers with no
+// project context (catalog sync, admin "test provider", org-level API keys).
 func (r *VirtualModelResolver) Resolve(ctx context.Context, modelName string) (*VirtualEndpoint, error) {
 	cache, err := r.getCache(ctx)
 	if err != nil {
@@ -85,6 +96,44 @@ func (r *VirtualModelResolver) Resolve(ctx context.Context, modelName string) (*
 		return nil, nil
 	}
 	return ep, nil
+}
+
+// ResolveForProject returns a VirtualEndpoint for a Mode-B model name with its
+// UpstreamAPIKey overridden to the credential resolved for projectID via
+// CredentialResolver — this is what makes two different projects hitting the
+// same provider (e.g. two OpenRouter accounts) land on two different upstream
+// tokens.
+//
+// Returns (nil, nil, nil) when the model name is not in the exposed catalog
+// (same "not found" contract as Resolve). Returns catalog.ErrCredentialUnavailable
+// when the project has no usable credential for this provider — callers MUST
+// map that to a distinct error response and MUST NOT fall back to Resolve()
+// or to any other credential.
+//
+// The returned *VirtualEndpoint is always a fresh copy, never the shared
+// cached pointer — safe to mutate/use per-request without racing other
+// goroutines resolving the same model name for a different project.
+func (r *VirtualModelResolver) ResolveForProject(ctx context.Context, modelName, projectID string) (*VirtualEndpoint, *ResolvedCredential, error) {
+	cache, err := r.getCache(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cached, ok := cache.byName[modelName]
+	if !ok {
+		return nil, nil, nil
+	}
+
+	providerID := cached.providerID
+	resolved, err := r.creds.Resolve(ctx, providerID, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vep := *cached // shallow copy — safe, no pointer/slice fields are mutated below
+	vep.UpstreamAPIKey = resolved.Secret
+	vep.CredentialHeader = resolved.HeaderName
+	vep.CredentialID = resolved.CredentialID
+	return &vep, resolved, nil
 }
 
 // ListExposed returns all virtual model names currently exposed.
@@ -361,6 +410,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				// Include provider ID in the virtual endpoint ID to prevent
 				// collisions when two providers expose a model with the same ID.
 				ID:                "virt:" + prov.ID + ":" + e.ProviderModelID,
+				providerID:        prov.ID,
 				BackendType:       runtime.BackendType(prov.BackendType),
 				UpstreamBaseURL:   prov.BaseURL,
 				UpstreamAPIKey:    prov.APIKey,
