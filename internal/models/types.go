@@ -239,8 +239,14 @@ type Message struct {
 	ToolCallID string      `json:"tool_call_id,omitempty"`
 	// Refusal/Reasoning are OpenRouter/OpenAI extensions. Passed through
 	// verbatim when the upstream sets them; omitted for backends that don't.
-	Refusal   interface{} `json:"refusal,omitempty"`
-	Reasoning interface{} `json:"reasoning,omitempty"`
+	//
+	// These are json.RawMessage (not interface{}) so an explicit upstream
+	// `null` — a real, present value — round-trips as `null` instead of being
+	// indistinguishable from "the backend never sent this field" and dropped
+	// by omitempty. Only a key that was truly absent unmarshals to a nil
+	// (zero-length) RawMessage, which omitempty still omits correctly.
+	Refusal   json.RawMessage `json:"refusal,omitempty"`
+	Reasoning json.RawMessage `json:"reasoning,omitempty"`
 }
 
 // ChatCompletionResponse mirrors the OpenAI Chat Completions response.
@@ -267,12 +273,12 @@ type ChatCompletionResponse struct {
 // provider's own finish-reason string (before OpenRouter normalizes it into
 // the standard finish_reason values).
 type Choice struct {
-	Index              int         `json:"index"`
-	Message            *Message    `json:"message,omitempty"`
-	Delta              *Delta      `json:"delta,omitempty"`
-	FinishReason       *string     `json:"finish_reason"`
-	NativeFinishReason *string     `json:"native_finish_reason,omitempty"`
-	Logprobs           interface{} `json:"logprobs,omitempty"`
+	Index              int             `json:"index"`
+	Message            *Message        `json:"message,omitempty"`
+	Delta              *Delta          `json:"delta,omitempty"`
+	FinishReason       *string         `json:"finish_reason"`
+	NativeFinishReason *string         `json:"native_finish_reason,omitempty"`
+	Logprobs           json.RawMessage `json:"logprobs,omitempty"` // see Message.Refusal for why RawMessage, not interface{}
 }
 
 // Delta is the streaming delta object in a chat completion chunk.
@@ -307,36 +313,57 @@ type Usage struct {
 	// VisibleTokens is completion_tokens minus thinking_tokens.
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
 
-	PromptTokensDetails     *UsageTokenDetails `json:"prompt_tokens_details,omitempty"`
-	CompletionTokensDetails *UsageTokenDetails `json:"completion_tokens_details,omitempty"`
+	PromptTokensDetails     *PromptTokenDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokenDetails `json:"completion_tokens_details,omitempty"`
 
 	// Cost/IsBYOK/CostDetails are OpenRouter extensions reporting what the
 	// request actually cost upstream. Passed through verbatim when the
 	// upstream sets them; omitted for backends that don't price per-request.
+	//
+	// IsBYOK is *bool (not bool) because OpenRouter always sends it, often as
+	// `false` — a plain bool with omitempty can't tell that apart from a
+	// backend that never sent the field at all, and drops the real `false`.
 	Cost        float64          `json:"cost,omitempty"`
-	IsBYOK      bool             `json:"is_byok,omitempty"`
+	IsBYOK      *bool            `json:"is_byok,omitempty"`
 	CostDetails *UsageCostDetail `json:"cost_details,omitempty"`
 }
 
-// UsageTokenDetails is the OpenAI-shaped breakdown of cached/reasoning tokens
-// nested under prompt_tokens_details/completion_tokens_details. The extra
-// fields (cache write, audio, video, image) are OpenRouter/OpenAI additions
-// that only ever populate on the side of the split they apply to.
-type UsageTokenDetails struct {
-	CachedTokens     int `json:"cached_tokens,omitempty"`
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
-	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
-	AudioTokens      int `json:"audio_tokens,omitempty"`
-	VideoTokens      int `json:"video_tokens,omitempty"`
-	ImageTokens      int `json:"image_tokens,omitempty"`
+// PromptTokenDetails/CompletionTokenDetails are the OpenAI/OpenRouter-shaped
+// breakdowns nested under prompt_tokens_details/completion_tokens_details.
+// They're deliberately two distinct types (not one shared struct) because
+// OpenRouter never sends the same sub-fields on both sides — e.g.
+// cache/video fields are prompt-only, image/reasoning fields are
+// completion-only — and a shared struct would fabricate the other side's
+// fields as explicit 0 even though upstream never sent them, which is its
+// own (smaller) form of not-quite-exact passthrough.
+//
+// These counts intentionally have no `omitempty`: the parent pointer
+// (Usage.PromptTokensDetails/CompletionTokensDetails) is what controls
+// whether the object appears at all. Once present, OpenRouter always sends
+// every sub-field, frequently as an explicit 0 (e.g. "cached_tokens": 0) —
+// omitempty here would silently collapse that back down to `{}`.
+type PromptTokenDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+	AudioTokens      int `json:"audio_tokens"`
+	VideoTokens      int `json:"video_tokens"`
+}
+
+type CompletionTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+	AudioTokens     int `json:"audio_tokens"`
+	ImageTokens     int `json:"image_tokens"`
 }
 
 // UsageCostDetail is OpenRouter's per-request cost breakdown, nested under
-// usage.cost_details.
+// usage.cost_details. No omitempty for the same reason as the token details:
+// the parent *UsageCostDetail pointer already governs presence, and a
+// genuine $0 leg of the split (e.g. a fully-cached prompt) must round-trip
+// as 0, not disappear.
 type UsageCostDetail struct {
-	UpstreamInferenceCost            float64 `json:"upstream_inference_cost,omitempty"`
-	UpstreamInferencePromptCost      float64 `json:"upstream_inference_prompt_cost,omitempty"`
-	UpstreamInferenceCompletionsCost float64 `json:"upstream_inference_completions_cost,omitempty"`
+	UpstreamInferenceCost            float64 `json:"upstream_inference_cost"`
+	UpstreamInferencePromptCost      float64 `json:"upstream_inference_prompt_cost"`
+	UpstreamInferenceCompletionsCost float64 `json:"upstream_inference_completions_cost"`
 }
 
 // EmbeddingRequest mirrors the OpenAI Embeddings request body.

@@ -345,7 +345,7 @@ func translateAnthropicResponse(raw []byte, nexusModelName string) ([]byte, erro
 		},
 	}
 	if ar.Usage.CacheReadInputTokens > 0 {
-		oaiResp.Usage.PromptTokensDetails = &models.UsageTokenDetails{
+		oaiResp.Usage.PromptTokensDetails = &models.PromptTokenDetails{
 			CachedTokens: ar.Usage.CacheReadInputTokens,
 		}
 	}
