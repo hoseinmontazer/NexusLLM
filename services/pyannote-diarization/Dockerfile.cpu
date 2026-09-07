@@ -1,0 +1,39 @@
+# pyannote/speaker-diarization-3.1 on CPU.
+# pyannote.audio 3.4.0 declares torch>=2.0.0 / torchaudio>=2.2.0 / python>=3.9
+# with no upper bound, so torch 2.8.0 satisfies it on paper — but verified
+# against an actual gated download that it does NOT work in practice: PyTorch
+# >= 2.6 defaults torch.load(weights_only=True) (a restricted unpickler), and
+# pyannote.audio 3.4.0's checkpoints reference several of pyannote's own
+# internal classes (torch.torch_version.TorchVersion,
+# pyannote.audio.core.task.Specifications, ...) that aren't on torch's default
+# safe-globals allowlist — each one blocks loading in turn, whack-a-mole style,
+# with no indication of how many more there are. torch 2.5.1 is the last
+# release before that default changed, sidestepping the entire class of
+# failure instead of allowlisting classes one at a time.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-cpu.txt .
+RUN pip install --no-cache-dir torch==2.5.1 torchaudio==2.5.1 \
+        --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements-cpu.txt
+
+COPY app.py entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+ENV DEVICE=cpu
+EXPOSE 8000
+
+# --workers 1: exactly one pipeline instance per container (see app.py's
+# module docstring on why horizontal replicas, not extra workers, are the
+# scaling mechanism).
+#
+# ENTRYPOINT (not CMD) — see entrypoint.sh for why: NexusLLM's deploy code
+# auto-appends "--port <N>" as a CMD arg for images it doesn't recognize,
+# which would silently replace a bare CMD instead of extending it.
+ENTRYPOINT ["./entrypoint.sh"]

@@ -1,0 +1,24 @@
+# pyannote/speaker-diarization-3.1's model card states it "requires
+# pyannote.audio version 3.1 or higher" and its collection note claims
+# compatibility only up to the 3.4.x line. pyannote.audio 4.0 (released
+# alongside speaker-diarization-community-1) changed the pipeline call's
+# return type (Annotation -> DiarizeOutput) and dropped Python < 3.10 and
+# the sox/soundfile audio backends, and is NOT documented as compatible with
+# the 3.1 model. 3.4.0 (2025-09-09) is the last release before that break.
+pyannote.audio==3.4.0
+# Pinned <1.0 deliberately: verified by actually running this container that
+# pyannote.audio 3.4.0 still calls huggingface_hub.hf_hub_download(...,
+# use_auth_token=...) internally, and huggingface_hub 1.0 removed that kwarg
+# in favor of token=. Without this pin, pip resolves the newest 1.x release
+# (satisfies pyannote.audio's own unpinned huggingface_hub>=0.13.0 floor) and
+# every authenticated model download fails with:
+#   TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'
+huggingface_hub<1.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+# app.py decodes audio itself (ffmpeg -> WAV -> soundfile -> in-memory
+# waveform) rather than handing pyannote a raw path — see requirements-gpu.txt
+# for why. pyannote.audio 3.4.0 still pulls soundfile transitively, but pin it
+# directly since app.py now imports it itself.
+soundfile==0.14.0

@@ -1,0 +1,19 @@
+# pyannote/speaker-diarization-community-1 is pyannote.audio 4.0's flagship
+# pipeline; the PyPI JSON API for pyannote-audio (latest: 4.0.7) declares
+# torch>=2.8.0, torchaudio>=2.8.0, requires_python>=3.10. torch/torchaudio are
+# NOT listed here — the GPU Dockerfile installs them from the CUDA-matched
+# pytorch/pytorch base image instead of letting pip pull a CPU wheel.
+pyannote.audio==4.0.7
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+# pyannote.audio 4.0 dropped soundfile/sox as its own audio-decode backends
+# (ffmpeg-via-torchcodec or in-memory waveform are the only paths left).
+# Confirmed against the actual built image that torchcodec fails to load here
+# (libnvrtc.so.13 missing from the pytorch/pytorch *-runtime base image) — a
+# static missing-library issue, not a no-GPU-visible one, so it would recur on
+# real GPU hardware too. app.py works around it by decoding with the ffmpeg
+# binary itself and handing pyannote a pre-decoded waveform via soundfile,
+# which needs to be installed explicitly since pyannote.audio no longer pulls
+# it in.
+soundfile==0.14.0

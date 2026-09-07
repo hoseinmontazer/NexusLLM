@@ -159,6 +159,7 @@ func (s *ProjectProviderAccessStore) ListAll(ctx context.Context) ([]ProjectProv
 		SELECT `+projectProviderAccessCols+`
 		FROM project_provider_access ppa
 		JOIN providers p ON p.id = ppa.provider_id
+		LEFT JOIN provider_credentials pc ON pc.id = ppa.credential_id
 		WHERE ppa.enabled = TRUE AND p.enabled = TRUE
 		  AND p.exposure_mode IN ('catalog','hybrid')
 		ORDER BY ppa.project_id, p.name`)

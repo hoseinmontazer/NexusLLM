@@ -1,0 +1,25 @@
+# pyannote/speaker-diarization-community-1 on GPU.
+# pyannote-audio 4.0.7 (PyPI) declares torch>=2.8.0 / torchaudio>=2.8.0 /
+# python>=3.10. pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime is the official
+# PyTorch image that ships exactly torch/torchaudio 2.8.0 built against CUDA
+# 12.8 (confirmed present on Docker Hub) — NOT the previous cuda12.1/cudnn9
+# combo, which predates the 2.8.0 torch release and would silently mismatch.
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-gpu.txt .
+RUN pip install --no-cache-dir -r requirements-gpu.txt
+
+COPY app.py entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+ENV DEVICE=cuda
+EXPOSE 8000
+
+# ENTRYPOINT (not CMD) — see entrypoint.sh and Dockerfile.cpu for why.
+ENTRYPOINT ["./entrypoint.sh"]
