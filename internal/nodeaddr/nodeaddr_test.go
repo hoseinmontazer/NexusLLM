@@ -9,6 +9,7 @@ package nodeaddr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -75,7 +76,10 @@ func TestCanonicalHost_PrefersIPAddressOverHostname(t *testing.T) {
 	if err := db.Get(&nodeID, `INSERT INTO nodes (hostname, ip_address) VALUES ('node-b.internal', '192.168.10.22') RETURNING id::text`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
-	got := CanonicalHost(context.Background(), db, nodeID)
+	got, err := CanonicalHost(context.Background(), db, nodeID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "192.168.10.22" {
 		t.Fatalf("expected 192.168.10.22, got %q", got)
 	}
@@ -87,17 +91,60 @@ func TestCanonicalHost_FallsBackToHostnameWhenNoIP(t *testing.T) {
 	if err := db.Get(&nodeID, `INSERT INTO nodes (hostname, ip_address) VALUES ('node-c.internal', NULL) RETURNING id::text`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
-	got := CanonicalHost(context.Background(), db, nodeID)
+	got, err := CanonicalHost(context.Background(), db, nodeID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "node-c.internal" {
 		t.Fatalf("expected node-c.internal, got %q", got)
 	}
 }
 
-func TestCanonicalHost_UnregisteredNodeFallsBackToLocalhost(t *testing.T) {
+// TestCanonicalHost_UnregisteredNodeFailsLoudly is the regression test for the
+// production incident: a dangling/unknown node_id (or one not yet assigned —
+// e.g. auto-placement's bind_host resolved before the scheduler decision was
+// applied) MUST return an error, never silently produce "localhost". Silently
+// falling back to "localhost" here is exactly what let a month of auto-placed
+// deploys persist a guaranteed-unreachable endpoint instead of failing loudly.
+func TestCanonicalHost_UnregisteredNodeFailsLoudly(t *testing.T) {
 	db := setupNodeaddrTestDB(t)
-	got := CanonicalHost(context.Background(), db, uuid.New().String())
-	if got != "localhost" {
-		t.Fatalf("expected localhost fallback for a dangling node_id, got %q", got)
+	_, err := CanonicalHost(context.Background(), db, uuid.New().String())
+	if err == nil {
+		t.Fatal("expected an error for a dangling/unknown node_id, got nil (silent localhost fallback regression)")
+	}
+}
+
+// TestCanonicalHost_EmptyNodeIDFailsLoudly is the direct regression test for
+// the DeployModel auto-placement bug: bind_host was resolved with
+// input.NodeID == "" (not yet set by the scheduler), which the old
+// implementation silently turned into "localhost". An empty node ID must
+// never resolve to any address at all.
+func TestCanonicalHost_EmptyNodeIDFailsLoudly(t *testing.T) {
+	db := setupNodeaddrTestDB(t)
+	_, err := CanonicalHost(context.Background(), db, "")
+	if err == nil {
+		t.Fatal("expected an error for an empty node_id, got nil (silent localhost fallback regression)")
+	}
+}
+
+// TestCanonicalHost_NodeWithNoAddressFailsLoudly covers a node row that
+// exists but has neither ip_address nor hostname usable — must fail with
+// ErrNoAdvertisedAddress, never silently return "localhost".
+func TestCanonicalHost_NodeWithNoAddressFailsLoudly(t *testing.T) {
+	db := setupNodeaddrTestDB(t)
+	if _, err := db.Exec(`ALTER TABLE nodes ALTER COLUMN hostname DROP NOT NULL`); err != nil {
+		t.Fatalf("relax schema for test: %v", err)
+	}
+	var nodeID string
+	if err := db.Get(&nodeID, `INSERT INTO nodes (hostname, ip_address) VALUES (NULL, NULL) RETURNING id::text`); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	_, err := CanonicalHost(context.Background(), db, nodeID)
+	if err == nil {
+		t.Fatal("expected an error for a node with no advertised address, got nil")
+	}
+	if !errors.Is(err, ErrNoAdvertisedAddress) {
+		t.Fatalf("expected ErrNoAdvertisedAddress, got: %v", err)
 	}
 }
 
@@ -113,7 +160,10 @@ func TestCanonicalHost_GenuinelyColocatedLoopbackIsNotRewritten(t *testing.T) {
 	if err := db.Get(&nodeID, `INSERT INTO nodes (hostname, ip_address) VALUES ('devbox', '127.0.0.1') RETURNING id::text`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
-	got := CanonicalHost(context.Background(), db, nodeID)
+	got, err := CanonicalHost(context.Background(), db, nodeID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "127.0.0.1" {
 		t.Fatalf("expected the node's own registered loopback address 127.0.0.1 to be returned unchanged, got %q", got)
 	}
@@ -128,10 +178,10 @@ func TestCanonicalHost_MultipleNodesResolveIndependently(t *testing.T) {
 	if err := db.Get(&nodeB, `INSERT INTO nodes (hostname, ip_address) VALUES ('node-b', '10.0.0.20') RETURNING id::text`); err != nil {
 		t.Fatalf("seed node B: %v", err)
 	}
-	if got := CanonicalHost(context.Background(), db, nodeA); got != "10.0.0.10" {
-		t.Fatalf("node A: expected 10.0.0.10, got %q", got)
+	if got, err := CanonicalHost(context.Background(), db, nodeA); err != nil || got != "10.0.0.10" {
+		t.Fatalf("node A: expected 10.0.0.10, got %q (err=%v)", got, err)
 	}
-	if got := CanonicalHost(context.Background(), db, nodeB); got != "10.0.0.20" {
-		t.Fatalf("node B: expected 10.0.0.20, got %q", got)
+	if got, err := CanonicalHost(context.Background(), db, nodeB); err != nil || got != "10.0.0.20" {
+		t.Fatalf("node B: expected 10.0.0.20, got %q (err=%v)", got, err)
 	}
 }

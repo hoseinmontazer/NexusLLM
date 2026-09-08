@@ -343,8 +343,18 @@ func (a *RuntimeActivator) doStartModel(ctx context.Context, modelName string, s
 // unstarted because of a failed lookup.
 func (a *RuntimeActivator) IsManuallyDeployed(ctx context.Context, modelName string) bool {
 	var mode string
-	err := a.db.GetContext(ctx, &mode,
-		`SELECT COALESCE(deployment_mode,'managed') FROM models WHERE name = $1`, modelName)
+	// A bare WHERE name=$1 with no lifecycle/enabled filter and no ORDER BY is
+	// non-deterministic whenever multiple historical rows share a name (soft-
+	// delete + redeploy under the same name creates a new model_id each time —
+	// see team.go's AddModelPermission for the same class of bug, already
+	// fixed there). Confirmed in production: this exact query picked an old,
+	// soft-deleted deployment_mode='manual' row over the real active
+	// deployment_mode='managed' one, making a healthy managed model's cold
+	// start report itself as manually-deployed and refuse to start.
+	err := a.db.GetContext(ctx, &mode, `
+		SELECT COALESCE(deployment_mode,'managed') FROM models
+		WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`, modelName)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			a.log.Warn("deployment_mode lookup failed — treating model as NexusLLM-managed",
@@ -1271,7 +1281,11 @@ func (a *RuntimeActivator) loadConfigQuery(ctx context.Context, modelName string
 	// waitForReady) can trust directly, rather than one more fallback in a
 	// chain of stale values.
 	if cfg.NodeID != "" {
-		cfg.BindHost = nodeaddr.CanonicalHost(ctx, a.db, cfg.NodeID)
+		host, hostErr := nodeaddr.CanonicalHost(ctx, a.db, cfg.NodeID)
+		if hostErr != nil {
+			return nil, fmt.Errorf("resolve bind host for node %s: %w", cfg.NodeID, hostErr)
+		}
+		cfg.BindHost = host
 	}
 	return cfg, nil
 }

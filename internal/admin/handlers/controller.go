@@ -158,7 +158,14 @@ func (h *ControllerHandler) loadRuntime(c *gin.Context, endpointID string) (*run
 	// trusting whatever was stored before — this is the single choke point
 	// every caller (Start/Restart/Upgrade/Rollback) goes through, so fixing
 	// it here fixes it for all four.
-	row.BindHost = nodeaddr.CanonicalHost(c.Request.Context(), h.db, row.NodeID)
+	host, hostErr := nodeaddr.CanonicalHost(c.Request.Context(), h.db, row.NodeID)
+	if hostErr != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "cannot resolve a reachable address for this endpoint's node: " + hostErr.Error(),
+		})
+		return nil, false
+	}
+	row.BindHost = host
 	return &row, true
 }
 

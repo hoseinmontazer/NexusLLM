@@ -1021,8 +1021,11 @@ func (h *Handler) ModelByID(c *gin.Context) {
 	if allowed && registered[modelID] {
 		var createdAt int64
 		if h.db != nil {
-			_ = h.db.QueryRowContext(c.Request.Context(),
-				`SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM models WHERE name=$1 AND enabled=TRUE`,
+			// Same fix as team.go's AddModelPermission / runtimemgr.IsManuallyDeployed.
+			_ = h.db.QueryRowContext(c.Request.Context(), `
+				SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM models
+				WHERE name=$1 AND enabled=TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+				ORDER BY created_at DESC LIMIT 1`,
 				modelID,
 			).Scan(&createdAt)
 		}

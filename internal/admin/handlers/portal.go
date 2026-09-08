@@ -512,8 +512,14 @@ func (h *PortalHandler) ReviewPortalAccessRequest(c *gin.Context) {
 	var modelsList []string
 	_ = json.Unmarshal([]byte(req.RequestedModels), &modelsList)
 	for _, modelName := range modelsList {
+		// Same fix as team.go's AddModelPermission / runtimemgr.IsManuallyDeployed:
+		// exclude soft-deleted/disabled historical rows and break ties
+		// deterministically, or this can silently grant against a stale model_id.
 		var modelID string
-		if err := tx.GetContext(c.Request.Context(), &modelID, `SELECT id FROM models WHERE name = $1`, modelName); err == nil && modelID != "" {
+		if err := tx.GetContext(c.Request.Context(), &modelID, `
+			SELECT id FROM models
+			WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+			ORDER BY created_at DESC LIMIT 1`, modelName); err == nil && modelID != "" {
 			_, _ = tx.ExecContext(c.Request.Context(),
 				`INSERT INTO team_model_permissions (team_id, model_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 				req.TeamID, modelID)

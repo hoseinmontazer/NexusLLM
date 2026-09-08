@@ -210,9 +210,15 @@ func (e *Engine) loadPolicies(ctx context.Context, orgID, teamID, modelName stri
 	// query always uses the correct type for the scope_id (uuid) column.
 	// If no row is found the lookup returns an empty string which will
 	// simply match no model-scoped policies — safe fallback.
+	// enabled=TRUE alone isn't sufficient — EnableModel doesn't clear a stale
+	// lifecycle='deleted' on re-enable (see internal/modelguard), so a
+	// disabled-in-spirit row can still have enabled=TRUE. Same fix as
+	// team.go's AddModelPermission / runtimemgr.IsManuallyDeployed.
 	var modelID string
-	_ = e.db.QueryRowContext(ctx,
-		`SELECT id::text FROM models WHERE name = $1 AND enabled = TRUE LIMIT 1`,
+	_ = e.db.QueryRowContext(ctx, `
+		SELECT id::text FROM models
+		WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`,
 		modelName,
 	).Scan(&modelID)
 

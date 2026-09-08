@@ -527,7 +527,7 @@ func (r *Reconciler) allocatePort(ctx context.Context, nodeID, modelID string) (
 // nodeIP returns the canonical reachable address of a node for container
 // bind_host. Delegates to nodeaddr.CanonicalHost — the single shared
 // implementation — rather than duplicating the resolution query here.
-func (r *Reconciler) nodeIP(ctx context.Context, nodeID string) string {
+func (r *Reconciler) nodeIP(ctx context.Context, nodeID string) (string, error) {
 	return nodeaddr.CanonicalHost(ctx, r.db, nodeID)
 }
 
@@ -589,7 +589,16 @@ func (r *Reconciler) executeReturningID(ctx context.Context, status ReplicaStatu
 		r.recordLog(ctx, logID, action, "", "failed", err.Error())
 		return "", 0, err
 	}
-	bindHost := r.nodeIP(ctx, action.TargetNode)
+	bindHost, err := r.nodeIP(ctx, action.TargetNode)
+	if err != nil {
+		// Must not proceed with an empty/placeholder host — that's exactly
+		// the bug that produced a month of unreachable "localhost" endpoints
+		// (see nodeaddr.CanonicalHost). Release the port we just claimed and
+		// fail this replacement attempt loudly instead.
+		_, _ = r.db.ExecContext(ctx, `SELECT release_node_port($1::uuid, $2)`, action.TargetNode, port)
+		r.recordLog(ctx, logID, action, "", "failed", "resolve bind host: "+err.Error())
+		return "", 0, fmt.Errorf("resolve bind host for node %s: %w", action.TargetNode, err)
+	}
 
 	// ── 3. Generate unique runtime identity ──────────────────────────────────
 	runtimeID := uuid.New().String()

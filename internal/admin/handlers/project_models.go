@@ -118,9 +118,15 @@ func (h *ProjectHandler) RemoveProjectModelPermission(c *gin.Context) {
 	projectID := c.Param("id")
 	modelName := c.Param("model")
 
+	// Same fix as team.go's AddModelPermission / runtimemgr.IsManuallyDeployed:
+	// a bare WHERE name=$1 (even with ORDER BY) can still match a soft-deleted
+	// historical row when it happens to be the newest by created_at (e.g. a
+	// delete followed by no redeploy yet) — must exclude those explicitly.
 	var modelID string
-	if err := h.db.GetContext(c.Request.Context(), &modelID,
-		`SELECT id FROM models WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, modelName); err != nil {
+	if err := h.db.GetContext(c.Request.Context(), &modelID, `
+		SELECT id FROM models
+		WHERE name = $1 AND enabled = TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`, modelName); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
 		return
 	}

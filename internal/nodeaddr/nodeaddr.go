@@ -15,29 +15,55 @@ package nodeaddr
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/jmoiron/sqlx"
 )
 
+// ErrNoAdvertisedAddress is returned when a node exists but has neither an
+// ip_address nor a hostname registered — there is nothing for a caller to
+// bind a runtime endpoint to.
+var ErrNoAdvertisedAddress = errors.New("node has no advertised address (ip_address and hostname both unset)")
+
 // CanonicalHost resolves the network-reachable address of nodeID from the
 // nodes table — the single source of truth for "what address is this node
-// reachable at." Prefers the registered IP address, falls back to hostname,
-// and only falls back to the literal string "localhost" when neither is set
-// (e.g. an unregistered/dangling node reference) or the query fails.
+// reachable at." Prefers the registered IP address, falls back to hostname.
 //
-// This intentionally does NOT treat "localhost"/"127.0.0.1" as inherently
-// invalid: if a node's own registered address genuinely is a loopback value
-// (a real, deliberately colocated single-node deployment), that IS its
-// canonical reachable address, and callers must not "correct" it to
+// It deliberately does NOT fall back to the literal string "localhost" when
+// nodeID is empty/unknown or the node has no address registered — doing so
+// previously made every caller silently persist an endpoint guaranteed to be
+// unreachable from wherever health checks and request proxying actually run,
+// instead of failing the deploy with a clear error (forensic audit: this
+// silent fallback, combined with internal/admin/handlers/runtime.go's
+// DeployModel resolving bind_host from input.NodeID BEFORE the auto-placement
+// scheduler decision had set it, is what produced a month of "host=localhost,
+// health=down" endpoint rows for auto-placed models while the real container
+// ran, unreachable, on the actual node).
+//
+// This intentionally does NOT treat a node's own genuinely-registered
+// "localhost"/"127.0.0.1" as inherently invalid: if that IS what the node is
+// registered as (a real, deliberately colocated single-node deployment), that
+// is its canonical reachable address, and callers must not "correct" it to
 // something else. The invariant this package establishes is "matches what
-// the node itself is registered as," not "is not a loopback string."
-func CanonicalHost(ctx context.Context, db *sqlx.DB, nodeID string) string {
-	var host string
-	_ = db.QueryRowContext(ctx,
-		`SELECT COALESCE(host(ip_address), hostname, 'localhost') FROM nodes WHERE id = $1`, nodeID,
-	).Scan(&host)
-	if host == "" {
-		return "localhost"
+// the node itself is registered as, and only that," not "is not a loopback
+// string."
+func CanonicalHost(ctx context.Context, db *sqlx.DB, nodeID string) (string, error) {
+	if nodeID == "" {
+		return "", fmt.Errorf("nodeaddr.CanonicalHost: empty node ID")
 	}
-	return host
+	var ipAddr, hostname *string
+	err := db.QueryRowContext(ctx,
+		`SELECT host(ip_address), hostname FROM nodes WHERE id = $1`, nodeID,
+	).Scan(&ipAddr, &hostname)
+	if err != nil {
+		return "", fmt.Errorf("nodeaddr.CanonicalHost: node %s: %w", nodeID, err)
+	}
+	if ipAddr != nil && *ipAddr != "" {
+		return *ipAddr, nil
+	}
+	if hostname != nil && *hostname != "" {
+		return *hostname, nil
+	}
+	return "", fmt.Errorf("nodeaddr.CanonicalHost: node %s: %w", nodeID, ErrNoAdvertisedAddress)
 }

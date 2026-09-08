@@ -961,7 +961,16 @@ func sweepStuckRuntimes(ctx context.Context, db *sqlx.DB, taskMgr *taskmanager.M
 		// Resolve the canonical reachable address of the target node instead
 		// of copying model_endpoints.host, which can be stale or wrong
 		// (forensic audit, Case File 003) — nothing else ever corrects it.
-		bindHost := nodeaddr.CanonicalHost(ctx, db, row.NodeID)
+		bindHost, hostErr := nodeaddr.CanonicalHost(ctx, db, row.NodeID)
+		if hostErr != nil {
+			_ = tx.Rollback()
+			log.Warn("stuck-runtime sweep: cannot resolve node address — skipping re-enqueue rather than persisting an unreachable host",
+				zap.String("model", row.ModelName),
+				zap.String("node_id", row.NodeID),
+				zap.Error(hostErr),
+			)
+			continue
+		}
 
 		// Insert the new runtime row inside the same tx that claimed the slot,
 		// so the advisory lock covers the INSERT and is released only on commit.

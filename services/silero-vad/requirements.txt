@@ -1,0 +1,11 @@
+# silero-vad-notorch: an independent community fork of silero-vad (NOT an
+# official Silero/snakers4 release) with torch/torchaudio removed, running
+# purely on onnxruntime. Ships the v5 ONNX weights inside the package itself
+# — no network fetch, no gating. Top-level module is silero_vad_notorch, not
+# silero_vad, despite READMEs describing a drop-in `from silero_vad import
+# ...` API — verified via `pip show`/inspecting the installed package.
+silero-vad-notorch==6.2.1.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+soundfile==0.14.0

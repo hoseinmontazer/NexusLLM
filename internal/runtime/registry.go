@@ -571,9 +571,13 @@ func (r *Registry) IsRemoteModel(ctx context.Context, modelName string) bool {
 
 	// Slow path: model not in pool (might be in DB but not yet reloaded, or
 	// simply does not exist). Query the models table directly.
+	// Same fix as team.go's AddModelPermission / runtimemgr.IsManuallyDeployed —
+	// enabled=TRUE alone can still match a stale lifecycle='deleted' row.
 	var backendType BackendType
-	err := r.db.GetContext(ctx, &backendType,
-		`SELECT backend_type FROM models WHERE name=$1 AND enabled=TRUE LIMIT 1`,
+	err := r.db.GetContext(ctx, &backendType, `
+		SELECT backend_type FROM models
+		WHERE name=$1 AND enabled=TRUE AND COALESCE(lifecycle,'active') != 'deleted'
+		ORDER BY created_at DESC LIMIT 1`,
 		modelName)
 	if err != nil {
 		// Not found or DB error — treat as local so the activator path runs.

@@ -306,7 +306,14 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 	// above — apply, preserving prior behavior for that case.
 	var bindHost string
 	if input.NodeID != "" {
-		bindHost = nodeaddr.CanonicalHost(c.Request.Context(), h.db, input.NodeID)
+		host, hostErr := nodeaddr.CanonicalHost(c.Request.Context(), h.db, input.NodeID)
+		if hostErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "cannot resolve a reachable address for node " + input.NodeID + ": " + hostErr.Error(),
+			})
+			return
+		}
+		bindHost = host
 	} else if input.Host != "" {
 		bindHost = input.Host
 	} else {
@@ -473,12 +480,45 @@ func (h *RuntimeHandler) DeployModel(c *gin.Context) {
 			}(),
 		}
 		if dec, schedErr := h.sched.Decide(c.Request.Context(), sReq); schedErr == nil {
+			// BUG FIX: the scheduler's decision was computed and recorded
+			// (scheduler_decisions.outcome='success') but input.NodeID was
+			// never actually set from it — every auto-placed deploy silently
+			// ended up with no node assigned, later failing at start time
+			// with "endpoint has no assigned node — deploy to a node first",
+			// with no error surfaced anywhere in between. Confirmed against
+			// a live instance: a real placement row existed pointing at a
+			// healthy, capable node, yet the endpoint's node_id was empty.
+			input.NodeID = dec.NodeID
 			input.GPUDevices = dec.GPUDeviceIndices
 			if len(dec.GPUDeviceIndices) > 0 {
 				input.TensorParallel = len(dec.GPUDeviceIndices)
 			}
 			// Apply: mark the scheduler decision as used.
 			_, _ = h.sched.Apply(c.Request.Context(), dec, sReq)
+
+			// SECOND HALF OF THE SAME BUG: bindHost was already resolved
+			// (from input.NodeID, which was still "" for auto-placement) and
+			// already written into the model_endpoints row inserted above, at
+			// step 2 — before the scheduler ever ran. Re-resolve it from the
+			// node the scheduler just picked and patch the row, or every
+			// auto-placed endpoint keeps pointing at "localhost"/input.Host
+			// regardless of which node its container actually starts on.
+			host, hostErr := nodeaddr.CanonicalHost(c.Request.Context(), h.db, input.NodeID)
+			if hostErr != nil {
+				// The scheduler chose a node that turns out to have no
+				// advertised address — a broken node registration, not a
+				// placement problem. Do not persist a guaranteed-unreachable
+				// host and do not start a container on it: fall back to
+				// "registered, no node assigned" rather than repeating the
+				// exact bug this code exists to fix.
+				h.log.Error("auto-placement: scheduler chose a node with no advertised address — leaving endpoint unassigned rather than persisting an unreachable host",
+					zap.String("model_id", mID), zap.String("node_id", input.NodeID), zap.Error(hostErr))
+				input.NodeID = ""
+			} else {
+				bindHost = host
+				_, _ = h.db.ExecContext(c.Request.Context(),
+					`UPDATE model_endpoints SET host = $1 WHERE id = $2`, bindHost, epID)
+			}
 		}
 	}
 	// ── Path A: Deploy via Node Agent ──────────────────────────────────────
