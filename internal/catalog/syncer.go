@@ -29,6 +29,7 @@ type RemoteModel struct {
 	SupportsTools      bool
 	SupportsVision     bool
 	SupportsAudio      bool
+	SupportsSpeech     bool
 	SupportsEmbedding  bool
 	SupportsReasoning  bool
 	SupportsImages     bool
@@ -204,6 +205,7 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 		// from model name strings.
 		supportsVision := false
 		supportsAudio := false
+		supportsSpeech := false
 		supportsEmbedding := false
 		supportsImageGen := false
 		description := m.Description
@@ -227,6 +229,13 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 					supportsImageGen = true
 				case "embedding":
 					supportsEmbedding = true
+				case "audio", "speech":
+					// TTS models (e.g. OpenRouter's google/gemini-3.1-flash-tts-preview)
+					// report audio as an OUTPUT modality with text-only input — the
+					// opposite of Whisper-style STT, which reports audio as an INPUT
+					// modality (see supportsAudio above). Never inferred from the
+					// model name/ID string.
+					supportsSpeech = true
 				}
 			}
 		}
@@ -290,6 +299,7 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 			SupportsTools:     supportsTools,
 			SupportsVision:    supportsVision,
 			SupportsAudio:     supportsAudio,
+			SupportsSpeech:    supportsSpeech,
 			SupportsEmbedding: supportsEmbedding,
 			SupportsImages:    supportsImageGen,
 			// Derived from supported_parameters.
@@ -346,9 +356,9 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			   provider_input_cost, provider_output_cost,
 			   supports_streaming, supports_tools, supports_vision,
 			   supports_audio, supports_embeddings, supports_reasoning, supports_images,
-			   supports_json_mode,
+			   supports_json_mode, supports_speech,
 			   tags, enabled, last_seen_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,TRUE,NOW())
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,TRUE,NOW())
 			ON CONFLICT (provider_id, provider_model_id) DO UPDATE
 			SET display_name         = EXCLUDED.display_name,
 			    description          = EXCLUDED.description,
@@ -380,6 +390,7 @@ func (s *CatalogSyncer) upsertCatalog(ctx context.Context, providerID string, mo
 			m.SupportsReasoning,
 			m.SupportsImages,
 			m.SupportsJsonMode,
+			m.SupportsSpeech,
 			tagsArray,
 		)
 		if err != nil {

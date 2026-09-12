@@ -369,6 +369,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 			SupportsTools     bool   `db:"supports_tools"`
 			SupportsVision    bool   `db:"supports_vision"`
 			SupportsAudio     bool   `db:"supports_audio"`
+			SupportsSpeech    bool   `db:"supports_speech"`
 			SupportsEmbedding bool   `db:"supports_embeddings"`
 			SupportsReasoning bool   `db:"supports_reasoning"`
 		}
@@ -377,7 +378,8 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 			SELECT provider_model_id,
 			       COALESCE(array_to_string(tags,','),'') AS tags_raw,
 			       supports_streaming, supports_tools, supports_vision,
-			       supports_audio, supports_embeddings, supports_reasoning
+			       supports_audio, COALESCE(supports_speech, FALSE) AS supports_speech,
+			       supports_embeddings, supports_reasoning
 			FROM provider_remote_models
 			WHERE provider_id::text=$1 AND enabled=TRUE`, prov.ID); err != nil {
 			r.log.Warn("virtual resolver: failed to load catalog", zap.String("provider", prov.Name), zap.Error(err))
@@ -398,6 +400,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				SupportsTools:     e.SupportsTools,
 				SupportsVision:    e.SupportsVision,
 				SupportsAudio:     e.SupportsAudio,
+				SupportsSpeech:    e.SupportsSpeech,
 				SupportsEmbedding: e.SupportsEmbedding,
 				SupportsReasoning: e.SupportsReasoning,
 			}
@@ -423,6 +426,7 @@ func (r *VirtualModelResolver) buildCache(ctx context.Context) (*virtualCache, e
 				SupportsTools:     e.SupportsTools,
 				SupportsVision:    e.SupportsVision,
 				SupportsAudio:     e.SupportsAudio,
+				SupportsSpeech:    e.SupportsSpeech,
 				SupportsEmbedding: e.SupportsEmbedding,
 				SupportsReasoning: e.SupportsReasoning,
 			}
@@ -462,6 +466,13 @@ func capabilitiesFromVirtualEndpoint(vep *VirtualEndpoint) []runtime.Capability 
 		// This distinguishes Whisper-style STT (audio-only) from GPT-4o Audio
 		// (chat model that also handles audio, which has SupportsTools=true).
 		return []runtime.Capability{runtime.CapabilityTranscription}
+	}
+	if vep.SupportsSpeech {
+		// SupportsSpeech is only ever set from an OUTPUT modality (see
+		// syncer.go), so unlike SupportsAudio there is no chat-model false
+		// positive to guard against here — a model reporting audio OUTPUT
+		// with text input (e.g. TTS-only models) never also serves chat.
+		return []runtime.Capability{runtime.CapabilitySpeech}
 	}
 
 	// Chat / completion model — the common case.

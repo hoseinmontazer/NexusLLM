@@ -396,10 +396,19 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 		effectiveUpstreamModel = ep.UpstreamModelName
 	}
 
-	// If we have an upstream model name (from request or config), rewrite the form.
-	if effectiveUpstreamModel != "" {
+	// OpenRouter speaks a different wire format entirely (JSON+base64, not
+	// multipart) — branch on backend type, never on model name, so any
+	// current or future OpenRouter STT model is covered automatically.
+	// See internal/proxy/openrouter_audio.go for the translation.
+	if ep.BackendType == runtime.BackendOpenRouter {
+		if err := openRouterTranscribe(c, ep, h.registry.ClientForEndpoint(ep), bodyBytes, extractBoundary(c.Request.Header.Get("Content-Type"))); err != nil {
+			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
+			return
+		}
+	} else if effectiveUpstreamModel != "" {
+		// If we have an upstream model name (from request or config), rewrite the form.
 		if err := h.forwardMultipartWithModelSubstitution(c,
-			epEffectiveURL(ep)+"/v1/audio/transcriptions",
+			epEffectiveURL(ep)+audioTranscriptionsPath(ep.BackendType),
 			ep.UpstreamAPIKey,
 			h.registry.ClientForEndpoint(ep),
 			effectiveUpstreamModel, bodyBytes, true); err != nil {
@@ -409,7 +418,7 @@ func (h *Handler) Transcriptions(c *gin.Context) {
 	} else {
 		// No model name substitution needed - forward as-is
 		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		if err := h.forwardRaw(c, epEffectiveURL(ep)+"/v1/audio/transcriptions",
+		if err := h.forwardRaw(c, epEffectiveURL(ep)+audioTranscriptionsPath(ep.BackendType),
 			ep.UpstreamAPIKey,
 			h.registry.ClientForEndpoint(ep)); err != nil {
 			abortErr(c, http.StatusBadGateway, "upstream_error", err.Error())
@@ -455,8 +464,13 @@ func (h *Handler) Speech(c *gin.Context) {
 	start := time.Now()
 
 	body, _ := json.Marshal(req)
+	// audioSpeechPath resolves to OpenRouter's /api/v1/audio/speech for
+	// ep.BackendType == runtime.BackendOpenRouter, /v1/audio/speech otherwise.
+	// The SpeechRequest JSON body itself (model/input/voice/response_format/
+	// speed) is already wire-compatible with OpenRouter's TTS endpoint, so no
+	// request translation is needed here — only the path differs.
 	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost,
-		epEffectiveURL(ep)+"/v1/audio/speech", bytes.NewReader(body))
+		epEffectiveURL(ep)+audioSpeechPath(ep.BackendType), bytes.NewReader(body))
 	if err != nil {
 		abortErr(c, http.StatusInternalServerError, "request_build_error", err.Error())
 		return
@@ -475,6 +489,22 @@ func (h *Handler) Speech(c *gin.Context) {
 
 	audioData, _ := io.ReadAll(resp.Body)
 	ct := resp.Header.Get("Content-Type")
+
+	// A successful OpenRouter TTS response is raw audio bytes, never JSON —
+	// it must not be decoded. A failed one is JSON; translate it the same way
+	// the STT adapter does instead of shipping OpenRouter's raw error shape
+	// (and its own status conventions) straight to the client.
+	if ep.BackendType == runtime.BackendOpenRouter &&
+		writeOpenRouterSpeechError(c, resp.StatusCode, audioData, ct) {
+		h.usageTracker.Record(context.Background(), usage.Event{
+			OrgID: res.orgID, TeamID: res.teamID,
+			ModelName: res.realModel, EndpointID: ep.ID, CredentialID: ep.CredentialID,
+			LatencyMs: int(time.Since(start).Milliseconds()),
+			Status:    statusFromHTTP(resp.StatusCode),
+		})
+		return
+	}
+
 	if ct == "" {
 		ct = "audio/mpeg"
 	}

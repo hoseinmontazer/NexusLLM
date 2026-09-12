@@ -46,6 +46,7 @@ type VirtualEndpoint struct {
 	SupportsTools     bool
 	SupportsVision    bool
 	SupportsAudio     bool
+	SupportsSpeech    bool
 	SupportsEmbedding bool
 	SupportsReasoning bool
 }
