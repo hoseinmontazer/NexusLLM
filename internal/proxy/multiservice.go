@@ -169,10 +169,28 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 	// model name string. This mirrors the same check in ChatCompletions.
 	if h.activator != nil {
 		if _, _, err := h.registry.ResolveWithFailover(realModel, 1); err != nil {
-			// Registry miss. Check whether this is a remote model before
-			// attempting a cold start. Remote models skip EnsureRunning entirely
-			// and are handled in stage 8 via the virtual resolver.
-			if !h.registry.IsRemoteModel(c.Request.Context(), realModel) {
+			// Registry miss. Check the virtual catalog BEFORE ever considering
+			// IsRemoteModel/cold-start — this MUST run first. IsRemoteModel only
+			// answers "is this a registered models-table row backed by a
+			// provider," and a virtual (Mode-B) catalog model is never a
+			// models-table row at all, so IsRemoteModel alone cannot distinguish
+			// "virtual model, always reachable via its provider" from
+			// "genuinely local model, just not started yet" — it falls back to
+			// treating "not found" as local. Every virtual OpenRouter STT/TTS
+			// model's very first request hit exactly this gap: cold-start was
+			// attempted for a model with no container to start, so it stayed
+			// stuck on "model is starting up, retry in ~10s" forever. Confirmed
+			// against a live instance (openai/whisper-large-v3-turbo via
+			// X-Nexus-Provider: openrouter). Mirrors the order ChatCompletions
+			// already uses correctly: virtual catalog resolution happens before
+			// EnsureRunning is ever considered.
+			isVirtual := false
+			if h.virtualResolver != nil {
+				if _, ok := h.virtualResolver.Capabilities(c.Request.Context(), realModel); ok {
+					isVirtual = true
+				}
+			}
+			if !isVirtual && !h.registry.IsRemoteModel(c.Request.Context(), realModel) {
 				// Local model not yet running — delegate to the shared cold-start handler.
 				// handleColdStart writes 503 and returns for the starting case, or sets
 				// X-Nexus-Warmup-Ms and returns (probe fast-path) when the model is
@@ -183,7 +201,7 @@ func (h *Handler) pipelineSetup(c *gin.Context, rawModel string, estimatedTokens
 				}
 				// Probe fast-path: fall through to endpoint re-resolution below.
 			}
-			// Remote model — fall through to stage 8 where the virtual
+			// Remote/virtual model — fall through to stage 8 where the virtual
 			// resolver will handle it. No cold-start attempted.
 		}
 	}
