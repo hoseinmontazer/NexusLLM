@@ -291,3 +291,21 @@ func writeOpenRouterSpeechError(c *gin.Context, upstreamStatus int, body []byte,
 	writeOpenRouterError(c, upstreamStatus, body)
 	return true
 }
+
+// outboundModelName is the model identifier to send to whatever is on the
+// other end of ep — not necessarily realModel (Nexus's own, possibly
+// fully-qualified virtual name, e.g. "openrouter/google/gemini-3.1-flash-tts-preview").
+// A virtual/provider-routed endpoint has its own UpstreamModelName (the
+// provider's real model ID, e.g. "google/gemini-3.1-flash-tts-preview") and
+// has never heard of Nexus's virtual naming — sending it the virtual name
+// gets "model does not exist" back. Local/native backends have no separate
+// upstream name and expect the plain registered name, so they fall back to
+// realModel unchanged. Used by Speech(); Transcriptions() has its own
+// closely related but distinct precedence (a request-level upstream_model
+// override takes priority there, which SpeechRequest has no equivalent of).
+func outboundModelName(realModel string, ep *runtime.Endpoint) string {
+	if ep.UpstreamModelName != "" {
+		return ep.UpstreamModelName
+	}
+	return realModel
+}

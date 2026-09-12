@@ -388,3 +388,28 @@ func TestNoModelNameConditionalsInAudioAdapter(t *testing.T) {
 		}
 	}
 }
+
+// ─── outboundModelName ──────────────────────────────────────────────────────
+
+// TestOutboundModelName is the regression test for a real production bug:
+// Speech() sent OpenRouter its own fully-qualified virtual model name
+// ("openrouter/google/gemini-3.1-flash-tts-preview") instead of the upstream
+// provider's real model ID ("google/gemini-3.1-flash-tts-preview"), which
+// OpenRouter correctly rejected as "does not exist" — it has never heard of
+// Nexus's own virtual naming scheme.
+func TestOutboundModelName(t *testing.T) {
+	t.Run("virtual/provider-routed endpoint uses its upstream model ID, not the virtual name", func(t *testing.T) {
+		ep := &runtime.Endpoint{BackendType: runtime.BackendOpenRouter, UpstreamModelName: "google/gemini-3.1-flash-tts-preview"}
+		got := outboundModelName("openrouter/google/gemini-3.1-flash-tts-preview", ep)
+		if got != "google/gemini-3.1-flash-tts-preview" {
+			t.Errorf("got %q, want the upstream model ID with no openrouter/ prefix", got)
+		}
+	})
+	t.Run("local/native endpoint with no upstream name falls back to the registered name", func(t *testing.T) {
+		ep := &runtime.Endpoint{BackendType: runtime.BackendCPUNative}
+		got := outboundModelName("kokoro-tts", ep)
+		if got != "kokoro-tts" {
+			t.Errorf("got %q, want the plain registered name unchanged", got)
+		}
+	})
+}

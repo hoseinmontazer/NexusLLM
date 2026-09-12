@@ -471,9 +471,9 @@ func (h *Handler) Speech(c *gin.Context) {
 		return
 	}
 	defer h.decrementInflight(context.Background(), res.teamID, res.projectID, res.realModel)
-	req.Model = res.realModel
 
 	ep := res.ep
+	req.Model = outboundModelName(res.realModel, ep)
 	atomic.AddInt64(&ep.ActiveConns, 1)
 	defer atomic.AddInt64(&ep.ActiveConns, -1)
 	if h.activator != nil {
