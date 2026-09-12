@@ -413,3 +413,102 @@ func TestOutboundModelName(t *testing.T) {
 		}
 	})
 }
+
+// ─── response_format=verbose_json ──────────────────────────────────────────
+
+// TestOpenRouterTranscribe_ResponseFormat covers a real, previously-missing
+// feature: response_format is an OpenAI-standard parameter (not OpenRouter-
+// specific), and native/other STT backends already return verbose_json's
+// full shape untouched via the byte-transparent forwardRaw path — the
+// OpenRouter adapter was the only one collapsing it down to bare {"text"}
+// regardless of what was requested.
+func TestOpenRouterTranscribe_ResponseFormat(t *testing.T) {
+	const upstreamBody = `{
+		"text": "Hello there. Hi, how are you?",
+		"language": "en",
+		"duration": 6.4,
+		"task": "transcribe",
+		"segments": [{"id":0,"start":0.0,"end":1.2,"text":"Hello there."}],
+		"words": [{"word":"Hello","start":0.0,"end":0.4}],
+		"usage": {"seconds": 6.4, "cost": 0.000178}
+	}`
+
+	t.Run("verbose_json returns the full shape", func(t *testing.T) {
+		var gotRequestedFormat string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				RespFormat string `json:"response_format"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotRequestedFormat = body.RespFormat
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(upstreamBody))
+		}))
+		defer server.Close()
+
+		ep := &runtime.Endpoint{BackendType: runtime.BackendOpenRouter, UpstreamBaseURL: server.URL, UpstreamModelName: "openai/whisper-large-v3-turbo"}
+		bodyBytes, boundary := buildMultipartAudio(t, "call.wav", []byte("RIFF....WAVE"), map[string]string{"response_format": "verbose_json"})
+		c, rec := ginContext(t)
+		if err := openRouterTranscribe(c, ep, server.Client(), bodyBytes, boundary); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if gotRequestedFormat != "verbose_json" {
+			t.Errorf("upstream request did not forward response_format=verbose_json, got %q", gotRequestedFormat)
+		}
+
+		var out struct {
+			Text     string  `json:"text"`
+			Language string  `json:"language"`
+			Duration float64 `json:"duration"`
+			Task     string  `json:"task"`
+			Segments []struct {
+				ID    int     `json:"id"`
+				Text  string  `json:"text"`
+				Start float64 `json:"start"`
+				End   float64 `json:"end"`
+			} `json:"segments"`
+			Words []struct {
+				Word string `json:"word"`
+			} `json:"words"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("response not valid JSON: %v (body=%s)", err, rec.Body.String())
+		}
+		if out.Language != "en" || out.Duration != 6.4 || out.Task != "transcribe" {
+			t.Errorf("verbose fields missing/wrong: %+v", out)
+		}
+		if len(out.Segments) != 1 || out.Segments[0].Text != "Hello there." {
+			t.Errorf("segments missing/wrong: %+v", out.Segments)
+		}
+		if len(out.Words) != 1 || out.Words[0].Word != "Hello" {
+			t.Errorf("words missing/wrong: %+v", out.Words)
+		}
+	})
+
+	t.Run("default json format stays exactly {text} unchanged", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(upstreamBody)) // upstream may still send extra fields even unrequested
+		}))
+		defer server.Close()
+
+		ep := &runtime.Endpoint{BackendType: runtime.BackendOpenRouter, UpstreamBaseURL: server.URL, UpstreamModelName: "openai/whisper-large-v3-turbo"}
+		bodyBytes, boundary := buildMultipartAudio(t, "call.wav", []byte("RIFF....WAVE"), nil) // no response_format field at all
+		c, rec := ginContext(t)
+		if err := openRouterTranscribe(c, ep, server.Client(), bodyBytes, boundary); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var out map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("response not valid JSON: %v", err)
+		}
+		if len(out) != 1 {
+			t.Errorf("default response format must stay exactly {\"text\": ...} — got extra fields: %+v", out)
+		}
+		if out["text"] != "Hello there. Hi, how are you?" {
+			t.Errorf("text = %v", out["text"])
+		}
+	})
+}

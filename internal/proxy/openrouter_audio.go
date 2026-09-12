@@ -104,8 +104,31 @@ type openRouterInputAudio struct {
 	Format string `json:"format"`
 }
 
+// openRouterTranscriptionResponse covers both OpenRouter's default "json"
+// shape (text + usage only) and "verbose_json" (adds language/duration/task
+// plus segment- and word-level timestamps) — verified against OpenRouter's
+// own documented example response, not assumed. Language/Duration/Task/
+// Segments/Words are only ever populated when the client requested
+// response_format=verbose_json; zero-value/omitted otherwise, so the default
+// response stays exactly {"text": ...} as before.
 type openRouterTranscriptionResponse struct {
-	Text  string `json:"text"`
+	Text     string  `json:"text"`
+	Language string  `json:"language,omitempty"`
+	Duration float64 `json:"duration,omitempty"`
+	Task     string  `json:"task,omitempty"`
+	Segments []struct {
+		ID      int     `json:"id"`
+		Start   float64 `json:"start"`
+		End     float64 `json:"end"`
+		Text    string  `json:"text"`
+		Speaker *int    `json:"speaker,omitempty"`
+	} `json:"segments,omitempty"`
+	Words []struct {
+		Word    string  `json:"word"`
+		Start   float64 `json:"start"`
+		End     float64 `json:"end"`
+		Speaker *int    `json:"speaker,omitempty"`
+	} `json:"words,omitempty"`
 	Usage *struct {
 		Seconds      float64 `json:"seconds"`
 		TotalTokens  int     `json:"total_tokens"`
@@ -224,6 +247,16 @@ func openRouterTranscribe(c *gin.Context, ep *runtime.Endpoint, client *http.Cli
 	if jsonErr := json.Unmarshal(respBody, &orResp); jsonErr != nil {
 		abortErr(c, http.StatusBadGateway, "upstream_invalid_response",
 			"OpenRouter returned a malformed transcription response")
+		return nil
+	}
+
+	// response_format=verbose_json (an OpenAI-standard parameter, not an
+	// OpenRouter-specific one — native/other STT backends already return this
+	// full shape untouched via the byte-transparent forwardRaw path) gets its
+	// full shape back; the default "json" format stays exactly {"text": ...},
+	// unchanged from before this field existed.
+	if responseFormat == "verbose_json" {
+		c.JSON(http.StatusOK, orResp)
 		return nil
 	}
 	c.JSON(http.StatusOK, gin.H{"text": orResp.Text})
