@@ -115,6 +115,18 @@ func (s *CatalogSyncer) SyncProvider(ctx context.Context, providerID string) err
 // fetchModels calls the provider's /models endpoint and returns a slice of RemoteModel.
 // It calls the endpoint directly with the provider's API key rather than going through
 // the Backend.Models() method, which does not accept an api key parameter.
+// openRouterModalityFilteredPaths are additional catalog endpoints that must
+// be fetched and merged in for OpenRouter specifically: its default
+// /api/v1/models listing does NOT include audio-only models (STT/TTS) at
+// all — confirmed live against the real API, not assumed — they only appear
+// behind these output_modalities filters. Without this, no OpenRouter STT/TTS
+// model (present or future) could ever be discovered by catalog sync,
+// regardless of how correct the capability-derivation parsing below is.
+var openRouterModalityFilteredPaths = []string{
+	"/api/v1/models?output_modalities=transcription",
+	"/api/v1/models?output_modalities=speech",
+}
+
 func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *http.Client) ([]RemoteModel, error) {
 	// Determine the correct models URL based on backend type.
 	path := "/v1/models"
@@ -128,6 +140,44 @@ func (s *CatalogSyncer) fetchModels(ctx context.Context, p *Provider, client *ht
 	}
 	modelsURL := runtime.NormalizeProviderEndpointURL(p.BaseURL, path)
 
+	out, err := s.fetchModelsFromURL(ctx, client, p, modelsURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if runtime.BackendType(p.BackendType) == runtime.BackendOpenRouter {
+		seen := make(map[string]bool, len(out))
+		for _, m := range out {
+			seen[m.ProviderModelID] = true
+		}
+		for _, path := range openRouterModalityFilteredPaths {
+			extraURL := runtime.NormalizeProviderEndpointURL(p.BaseURL, path)
+			extra, ferr := s.fetchModelsFromURL(ctx, client, p, extraURL)
+			if ferr != nil {
+				// Non-fatal: the base catalog sync must still succeed even if
+				// one modality-filtered endpoint is temporarily unavailable.
+				s.log.Warn("catalog sync: modality-filtered fetch failed, skipping",
+					zap.String("provider", p.Name), zap.String("url", extraURL), zap.Error(ferr))
+				continue
+			}
+			for _, m := range extra {
+				if seen[m.ProviderModelID] {
+					continue // already present in the base listing
+				}
+				seen[m.ProviderModelID] = true
+				out = append(out, m)
+			}
+		}
+	}
+	return out, nil
+}
+
+// fetchModelsFromURL fetches and parses one /models-shaped catalog endpoint.
+// Split out from fetchModels so OpenRouter's modality-filtered endpoints
+// (see openRouterModalityFilteredPaths) can reuse the identical parsing —
+// capability derivation must never differ between the base listing and
+// these supplementary ones.
+func (s *CatalogSyncer) fetchModelsFromURL(ctx context.Context, client *http.Client, p *Provider, modelsURL string) ([]RemoteModel, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
 		return nil, err
